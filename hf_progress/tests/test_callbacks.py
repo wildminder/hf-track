@@ -66,14 +66,17 @@ class TestXetUploadProgressCallback:
         assert event.transfer_speed == 80.0
         assert event.dedup_saved_bytes == 100  # 500 - 400
 
-    def test_throttling(self):
-        """Rapid calls should be throttled to report_interval."""
+    def test_every_call_emits_event(self):
+        """Every callback invocation should emit an event (no producer-side throttle).
+
+        The consumer is responsible for throttling/display refresh.
+        """
         q = queue.Queue()
         callback = XetUploadProgressCallback(
             filename="test.bin",
             total_bytes=1000,
             event_queue=q,
-            report_interval=1.0,  # 1 second throttle
+            report_interval=1.0,  # unused — kept for API compat
         )
 
         total_update = self._make_mock_total_update()
@@ -82,9 +85,9 @@ class TestXetUploadProgressCallback:
         callback(total_update, [])
         assert q.qsize() == 1
 
-        # Immediate second call should be throttled
+        # Second call should also emit (no producer-side throttle)
         callback(total_update, [])
-        assert q.qsize() == 1  # Still 1
+        assert q.qsize() == 2  # Both calls emit
 
     def test_throttle_allows_after_interval(self):
         """After the report_interval, calls should emit again."""
@@ -315,24 +318,27 @@ class TestXetDownloadProgressCallback:
         event = q.get_nowait()
         assert event.percentage == 25.0
 
-    def test_throttling(self):
-        """Rapid calls should be throttled."""
+    def test_every_call_emits_event(self):
+        """Every callback invocation should emit an event (no producer-side throttle).
+
+        The consumer is responsible for throttling/display refresh.
+        """
         q = queue.Queue()
         callback = XetDownloadProgressCallback(
             filename="test.bin",
             total_bytes=1000,
             event_queue=q,
-            report_interval=1.0,  # 1 second throttle
+            report_interval=1.0,  # unused — kept for API compat
         )
 
         total_update = self._make_total_update(total_bytes_completed=100)
         callback(total_update, [])
         assert q.qsize() == 1
 
-        # Immediate second call should be throttled
+        # Second call should also emit (no producer-side throttle)
         total_update2 = self._make_total_update(total_bytes_completed=200)
         callback(total_update2, [])
-        assert q.qsize() == 1  # Still 1
+        assert q.qsize() == 2  # Both calls emit
 
     def test_zero_total_bytes(self):
         """Percentage should be 0 when total_bytes is 0."""
@@ -412,8 +418,11 @@ class TestDownloadProgressTqdm:
         assert len(complete_events) == 1
         assert complete_events[0].percentage == 100.0
 
-    def test_throttling(self):
-        """Throttling should prevent excessive events."""
+    def test_every_update_emits_event(self):
+        """Every update() call should emit an event (no producer-side throttle).
+
+        The consumer is responsible for throttling/display refresh.
+        """
         q = queue.Queue()
         bar = DownloadProgressTqdm(
             total=1000,
@@ -423,16 +432,16 @@ class TestDownloadProgressTqdm:
             event_queue=q,
             transfer_id="test-dl-2",
             filename="test.bin",
-            report_interval=1.0,  # 1 second throttle
+            report_interval=1.0,  # unused — kept for API compat
         )
 
         # First update should emit
         bar.update(100)
         assert q.qsize() == 1
 
-        # Immediate second update should be throttled
+        # Second update should also emit (no producer-side throttle)
         bar.update(100)
-        assert q.qsize() == 1  # Still 1
+        assert q.qsize() == 2  # Both updates emit
 
         bar.close()
 
@@ -629,13 +638,12 @@ class TestDownloadProgressTqdm:
 
         bar.close()
 
-    def test_throttle_only_affects_event_emission_not_counter(self):
-        """Throttle should only limit event emission, not tqdm's internal counter.
+    def test_every_update_emits_with_correct_bytes(self):
+        """Every update() should emit an event with the current accumulated bytes.
 
-        When update() is called during a throttle period, self.n should still
-        be updated (via super().update(n)) even though no event is emitted.
-        The next emitted event should reflect the accumulated progress.
-        This prevents the "frozen then jump" progress bar behavior.
+        Since there is no producer-side throttle, each update() emits
+        an event reflecting the current self.n value. This gives the
+        consumer real-time progress data on every chunk.
         """
         q = queue.Queue()
         bar = DownloadProgressTqdm(
@@ -646,45 +654,31 @@ class TestDownloadProgressTqdm:
             event_queue=q,
             transfer_id="test-dl-6",
             filename="test.bin",
-            report_interval=1.0,  # 1 second throttle — long enough to block
+            report_interval=1.0,  # unused — kept for API compat
         )
 
-        # First update — should emit event (first call always passes)
+        # First update — emits event with bytes_completed=100
         bar.update(100)
-        assert bar.n == 100  # Counter updated
+        assert bar.n == 100
 
-        # Second update during throttle — event suppressed but counter updated
+        # Second update — emits event with bytes_completed=300
         bar.update(200)
-        assert bar.n == 300  # Counter still updated despite throttle!
+        assert bar.n == 300
 
-        # Third update during throttle — event suppressed but counter updated
+        # Third update — emits event with bytes_completed=600
         bar.update(300)
-        assert bar.n == 600  # Counter still updated despite throttle!
+        assert bar.n == 600
 
-        # Drain events — should have only 1 progress event (from first update)
+        # Drain events — should have 3 progress events (one per update)
         events = []
         while not q.empty():
             events.append(q.get_nowait())
         progress_events = [e for e in events if e.event_type == EventType.PROGRESS]
-        assert len(progress_events) == 1
-        # The first event shows 100 bytes (from the first update)
+        assert len(progress_events) == 3
+        # Each event reflects the accumulated progress at that point
         assert progress_events[0].bytes_completed == 100
-
-        # Now force the throttle to expire
-        bar._last_report_time = 0.0
-
-        # Next update should emit event with ACCUMULATED progress
-        bar.update(100)
-        assert bar.n == 700
-
-        # Drain new events
-        new_events = []
-        while not q.empty():
-            new_events.append(q.get_nowait())
-        new_progress = [e for e in new_events if e.event_type == EventType.PROGRESS]
-        assert len(new_progress) == 1
-        # The event shows 700 bytes — the full accumulated progress
-        assert new_progress[0].bytes_completed == 700
+        assert progress_events[1].bytes_completed == 300
+        assert progress_events[2].bytes_completed == 600
 
         bar.close()
 
@@ -812,8 +806,11 @@ class TestTqdmUploadPatcher:
         ]
         assert len(complete_events) == 0
 
-    def test_throttling(self):
-        """Rapid updates should be throttled."""
+    def test_every_update_emits_event(self):
+        """Every update() call should emit an event (no producer-side throttle).
+
+        The consumer is responsible for throttling/display refresh.
+        """
         q = queue.Queue()
 
         with tqdm_upload_patcher(
@@ -829,7 +826,7 @@ class TestTqdmUploadPatcher:
             initial_count = q.qsize()
 
             bar.update(100)
-            # Second update should be throttled
-            assert q.qsize() == initial_count
+            # Second update should also emit (no producer-side throttle)
+            assert q.qsize() == initial_count + 1
 
             bar.close()

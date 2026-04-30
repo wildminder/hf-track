@@ -3,20 +3,26 @@
 Four callback mechanisms are provided:
 
 1. ``XetUploadProgressCallback`` — For hf_xet direct upload calls.
-Receives (total_update, item_updates) from Rust runtime.
-Parameter names MUST match exactly for Rust auto-detection.
+   Receives (total_update, item_updates) from Rust runtime.
+   Parameter names MUST match exactly for Rust auto-detection.
 
 2. ``XetDownloadProgressCallback`` — For hf_xet direct download calls.
-Receives (total_update, item_updates) from Rust runtime.
-Parameter names MUST match exactly for Rust auto-detection.
+   Receives (total_update, item_updates) from Rust runtime.
+   Parameter names MUST match exactly for Rust auto-detection.
 
 3. ``DownloadProgressTqdm`` — Custom tqdm subclass for HTTP downloads.
-Used via the ``tqdm_class`` parameter of ``hf_hub_download()``.
-Fallback when hf_xet is not available.
+   Used via the ``tqdm_class`` parameter of ``hf_hub_download()``.
+   Fallback when hf_xet is not available.
 
 4. ``tqdm_upload_patcher`` — Context manager for LFS upload progress.
-Monkey-patches tqdm globally to intercept upload progress bars.
-Fallback when hf_xet is not available.
+   Monkey-patches tqdm globally to intercept upload progress bars.
+   Fallback when hf_xet is not available.
+
+**Event emission philosophy**: All callbacks emit a ProgressEvent on
+every invocation/update. The consumer (UI, SSE, etc.) is responsible
+for its own throttling and display refresh. This ensures real-time
+progress data is always available — no "frozen then jump" gaps caused
+by producer-side throttling.
 """
 
 from __future__ import annotations
@@ -38,7 +44,7 @@ from .types import (
 
 
 class XetUploadProgressCallback:
-    """Thread-safe progress callback for hf_xet uploads.
+    """Progress callback for hf_xet uploads.
 
     hf_xet's Rust runtime calls this with two arguments:
     - ``total_update``: PyTotalProgressUpdate with overall progress
@@ -53,11 +59,15 @@ class XetUploadProgressCallback:
     which acquires the GIL via ``Python::attach``. It is synchronous from
     Python's perspective but runs on a background thread.
 
+    **Event emission**: Emits a ProgressEvent on every invocation.
+    The consumer is responsible for its own throttling/display refresh.
+
     Args:
         filename: Name of the file being uploaded.
         total_bytes: Expected total bytes.
         event_queue: Thread-safe queue to emit ProgressEvent objects.
-        report_interval: Minimum seconds between progress events (throttle).
+        report_interval: Unused (kept for API compatibility). Consumer
+            handles throttling.
         transfer_id: Unique identifier for this transfer.
         file_index: Index of this file in a multi-file transfer.
         total_files: Total number of files in the transfer.
@@ -76,15 +86,19 @@ class XetUploadProgressCallback:
         self.filename = filename
         self.total_bytes = total_bytes
         self.event_queue = event_queue
-        self.report_interval = report_interval
+        self.report_interval = report_interval  # kept for API compat
         self.transfer_id = transfer_id
         self.file_index = file_index
         self.total_files = total_files
-        self._last_report_time = 0.0
-        self._lock = threading.Lock()
 
     def __call__(self, total_update, item_updates):
         """Called by hf_xet Rust runtime from a background thread.
+
+        Emits a ProgressEvent on every invocation. The consumer (UI,
+        SSE, etc.) is responsible for its own throttling/display refresh.
+
+        The Rust runtime calls this at its own cadence (typically every
+        100ms+), so the event volume is manageable.
 
         Args:
             total_update: PyTotalProgressUpdate with fields:
@@ -100,12 +114,6 @@ class XetUploadProgressCallback:
                 - bytes_completed (int)
                 - bytes_completion_increment (int)
         """
-        now = time.time()
-        with self._lock:
-            if now - self._last_report_time < self.report_interval:
-                return
-            self._last_report_time = now
-
         # Extract values immediately — don't store Rust object references
         bytes_completed = getattr(total_update, "total_bytes_completed", 0)
         total_bytes = getattr(total_update, "total_bytes", 0) or self.total_bytes
@@ -144,7 +152,7 @@ class XetUploadProgressCallback:
 
 
 class XetDownloadProgressCallback:
-    """Thread-safe progress callback for hf_xet downloads.
+    """Progress callback for hf_xet downloads.
 
     Uses the **detailed** callback signature ``(total_update, item_updates)``
     so the Rust ``WrappedProgressUpdaterImpl`` provides rich progress data
@@ -159,11 +167,15 @@ class XetDownloadProgressCallback:
     which acquires the GIL via ``Python::attach``. It is synchronous from
     Python's perspective but runs on a background thread.
 
+    **Event emission**: Emits a ProgressEvent on every invocation.
+    The consumer is responsible for its own throttling/display refresh.
+
     Args:
         filename: Name of the file being downloaded.
         total_bytes: Expected total bytes.
         event_queue: Thread-safe queue to emit ProgressEvent objects.
-        report_interval: Minimum seconds between progress events (throttle).
+        report_interval: Unused (kept for API compatibility). Consumer
+            handles throttling.
         transfer_id: Unique identifier for this transfer.
         file_index: Index of this file in a multi-file transfer.
         total_files: Total number of files in the transfer.
@@ -182,15 +194,19 @@ class XetDownloadProgressCallback:
         self.filename = filename
         self.total_bytes = total_bytes
         self.event_queue = event_queue
-        self.report_interval = report_interval
+        self.report_interval = report_interval  # kept for API compat
         self.transfer_id = transfer_id
         self.file_index = file_index
         self.total_files = total_files
-        self._last_report_time = 0.0
-        self._lock = threading.Lock()
 
     def __call__(self, total_update, item_updates):
         """Called by hf_xet Rust runtime from a background thread.
+
+        Emits a ProgressEvent on every invocation. The consumer (UI,
+        SSE, etc.) is responsible for its own throttling/display refresh.
+
+        The Rust runtime calls this at its own cadence (typically every
+        100ms+), so the event volume is manageable.
 
         Args:
             total_update: PyTotalProgressUpdate with fields:
@@ -206,12 +222,6 @@ class XetDownloadProgressCallback:
                 - bytes_completed (int)
                 - bytes_completion_increment (int)
         """
-        now = time.time()
-        with self._lock:
-            if now - self._last_report_time < self.report_interval:
-                return
-            self._last_report_time = now
-
         # Extract values immediately — don't store Rust object references
         bytes_completed = getattr(total_update, "total_bytes_completed", 0)
         total_bytes = getattr(total_update, "total_bytes", 0) or self.total_bytes
@@ -259,6 +269,10 @@ class DownloadProgressTqdm(base_tqdm):
     ``transfer_id``, etc.) are injected via ``bind()`` which uses
     ``kwargs.setdefault()`` in a generated subclass ``__init__``.
 
+    **Event emission**: Every ``update()`` call emits a ProgressEvent.
+    The consumer is responsible for its own throttling/display refresh.
+    This ensures real-time progress data is always available.
+
     **How it works with HTTP downloads**::
 
         hf_hub_download(tqdm_class=BoundDownloadTqdm)
@@ -266,7 +280,7 @@ class DownloadProgressTqdm(base_tqdm):
         → _get_progress_bar_context(tqdm_class=BoundDownloadTqdm)
         → _create_progress_bar(cls=BoundDownloadTqdm, ...)
         → BoundDownloadTqdm(desc=..., total=..., unit="B", ...)
-        → progress.update(len(chunk))  per HTTP chunk
+        → progress.update(len(chunk)) per HTTP chunk
 
     **How it works with Xet downloads**::
 
@@ -294,7 +308,8 @@ class DownloadProgressTqdm(base_tqdm):
         event_queue: Thread-safe queue for emitting ProgressEvent objects.
         transfer_id: Unique identifier for this transfer.
         filename: Name of the file being downloaded.
-        report_interval: Minimum seconds between progress events.
+        report_interval: Unused (kept for API compatibility). Consumer
+            handles throttling.
     """
 
     def __init__(
@@ -313,9 +328,7 @@ class DownloadProgressTqdm(base_tqdm):
         self._event_queue = event_queue
         self._transfer_id = transfer_id
         self._filename = filename
-        self._report_interval = report_interval
-        self._last_report_time = 0.0
-        self._lock = threading.Lock()
+        self._report_interval = report_interval  # kept for API compat
         self._start_time = time.time()
 
         # Remove 'name' kwarg that HF injects for its own tqdm subclass.
@@ -331,18 +344,22 @@ class DownloadProgressTqdm(base_tqdm):
             self._filename = self.desc or "unknown"
 
     def update(self, n=1):
-        """Override update to emit progress events with throttling.
+        """Override update to emit progress events on every call.
 
         Called by ``huggingface_hub`` internals for each chunk downloaded.
         For HTTP downloads: called per ``len(chunk)`` bytes received.
         For Xet downloads: called via ``progress_updater`` closure that
         wraps ``progress.update(progress_bytes)``.
 
-        **Throttling strategy**: Always update tqdm's internal counter
-        (via ``super().update(n)``) so ``self.n`` stays accurate.
-        Only throttle the *event emission* — when the throttle fires,
-        emit the current accumulated progress. This prevents the
-        consumer from seeing "frozen then jump" behavior.
+        **Event emission**: Every ``update()`` call emits a ProgressEvent
+        to the queue. The consumer (UI, SSE, etc.) is responsible for
+        its own throttling/display refresh. This ensures real-time
+        progress data is always available — no "frozen then jump" gaps.
+
+        **Performance**: The queue is unbounded and ``put()`` is O(1).
+        For HTTP downloads, ``update()`` is called per chunk (typically
+        every 1-10 MB). For Xet downloads, the Rust runtime calls the
+        progress updater at its own cadence (typically every 100ms+).
         """
         # Always update tqdm's internal counter first
         result = super().update(n)
@@ -350,12 +367,8 @@ class DownloadProgressTqdm(base_tqdm):
         if self._event_queue is None:
             return result
 
-        # Throttle only the event emission, not the counter update
+        # Emit event on every update — consumer handles its own throttle
         now = time.time()
-        with self._lock:
-            if now - self._last_report_time < self._report_interval:
-                return result
-            self._last_report_time = now
 
         # Calculate progress from current accumulated state
         bytes_completed = self.n
@@ -496,6 +509,9 @@ def tqdm_upload_patcher(
     Temporarily replaces ``tqdm.auto.tqdm`` with a custom subclass
     that emits ProgressEvent objects to a queue.
 
+    **Event emission**: Every ``update()`` call emits a ProgressEvent.
+    The consumer is responsible for its own throttling/display refresh.
+
     **WARNING**: This patches the GLOBAL tqdm class. It will affect
     ALL tqdm bars created while the context manager is active, not
     just HuggingFace upload bars. Use only when:
@@ -511,7 +527,8 @@ def tqdm_upload_patcher(
         event_queue: Thread-safe queue for emitting ProgressEvent objects.
         transfer_id: Unique identifier for this transfer.
         filename: Expected filename (used as fallback if tqdm desc is empty).
-        report_interval: Minimum seconds between progress events.
+        report_interval: Unused (kept for API compatibility). Consumer
+            handles throttling.
 
     Usage::
 
@@ -530,16 +547,18 @@ def tqdm_upload_patcher(
     _patch_active = True
 
     class UploadProgressTqdm(original_tqdm):
-        """tqdm subclass that emits progress events during uploads."""
+        """tqdm subclass that emits progress events during uploads.
+
+        Emits a ProgressEvent on every update() call. Consumer handles
+        its own throttling.
+        """
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self._upload_event_queue = event_queue
             self._upload_transfer_id = transfer_id
             self._upload_filename = filename or (self.desc or "")
-            self._upload_report_interval = report_interval
-            self._upload_last_report_time = 0.0
-            self._upload_lock = threading.Lock()
+            self._upload_report_interval = report_interval  # kept for API compat
             self._upload_start_time = time.time()
             # File-level bars have unit="B" and a positive total;
             # file-count bars from thread_map have unit="it"
@@ -573,14 +592,8 @@ def tqdm_upload_patcher(
             ):
                 return result
 
+            # Emit event on every update — consumer handles its own throttle
             now = time.time()
-            with self._upload_lock:
-                if (
-                    now - self._upload_last_report_time
-                    < self._upload_report_interval
-                ):
-                    return result
-                self._upload_last_report_time = now
 
             bytes_completed = self.n
             total_bytes = self.total or 0
