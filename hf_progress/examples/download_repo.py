@@ -19,12 +19,18 @@ Usage::
     # Download a different repo:
     python download_repo.py --repo user/model-name
 
+    # Force HTTP fallback (skip Xet direct path):
+    python download_repo.py --no-xet
+
 The download uses ``HfProgressTracker.download_snapshot()`` which
 wraps ``huggingface_hub.snapshot_download()`` with a custom
 ``tqdm_class`` that emits ``ProgressEvent`` objects. The snapshot
 progress bar shows file-count progress (N/M files downloaded).
 
-For per-file byte-level progress, see ``download_file.py``.
+**Note**: ``snapshot_download()`` always uses the tqdm-based path
+(file-count progress). For byte-level progress with the direct-first
+Xet strategy (detailed callbacks with speed, dedup, per-item data),
+use ``download_file.py`` which calls ``download_file()`` instead.
 """
 
 from __future__ import annotations

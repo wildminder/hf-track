@@ -22,9 +22,19 @@ Usage::
     # Download a different file:
     python download_file.py --repo user/model --file path/to/file.bin
 
-This uses ``HfProgressTracker.download_file()`` which wraps
-``huggingface_hub.hf_hub_download()`` with a custom ``tqdm_class``
-that emits ``ProgressEvent`` objects with byte-level progress.
+    # Force HTTP fallback (skip Xet direct path):
+    python download_file.py --no-xet
+
+This uses ``HfProgressTracker.download_file()`` with a **direct-first**
+strategy:
+
+1. If ``hf_xet`` is available, calls ``hf_xet.download_files()`` directly
+   with a detailed ``(total_update, item_updates)`` callback. This provides
+   speed, dedup info, and per-item progress from the Rust runtime.
+
+2. If Xet is not available (or ``--no-xet`` is set), falls back to
+   ``hf_hub_download(tqdm_class=...)`` which works for HTTP downloads
+   with basic byte-level progress.
 
 Unlike ``download_repo.py`` (which shows file-count progress),
 this example shows real byte-level progress with speed and ETA.

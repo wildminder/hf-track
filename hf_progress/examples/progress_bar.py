@@ -7,7 +7,9 @@ Supports:
 - Byte-level progress with percentage
 - Transfer speed formatting (KB/s, MB/s, GB/s)
 - ETA display
-- Xet-specific fields (dedup savings, transfer vs processing bytes)
+- Xet-specific fields (dedup savings, transfer vs processing bytes,
+  network transfer speed) — shown when using the direct-first Xet
+  strategy with detailed ``(total_update, item_updates)`` callbacks
 - Multi-line display for snapshot downloads (file count + bytes)
 
 Windows-compatible: uses only ASCII characters for the progress bar
@@ -101,13 +103,17 @@ def render_progress_line(
 ) -> str:
     """Render a single progress line from a ProgressEvent.
 
-    Layout::
+    Layout (HTTP fallback)::
 
-        down  [##################------------]  67.3%  350.0 MB/520.0 MB  12.1 MB/s  ETA 14s
+        down [##################------------] 67.3% 350.0 MB/520.0 MB 12.1 MB/s ETA 14s
+
+    Layout (Xet direct — with transfer speed and dedup)::
+
+        down [##################------------] 67.3% 350.0 MB/520.0 MB 12.1 MB/s net:8.2 MB/s dedup:120.0 MB saved ETA 14s
 
     For snapshot downloads (file-count bars), the layout is::
 
-        files [##################------------]  5/12 files  12.1 MB/s
+        files [##################------------] 5/12 files 12.1 MB/s
     """
     # Phase label
     if phase_label:
@@ -117,7 +123,7 @@ def render_progress_line(
     elif event.phase == ProgressPhase.DOWNLOADING:
         label = "down "
     elif event.phase == ProgressPhase.UPLOADING:
-        label = "up   "
+        label = "up "
     elif event.phase == ProgressPhase.VERIFYING:
         label = "verify"
     elif event.phase == ProgressPhase.COMPLETE:
@@ -135,8 +141,15 @@ def render_progress_line(
     total = format_bytes(event.total_bytes) if event.total_bytes > 0 else "???"
     byte_str = f"{completed}/{total}"
 
-    # Speed
+    # Speed (processing speed — includes dedup-cached bytes)
     speed_str = format_speed(event.speed) if event.speed > 0 else ""
+
+    # Network transfer speed (Xet only — actual bytes sent over wire)
+    # When available, this is the real network throughput, which may be
+    # lower than processing speed when dedup saves data.
+    net_str = ""
+    if event.transfer_speed > 0:
+        net_str = f"net:{format_speed(event.transfer_speed)}"
 
     # ETA (only if we have speed and remaining bytes)
     eta_str = ""
@@ -150,15 +163,17 @@ def render_progress_line(
     if event.dedup_saved_bytes > 0:
         dedup_str = f"dedup:{format_bytes(event.dedup_saved_bytes)} saved"
 
-    parts = [f"{label} {bar} {pct}  {byte_str}"]
+    parts = [f"{label} {bar} {pct} {byte_str}"]
     if speed_str:
         parts.append(speed_str)
+    if net_str:
+        parts.append(net_str)
     if eta_str:
         parts.append(eta_str)
     if dedup_str:
         parts.append(dedup_str)
 
-    return "  ".join(parts)
+    return " ".join(parts)
 
 
 def render_snapshot_line(
@@ -198,9 +213,18 @@ class ConsoleProgressDisplay:
     Renders a live-updating progress bar in the terminal with:
     - Visual bar fill
     - Percentage, bytes completed/total
-    - Transfer speed
+    - Processing speed (includes dedup-cached bytes)
+    - Network transfer speed (Xet direct path only — ``net:`` prefix)
     - ETA
-    - Xet dedup savings (when available)
+    - Xet dedup savings (when available, from detailed callbacks)
+
+    When using the **direct-first Xet strategy**, the Rust runtime provides
+    ``transfer_speed`` and ``dedup_saved_bytes`` via the detailed
+    ``(total_update, item_updates)`` callback. These are rendered as
+    ``net:<speed>`` and ``dedup:<size> saved`` in the progress line.
+
+    When using the **HTTP fallback** (tqdm_class), only basic speed and
+    byte progress are available.
 
     Supports **timer-based refresh**: even when no new ProgressEvent arrives
     (e.g., between HTTP chunk downloads), the display re-renders at a
