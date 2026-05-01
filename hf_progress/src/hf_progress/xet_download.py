@@ -67,6 +67,7 @@ def download_file_with_xet(
     endpoint: Optional[str] = None,
     transfer_id: Optional[str] = None,
     report_interval: float = 0.1,
+    request_headers: Optional[dict] = None,
 ) -> XetDownloadResult:
     """Download a file using hf_xet with detailed progress tracking.
 
@@ -85,6 +86,9 @@ def download_file_with_xet(
         endpoint: Optional custom HuggingFace API endpoint.
         transfer_id: Unique transfer identifier (auto-generated if None).
         report_interval: Minimum seconds between progress events.
+        request_headers: Optional dict of HTTP headers to pass to
+            ``hf_xet.download_files()`` (e.g. user-agent). Auth
+            headers should be stripped before passing.
 
     Returns:
         XetDownloadResult with download status and metadata.
@@ -138,13 +142,17 @@ def download_file_with_xet(
     )
 
     try:
-        results = hf_xet.download_files(
-            download_info,
+        kwargs = dict(
+            download_info=download_info,
             endpoint=creds.endpoint,
             token_info=creds.token_info,
             token_refresher=creds.token_refresher,
             progress_updater=[callback],  # List of per-file callbacks
         )
+        if request_headers:
+            kwargs["request_headers"] = request_headers
+
+        results = hf_xet.download_files(**kwargs)
 
         # Emit complete event
         event_queue.put(
@@ -189,6 +197,7 @@ def download_files_with_xet(
     endpoint: Optional[str] = None,
     transfer_id: Optional[str] = None,
     report_interval: float = 0.1,
+    request_headers: Optional[dict] = None,
 ) -> List[XetDownloadResult]:
     """Download multiple files using hf_xet with detailed per-file progress.
 
@@ -198,15 +207,18 @@ def download_files_with_xet(
 
     Args:
         file_specs: List of dicts, each with keys:
-            - ``hash`` (str): Content hash of the file.
-            - ``file_size`` (int): Expected file size in bytes.
-            - ``dest_path`` (str): Local path to save the file.
-            - ``xet_file_data``: XetFileData for token acquisition.
+        - ``hash`` (str): Content hash of the file.
+        - ``file_size`` (int): Expected file size in bytes.
+        - ``dest_path`` (str): Local path to save the file.
+        - ``xet_file_data``: XetFileData for token acquisition.
         token: HuggingFace API token.
         event_queue: Queue for emitting ProgressEvent objects.
         endpoint: Optional custom HuggingFace API endpoint.
         transfer_id: Unique transfer identifier (auto-generated if None).
         report_interval: Minimum seconds between progress events.
+        request_headers: Optional dict of HTTP headers to pass to
+            ``hf_xet.download_files()`` (e.g. user-agent). Auth
+            headers should be stripped before passing.
 
     Returns:
         List of XetDownloadResult objects.
@@ -274,13 +286,17 @@ def download_files_with_xet(
         )
 
     try:
-        results = hf_xet.download_files(
-            download_infos,
+        kwargs = dict(
+            download_info=download_infos,
             endpoint=creds.endpoint,
             token_info=creds.token_info,
             token_refresher=creds.token_refresher,
             progress_updater=callbacks,
         )
+        if request_headers:
+            kwargs["request_headers"] = request_headers
+
+        results = hf_xet.download_files(**kwargs)
 
         # Emit complete events
         download_results = []

@@ -291,14 +291,68 @@ class TestXetDownloadProgressCallback:
         callback(total_update, item_updates)
 
         event = q.get_nowait()
-        assert event.bytes_completed == 500
+        # bytes_completed uses transfer_completed (400) for smooth
+        # progress, not total_bytes_completed (500) which only
+        # updates when chunks are fully assembled.
+        assert event.bytes_completed == 400
         assert event.total_bytes == 1000
-        assert event.percentage == 50.0
-        assert event.speed == 1000.0
+        assert event.percentage == 40.0  # 400/1000
+        # speed uses transfer_speed when available
+        assert event.speed == 800.0
         assert event.transfer_bytes_completed == 400
         assert event.transfer_bytes_total == 800
         assert event.transfer_speed == 800.0
         assert event.dedup_saved_bytes == 100  # 500 - 400
+
+    def test_uses_transfer_completed_for_smooth_progress(self):
+        """bytes_completed uses transfer_completed for smooth progress.
+
+        When transfer_completed > 0, it provides incremental network-level
+        progress. total_bytes_completed only jumps when chunks are assembled.
+        """
+        q = queue.Queue()
+        callback = XetDownloadProgressCallback(
+            filename="test.bin",
+            total_bytes=1000,
+            event_queue=q,
+            report_interval=0,
+        )
+
+        # transfer_completed=300 > 0, so bytes_completed should be 300
+        total_update = self._make_total_update(
+            total_bytes=1000,
+            total_bytes_completed=100,  # assembly progress (jumps)
+            total_transfer_bytes=800,
+            total_transfer_bytes_completed=300,  # network progress (smooth)
+            total_transfer_bytes_completion_rate=500.0,
+        )
+        callback(total_update, [])
+        event = q.get_nowait()
+        assert event.bytes_completed == 300  # uses transfer_completed
+        assert event.percentage == 30.0  # 300/1000
+        assert event.speed == 500.0  # uses transfer_speed
+
+    def test_uses_total_bytes_completed_at_100_percent(self):
+        """At 100%, bytes_completed uses total_bytes_completed for exact value."""
+        q = queue.Queue()
+        callback = XetDownloadProgressCallback(
+            filename="test.bin",
+            total_bytes=1000,
+            event_queue=q,
+            report_interval=0,
+        )
+
+        # When bytes_completed >= total_bytes, use the exact final value
+        total_update = self._make_total_update(
+            total_bytes=1000,
+            total_bytes_completed=1000,  # fully assembled
+            total_transfer_bytes=800,
+            total_transfer_bytes_completed=750,  # less due to dedup
+        )
+        callback(total_update, [])
+        event = q.get_nowait()
+        assert event.bytes_completed == 1000  # uses total_bytes_completed
+        assert event.percentage == 100.0
 
     def test_computes_percentage(self):
         """Percentage should be computed from bytes_completed/total_bytes."""

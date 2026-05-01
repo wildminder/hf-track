@@ -170,10 +170,14 @@ class HfProgressTracker:
                     local_dir=local_dir,
                     transfer_id=transfer_id,
                 )
-            except Exception:
+            except Exception as xet_err:
                 # If Xet direct fails (e.g. file not in Xet storage,
                 # token refresh failure), fall back to standard path
-                pass
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Xet direct download failed for {repo_id}/{filename}, "
+                    f"falling back to tqdm_class: {xet_err}"
+                )
 
         # Fallback: use hf_hub_download with tqdm_class override
         from .standard_download import download_file as _download_file
@@ -256,48 +260,53 @@ class HfProgressTracker:
     ) -> str:
         """Download a file using hf_xet directly with detailed progress.
 
-        Acquires ``XetFileData`` (file hash + refresh route) via a HEAD
-        request, then calls ``hf_xet.download_files()`` with a detailed
-        ``(total_update, item_updates)`` callback.
+        Uses ``HfApi.get_hf_file_metadata()`` to acquire ``XetFileData``
+        (file hash + refresh route), then calls ``hf_xet.download_files()``
+        with a detailed ``(total_update, item_updates)`` callback.
 
         Raises:
             ValueError: If the file is not stored in Xet storage
-                (no ``XetFileData`` in the HEAD response).
+                (no ``XetFileData`` in the metadata response).
             ImportError: If ``hf_xet`` is not installed.
         """
-        from huggingface_hub import HfApi, build_hf_headers
-        from huggingface_hub.utils import (
-            parse_xet_file_data_from_response,
-        )
+        from huggingface_hub import HfApi, hf_hub_url
 
         from .xet_download import download_file_with_xet
 
-        # Step 1: Acquire XetFileData via a HEAD request
+        # Step 1: Acquire XetFileData via get_hf_file_metadata
+        # This is the stable public API that handles HEAD requests,
+        # redirects, and Xet header parsing internally.
         api = HfApi(endpoint=self._endpoint, token=self._token)
-        headers = build_hf_headers(token=self._token)
-
-        url = (
-            f"{api.endpoint}/api/{repo_type}s/{repo_id}/resolve/{revision or 'main'}/{filename}"
+        url = hf_hub_url(
+            repo_id=repo_id,
+            filename=filename,
+            repo_type=repo_type,
+            revision=revision,
+            endpoint=self._endpoint,
         )
-        response = api._session.head(url, headers=headers, follow_redirects=True)
+        metadata = api.get_hf_file_metadata(url=url, token=self._token)
 
-        xet_file_data = parse_xet_file_data_from_response(
-            response, endpoint=self._endpoint
-        )
-        if xet_file_data is None:
+        if metadata.xet_file_data is None:
             raise ValueError(
                 f"File '{filename}' in '{repo_id}' is not stored in Xet storage. "
                 f"Use the standard download path instead."
             )
 
-        # Step 2: Determine file size and destination
-        file_size = int(response.headers.get("content-length", 0))
+        xet_file_data = metadata.xet_file_data
+        file_size = metadata.size or 0
+
+        # Step 2: Determine destination path
         if local_dir:
             dest_path = os.path.join(local_dir, filename)
         else:
             dest_path = os.path.join(tempfile.gettempdir(), filename)
 
-        # Step 3: Call hf_xet.download_files() directly
+        # Step 3: Build request headers (strip auth for Xet CAS server)
+        headers = api._build_hf_headers()
+        xet_headers = dict(headers)
+        xet_headers.pop("authorization", None)
+
+        # Step 4: Call hf_xet.download_files() directly
         result = download_file_with_xet(
             file_hash=xet_file_data.file_hash,
             file_size=file_size,
@@ -305,9 +314,10 @@ class HfProgressTracker:
             xet_file_data=xet_file_data,
             token=self._token,
             event_queue=self.event_queue,
-            endpoint=self._endpoint,
+            endpoint=api.endpoint,
             transfer_id=transfer_id,
             report_interval=self._report_interval,
+            request_headers=xet_headers,
         )
 
         return result.destination_path

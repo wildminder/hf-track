@@ -18,11 +18,19 @@ Four callback mechanisms are provided:
    Monkey-patches tqdm globally to intercept upload progress bars.
    Fallback when hf_xet is not available.
 
-**Event emission philosophy**: All callbacks emit a ProgressEvent on
-every invocation/update. The consumer (UI, SSE, etc.) is responsible
-for its own throttling and display refresh. This ensures real-time
-progress data is always available — no "frozen then jump" gaps caused
-by producer-side throttling.
+**Event emission philosophy**:
+
+- **Xet callbacks** (1, 2): Emit a ProgressEvent on every invocation.
+  The Rust runtime calls these at its own cadence (typically every
+  100ms+), so the event volume is manageable.
+
+- **tqdm callbacks** (3, 4): Emit a ProgressEvent only when actual
+  bytes are received (``n > 0``). tqdm's internal display refresh
+  calls (``update(0)``) are skipped to avoid flooding the queue
+  with stale progress data. The consumer handles display refresh.
+
+This ensures real-time progress data is always available — no
+"frozen then jump" gaps caused by producer-side throttling.
 """
 
 from __future__ import annotations
@@ -208,6 +216,22 @@ class XetDownloadProgressCallback:
         The Rust runtime calls this at its own cadence (typically every
         100ms+), so the event volume is manageable.
 
+        **Progress field semantics**:
+
+        The Rust runtime provides two progress metrics:
+
+        - ``total_bytes_completed``: Bytes fully processed (assembled
+          from chunks and written to disk). This jumps when a chunk
+          assembly completes, not incrementally during transfer.
+        - ``total_transfer_bytes_completed``: Bytes received from the
+          network (before dedup/assembly). This updates incrementally
+          as data arrives, providing smooth real-time progress.
+
+        For the ``bytes_completed`` field in ProgressEvent, we use
+        ``total_transfer_bytes_completed`` when available (non-zero)
+        because it provides smooth incremental progress. We fall back
+        to ``total_bytes_completed`` for the final 100% event.
+
         Args:
             total_update: PyTotalProgressUpdate with fields:
                 - total_bytes (int)
@@ -234,8 +258,23 @@ class XetDownloadProgressCallback:
             total_update, "total_transfer_bytes_completion_rate", 0
         ) or 0
 
+        # Use transfer_completed for smooth progress when available.
+        # total_bytes_completed only jumps when chunks are assembled,
+        # but transfer_completed updates incrementally as data arrives.
+        # When bytes_completed == total_bytes (100%), use that instead
+        # to ensure the final event shows exact completion.
+        if bytes_completed >= total_bytes > 0:
+            # Download complete — use the exact final value
+            display_completed = bytes_completed
+        elif transfer_completed > 0:
+            # Transfer in progress — use network-level progress
+            display_completed = transfer_completed
+        else:
+            # No transfer data yet — use assembly progress
+            display_completed = bytes_completed
+
         percentage = (
-            (bytes_completed / total_bytes * 100) if total_bytes > 0 else 0
+            (display_completed / total_bytes * 100) if total_bytes > 0 else 0
         )
         dedup_saved = max(0, bytes_completed - transfer_completed)
 
@@ -245,10 +284,10 @@ class XetDownloadProgressCallback:
             direction=TransferDirection.DOWNLOAD,
             filename=self.filename,
             phase=ProgressPhase.DOWNLOADING,
-            bytes_completed=bytes_completed,
+            bytes_completed=display_completed,
             total_bytes=total_bytes,
             percentage=percentage,
-            speed=speed,
+            speed=transfer_speed or speed,
             file_index=self.file_index,
             total_files=self.total_files,
             transfer_bytes_completed=transfer_completed,
@@ -344,22 +383,23 @@ class DownloadProgressTqdm(base_tqdm):
             self._filename = self.desc or "unknown"
 
     def update(self, n=1):
-        """Override update to emit progress events on every call.
+        """Override update to emit progress events when bytes change.
 
         Called by ``huggingface_hub`` internals for each chunk downloaded.
         For HTTP downloads: called per ``len(chunk)`` bytes received.
         For Xet downloads: called via ``progress_updater`` closure that
         wraps ``progress.update(progress_bytes)``.
 
-        **Event emission**: Every ``update()`` call emits a ProgressEvent
-        to the queue. The consumer (UI, SSE, etc.) is responsible for
-        its own throttling/display refresh. This ensures real-time
-        progress data is always available — no "frozen then jump" gaps.
+        **Event emission**: Emits a ProgressEvent when ``n > 0`` (i.e.,
+        when actual bytes are received). Calls with ``n=0`` (tqdm's
+        internal display refresh) are skipped to avoid flooding the
+        queue with duplicate events. The consumer (UI, SSE, etc.) is
+        responsible for its own throttling/display refresh.
 
-        **Performance**: The queue is unbounded and ``put()`` is O(1).
-        For HTTP downloads, ``update()`` is called per chunk (typically
-        every 1-10 MB). For Xet downloads, the Rust runtime calls the
-        progress updater at its own cadence (typically every 100ms+).
+        **Why skip n=0?** tqdm calls ``update(0)`` periodically to
+        refresh its display (e.g., updating the ETA). These calls don't
+        represent new data — ``self.n`` hasn't changed — so emitting
+        events for them would flood the queue with stale progress data.
         """
         # Always update tqdm's internal counter first
         result = super().update(n)
@@ -367,7 +407,11 @@ class DownloadProgressTqdm(base_tqdm):
         if self._event_queue is None:
             return result
 
-        # Emit event on every update — consumer handles its own throttle
+        # Only emit when actual bytes are received (n > 0)
+        # Skip tqdm's internal display refresh calls (n=0)
+        if n == 0:
+            return result
+
         now = time.time()
 
         # Calculate progress from current accumulated state
@@ -584,15 +628,15 @@ def tqdm_upload_patcher(
         def update(self, n=1):
             result = super().update(n)
 
-            # Only emit events for file-level bars
+            # Only emit events for file-level bars with actual byte updates
             if (
                 not self._upload_is_file_bar
                 or self._upload_event_queue is None
                 or not _patch_active
+                or n == 0  # Skip tqdm's internal display refresh
             ):
                 return result
 
-            # Emit event on every update — consumer handles its own throttle
             now = time.time()
 
             bytes_completed = self.n
