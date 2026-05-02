@@ -6,7 +6,7 @@ import contextlib
 import queue
 from typing import Callable, Optional
 
-from .callbacks import DownloadProgressTqdm
+from .callbacks import DownloadProgressTqdm, state_manager
 from .types import (
     EventType,
     ProgressEvent,
@@ -46,25 +46,18 @@ def patch_xet_get():
         return
 
     def patched_xet_get(*args, **kwargs):
-        incomplete_path = kwargs.get("incomplete_path") if "incomplete_path" in kwargs else args[0]
-        xet_file_data = kwargs.get("xet_file_data") if "xet_file_data" in kwargs else args[1]
-        headers = kwargs.get("headers") if "headers" in kwargs else args[2]
-        
+        # xet_get is a keyword-only function natively. Accessing args[0] throws IndexError.
+        incomplete_path = kwargs.get("incomplete_path")
+        xet_file_data = kwargs.get("xet_file_data")
+        headers = kwargs.get("headers", {})
         expected_size = kwargs.get("expected_size")
-        if expected_size is None and len(args) > 3:
-            expected_size = args[3]
-            
         displayed_filename = kwargs.get("displayed_filename")
-        if displayed_filename is None and len(args) > 4:
-            displayed_filename = args[4]
-            
         tqdm_class = kwargs.get("tqdm_class")
-        if tqdm_class is None and len(args) > 5:
-            tqdm_class = args[5]
-            
         _tqdm_bar = kwargs.get("_tqdm_bar")
-        if _tqdm_bar is None and len(args) > 6:
-            _tqdm_bar = args[6]
+
+        if incomplete_path is None or xet_file_data is None:
+            # Gracefully fallback if upstream huggingface_hub changes its kwargs heavily
+            return original_xet_get(*args, **kwargs)
 
         try:
             from hf_xet import PyXetDownloadInfo, download_files
@@ -208,6 +201,8 @@ def download_file(
             )
         )
         raise
+    finally:
+        state_manager.clear_state(transfer_id)
 
 
 def download_snapshot(
@@ -254,6 +249,24 @@ def download_snapshot(
 
         with patch_download_chunk_size(), patch_xet_get():
             result = snapshot_download(**download_kwargs)
+            
+        # Manually synthesize the COMPLETE event for snapshot downloads because 
+        # huggingface_hub's _AggregatedTqdm never calls .close() on the byte tracking bar.
+        stats = state_manager.get_state(transfer_id)
+        event_queue.put(
+            ProgressEvent(
+                event_type=EventType.COMPLETE,
+                transfer_id=transfer_id,
+                direction=TransferDirection.DOWNLOAD,
+                filename=f"{repo_id}",
+                phase=ProgressPhase.COMPLETE,
+                bytes_completed=stats.get("bytes_completed", 0),
+                total_bytes=stats.get("total_bytes", 0),
+                percentage=100.0,
+                file_index=stats.get("files_completed", 0),
+                total_files=stats.get("total_files", 0),
+            )
+        )
         return result
 
     except Exception as e:
@@ -268,3 +281,5 @@ def download_snapshot(
             )
         )
         raise
+    finally:
+        state_manager.clear_state(transfer_id)

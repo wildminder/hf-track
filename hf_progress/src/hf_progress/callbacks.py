@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import queue
+import threading
 import time
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 
 from tqdm.auto import tqdm as base_tqdm
 
@@ -16,7 +17,76 @@ from .types import (
     TransferDirection,
 )
 
-_TRANSFER_STATES = {}
+
+class TransferStateManager:
+    """Thread-safe manager for aggregate transfer states."""
+    
+    def __init__(self):
+        self._states: Dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def init_download(self, transfer_id: str):
+        with self._lock:
+            if transfer_id not in self._states:
+                self._states[transfer_id] = {
+                    "files_completed": 0,
+                    "total_files": 0,
+                    "bytes_completed": 0,
+                    "total_bytes": 0,
+                }
+
+    def init_upload(self, transfer_id: str, filename: str, total_bytes: int, event_queue: queue.Queue):
+        with self._lock:
+            if transfer_id not in self._states:
+                self._states[transfer_id] = {
+                    "filename": filename,
+                    "total_bytes": total_bytes,
+                    "bytes_completed": 0,
+                    "event_queue": event_queue,
+                    "completed_emitted": False,
+                    "start_time": time.time(),
+                }
+
+    def update_download_files(self, transfer_id: str, files_completed: int, total_files: int):
+        with self._lock:
+            if transfer_id in self._states:
+                self._states[transfer_id]["files_completed"] = files_completed
+                if total_files > 0:
+                    self._states[transfer_id]["total_files"] = total_files
+
+    def update_download_bytes(self, transfer_id: str, bytes_completed: int, total_bytes: int):
+        with self._lock:
+            if transfer_id in self._states:
+                self._states[transfer_id]["bytes_completed"] = bytes_completed
+                self._states[transfer_id]["total_bytes"] = total_bytes
+
+    def add_upload_bytes(self, transfer_id: str, byte_increment: int) -> dict:
+        """Accumulates bytes for multipart uploads and returns the current state."""
+        with self._lock:
+            state = self._states.get(transfer_id)
+            if state:
+                state["bytes_completed"] += byte_increment
+                # Return a copy for safe event emission
+                return dict(state)
+            return {}
+
+    def mark_upload_completed(self, transfer_id: str):
+        with self._lock:
+            state = self._states.get(transfer_id)
+            if state:
+                state["completed_emitted"] = True
+
+    def get_state(self, transfer_id: str) -> dict:
+        with self._lock:
+            return dict(self._states.get(transfer_id, {}))
+
+    def clear_state(self, transfer_id: str):
+        with self._lock:
+            self._states.pop(transfer_id, None)
+
+
+# Global thread-safe state manager
+state_manager = TransferStateManager()
 
 
 class _DummyFile:
@@ -77,16 +147,19 @@ class XetUploadProgressCallback:
         percentage = ((display_completed / total_bytes * 100) if total_bytes > 0 else 0)
         dedup_saved = max(0, bytes_completed - transfer_completed) if self.total_files == 1 else 0
 
+        self._emit(display_completed, total_bytes, percentage, transfer_speed or speed, transfer_completed, transfer_total, transfer_speed, dedup_saved)
+
+    def _emit(self, bytes_completed, total_bytes, percentage, speed, transfer_completed, transfer_total, transfer_speed, dedup_saved):
         event = ProgressEvent(
             event_type=EventType.PROGRESS,
             transfer_id=self.transfer_id,
             direction=TransferDirection.UPLOAD,
             filename=self.filename,
             phase=ProgressPhase.UPLOADING,
-            bytes_completed=display_completed,
+            bytes_completed=bytes_completed,
             total_bytes=total_bytes,
             percentage=percentage,
-            speed=transfer_speed or speed,
+            speed=speed,
             file_index=self.file_index,
             total_files=self.total_files,
             transfer_bytes_completed=transfer_completed if self.total_files == 1 else 0,
@@ -94,7 +167,10 @@ class XetUploadProgressCallback:
             transfer_speed=transfer_speed if self.total_files == 1 else 0,
             dedup_saved_bytes=dedup_saved,
         )
-        self.event_queue.put(event)
+        try:
+            self.event_queue.put_nowait(event)
+        except queue.Full:
+            pass
 
 
 class XetDownloadProgressCallback:
@@ -151,16 +227,19 @@ class XetDownloadProgressCallback:
         percentage = ((display_completed / total_bytes * 100) if total_bytes > 0 else 0)
         dedup_saved = max(0, bytes_completed - transfer_completed) if self.total_files == 1 else 0
 
+        self._emit(display_completed, total_bytes, percentage, transfer_speed or speed, transfer_completed, transfer_total, transfer_speed, dedup_saved)
+
+    def _emit(self, bytes_completed, total_bytes, percentage, speed, transfer_completed, transfer_total, transfer_speed, dedup_saved):
         event = ProgressEvent(
             event_type=EventType.PROGRESS,
             transfer_id=self.transfer_id,
             direction=TransferDirection.DOWNLOAD,
             filename=self.filename,
             phase=ProgressPhase.DOWNLOADING,
-            bytes_completed=display_completed,
+            bytes_completed=bytes_completed,
             total_bytes=total_bytes,
             percentage=percentage,
-            speed=transfer_speed or speed,
+            speed=speed,
             file_index=self.file_index,
             total_files=self.total_files,
             transfer_bytes_completed=transfer_completed if self.total_files == 1 else 0,
@@ -168,7 +247,10 @@ class XetDownloadProgressCallback:
             transfer_speed=transfer_speed if self.total_files == 1 else 0,
             dedup_saved_bytes=dedup_saved,
         )
-        self.event_queue.put(event)
+        try:
+            self.event_queue.put_nowait(event)
+        except queue.Full:
+            pass
 
 
 class DownloadProgressTqdm(base_tqdm):
@@ -181,21 +263,16 @@ class DownloadProgressTqdm(base_tqdm):
         self._start_time = time.time()
         self._closed = False
         
-        # Determine if this is a bytes bar BEFORE super().__init__ 
-        # so it doesn't fail if super().__init__ fails
         self.is_bytes_bar = (kwargs.get("unit", "it") in ("B", "iB"))
-        
         kwargs.pop("name", None)
         super().__init__(*args, **kwargs)
         
         if not self._filename:
             self._filename = getattr(self, "desc", "unknown") or "unknown"
         
-        if self._transfer_id not in _TRANSFER_STATES:
-            _TRANSFER_STATES[self._transfer_id] = {"files_completed": 0, "total_files": 0}
-            
+        state_manager.init_download(self._transfer_id)
         if not self.is_bytes_bar:
-            _TRANSFER_STATES[self._transfer_id]["total_files"] = getattr(self, "total", 0) or 0
+            state_manager.update_download_files(self._transfer_id, 0, getattr(self, "total", 0) or 0)
 
     def update(self, n=1):
         if self._is_cancelled is not None and self._is_cancelled():
@@ -207,7 +284,7 @@ class DownloadProgressTqdm(base_tqdm):
             return result
 
         if not getattr(self, "is_bytes_bar", False):
-            _TRANSFER_STATES[self._transfer_id]["files_completed"] = getattr(self, "n", 0)
+            state_manager.update_download_files(self._transfer_id, getattr(self, "n", 0), getattr(self, "total", 0) or 0)
             return result
 
         now = time.time()
@@ -215,14 +292,16 @@ class DownloadProgressTqdm(base_tqdm):
         total_bytes = getattr(self, "total", 0) or 0
         percentage = ((bytes_completed / total_bytes * 100) if total_bytes > 0 else 0)
 
+        state_manager.update_download_bytes(self._transfer_id, bytes_completed, total_bytes)
+
         speed = getattr(self, "format_dict", {}).get("rate") or 0
         if not speed and bytes_completed > 0:
             elapsed = now - self._start_time
             speed = bytes_completed / elapsed if elapsed > 0 else 0
 
-        file_stats = _TRANSFER_STATES.get(self._transfer_id, {})
-        files_completed = file_stats.get("files_completed", 0)
-        total_files = file_stats.get("total_files", 0)
+        state = state_manager.get_state(self._transfer_id)
+        files_completed = state.get("files_completed", 0)
+        total_files = state.get("total_files", 0)
 
         event = ProgressEvent(
             event_type=EventType.PROGRESS,
@@ -237,7 +316,10 @@ class DownloadProgressTqdm(base_tqdm):
             file_index=files_completed,
             total_files=total_files,
         )
-        self._event_queue.put(event)
+        try:
+            self._event_queue.put_nowait(event)
+        except queue.Full:
+            pass
         return result
 
     def close(self):
@@ -255,24 +337,25 @@ class DownloadProgressTqdm(base_tqdm):
 
             if is_complete or is_xet_cached:
                 final_bytes = total_val if is_xet_cached else n_val
-                file_stats = _TRANSFER_STATES.get(self._transfer_id, {})
-                total_files = file_stats.get("total_files", 0)
-                files_completed = total_files if total_files > 0 else file_stats.get("files_completed", 0)
+                state = state_manager.get_state(self._transfer_id)
+                total_files = state.get("total_files", 0)
+                files_completed = total_files if total_files > 0 else state.get("files_completed", 0)
 
-                self._event_queue.put(
-                    ProgressEvent(
-                        event_type=EventType.COMPLETE,
-                        transfer_id=self._transfer_id,
-                        direction=TransferDirection.DOWNLOAD,
-                        filename=self._filename,
-                        phase=ProgressPhase.COMPLETE,
-                        bytes_completed=final_bytes,
-                        total_bytes=total_val,
-                        percentage=100.0,
-                        file_index=files_completed,
-                        total_files=total_files,
-                    )
+                event = ProgressEvent(
+                    event_type=EventType.COMPLETE,
+                    transfer_id=self._transfer_id,
+                    direction=TransferDirection.DOWNLOAD,
+                    filename=self._filename,
+                    phase=ProgressPhase.COMPLETE,
+                    bytes_completed=final_bytes,
+                    total_bytes=total_val,
+                    percentage=100.0,
+                    file_index=files_completed,
+                    total_files=total_files,
                 )
+                # Force enqueue COMPLETE event even if full (use put)
+                self._event_queue.put(event)
+                
         super().close()
 
     @classmethod
@@ -297,8 +380,6 @@ class DownloadProgressTqdm(base_tqdm):
                 kwargs.setdefault("filename", _fname)
                 kwargs.setdefault("report_interval", _interval)
                 kwargs.setdefault("is_cancelled", _cancel_hook)
-                
-                # IMPORTANT: Silence native tqdm rendering without breaking its math
                 kwargs["file"] = _dummy_file
                 super().__init__(*args, **kwargs)
 
@@ -314,40 +395,49 @@ def tqdm_upload_patcher(
     filename: str = "",
     report_interval: float = 0.1,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    total_bytes: int = 0,
 ):
     import tqdm.auto as tqdm_auto_module
 
     original_tqdm = tqdm_auto_module.tqdm
     _patch_active = True
 
+    # Register this upload in the state manager.
+    # LFS multipart uploads will spawn multiple tqdm bars matching this transfer_id
+    state_manager.init_upload(transfer_id, filename, total_bytes, event_queue)
+
     class UploadProgressTqdm(original_tqdm):
         def __init__(self, *args, **kwargs):
-            # IMPORTANT: Silence native tqdm rendering without breaking its math
             kwargs["file"] = _dummy_file
             super().__init__(*args, **kwargs)
             
-            self._upload_event_queue = event_queue
-            self._upload_transfer_id = transfer_id
-            self._upload_filename = filename or getattr(self, "desc", "") or ""
-            self._upload_report_interval = report_interval
-            self._upload_start_time = time.time()
+            # Identify if this bar corresponds to our transfer by checking if the transfer state exists
+            self._managed_state = state_manager.get_state(transfer_id)
+            
+            # File bars have unit="B"
             self._upload_is_file_bar = (
                 getattr(self, "total", None) is not None
                 and getattr(self, "total", 0) > 0
                 and getattr(self, "unit", "") in ("B", "iB")
             )
+            
+            # Track bytes for this specific bar instance to calculate deltas
+            self._last_n = 0
 
-            if getattr(self, "_upload_is_file_bar", False) and event_queue is not None:
-                event_queue.put(
-                    ProgressEvent(
-                        event_type=EventType.START,
-                        transfer_id=transfer_id,
-                        direction=TransferDirection.UPLOAD,
-                        filename=self._upload_filename,
-                        phase=ProgressPhase.UPLOADING,
-                        total_bytes=getattr(self, "total", 0),
-                    )
+            # Only emit START once across all multipart chunks
+            if getattr(self, "_upload_is_file_bar", False) and self._managed_state and self._managed_state["bytes_completed"] == 0:
+                event = ProgressEvent(
+                    event_type=EventType.START,
+                    transfer_id=transfer_id,
+                    direction=TransferDirection.UPLOAD,
+                    filename=self._managed_state["filename"],
+                    phase=ProgressPhase.UPLOADING,
+                    total_bytes=self._managed_state["total_bytes"],
                 )
+                try:
+                    event_queue.put_nowait(event)
+                except queue.Full:
+                    pass
 
         def update(self, n=1):
             if is_cancelled is not None and is_cancelled():
@@ -355,58 +445,65 @@ def tqdm_upload_patcher(
 
             result = super().update(n)
 
-            if (
-                not getattr(self, "_upload_is_file_bar", False)
-                or getattr(self, "_upload_event_queue", None) is None
-                or not _patch_active
-                or n == 0
-            ):
+            if not getattr(self, "_upload_is_file_bar", False) or not _patch_active or n == 0:
                 return result
 
-            now = time.time()
-            bytes_completed = getattr(self, "n", 0)
-            total_bytes = getattr(self, "total", 0) or 0
-            percentage = ((bytes_completed / total_bytes * 100) if total_bytes > 0 else 0)
+            current_n = getattr(self, "n", 0)
+            delta = current_n - self._last_n
+            self._last_n = current_n
 
-            speed = getattr(self, "format_dict", {}).get("rate") or 0
-            if not speed and bytes_completed > 0:
-                elapsed = now - getattr(self, "_upload_start_time", now)
-                speed = bytes_completed / elapsed if elapsed > 0 else 0
+            if delta > 0:
+                # Accumulate bytes globally for this transfer (handles multipart chunks safely)
+                state = state_manager.add_upload_bytes(transfer_id, delta)
+                if state:
+                    bytes_completed = state["bytes_completed"]
+                    total_bytes = state["total_bytes"]
+                    percentage = ((bytes_completed / total_bytes * 100) if total_bytes > 0 else 0)
 
-            event = ProgressEvent(
-                event_type=EventType.PROGRESS,
-                transfer_id=self._upload_transfer_id,
-                direction=TransferDirection.UPLOAD,
-                filename=self._upload_filename,
-                phase=ProgressPhase.UPLOADING,
-                bytes_completed=bytes_completed,
-                total_bytes=total_bytes,
-                percentage=percentage,
-                speed=speed or 0,
-            )
-            self._upload_event_queue.put(event)
+                    now = time.time()
+                    elapsed = now - state["start_time"]
+                    speed = bytes_completed / elapsed if elapsed > 0 else 0
+
+                    event = ProgressEvent(
+                        event_type=EventType.PROGRESS,
+                        transfer_id=transfer_id,
+                        direction=TransferDirection.UPLOAD,
+                        filename=state["filename"],
+                        phase=ProgressPhase.UPLOADING,
+                        bytes_completed=bytes_completed,
+                        total_bytes=total_bytes,
+                        percentage=percentage,
+                        speed=speed,
+                    )
+                    try:
+                        state["event_queue"].put_nowait(event)
+                    except queue.Full:
+                        pass
             return result
 
         def close(self):
-            if (
-                getattr(self, "_upload_is_file_bar", False)
-                and getattr(self, "_upload_event_queue", None) is None
-                and _patch_active
-                and getattr(self, "total", None) is not None
-                and getattr(self, "n", 0) >= self.total
-            ):
-                self._upload_event_queue.put(
-                    ProgressEvent(
+            if not getattr(self, "_upload_is_file_bar", False) or not _patch_active:
+                super().close()
+                return
+                
+            state = state_manager.get_state(transfer_id)
+            if state and not state.get("completed_emitted", False):
+                # Check if we have actually finished all bytes across all parts
+                if state["bytes_completed"] >= state["total_bytes"]:
+                    state_manager.mark_upload_completed(transfer_id)
+                    event = ProgressEvent(
                         event_type=EventType.COMPLETE,
-                        transfer_id=self._upload_transfer_id,
+                        transfer_id=transfer_id,
                         direction=TransferDirection.UPLOAD,
-                        filename=self._upload_filename,
+                        filename=state["filename"],
                         phase=ProgressPhase.COMPLETE,
-                        bytes_completed=self.n,
-                        total_bytes=self.total,
+                        bytes_completed=state["bytes_completed"],
+                        total_bytes=state["total_bytes"],
                         percentage=100.0,
                     )
-                )
+                    # Force enqueue COMPLETE event
+                    state["event_queue"].put(event)
+                    
             super().close()
 
     tqdm_auto_module.tqdm = UploadProgressTqdm

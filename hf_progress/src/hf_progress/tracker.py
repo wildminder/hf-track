@@ -30,7 +30,8 @@ class HfProgressTracker:
         self._token = token
         self._endpoint = endpoint
         self._report_interval = report_interval
-        self.event_queue: queue.Queue[ProgressEvent] = queue.Queue()
+        # IMP-012: Bounded queue to prevent OOM crashes if consumers hang
+        self.event_queue: queue.Queue[ProgressEvent] = queue.Queue(maxsize=10000)
         self._token_manager = XetTokenManager(token, endpoint)
         self._active_transfers: dict = {}
         self._cancelled_transfers: set[str] = set()
@@ -74,6 +75,7 @@ class HfProgressTracker:
                 )
             except Exception as xet_err:
                 import logging
+
                 logging.getLogger(__name__).warning(
                     f"Xet direct download failed for {repo_id}/{filename}, "
                     f"falling back to tqdm_class: {xet_err}"
@@ -262,6 +264,41 @@ class HfProgressTracker:
                 is_cancelled=is_cancelled_hook,
             )
 
+    def upload_folder(
+        self,
+        folder_path: str,
+        repo_id: str,
+        path_in_repo: Optional[str] = None,
+        repo_type: str = "model",
+        revision: Optional[str] = None,
+        allow_patterns: Optional[list[str] | str] = None,
+        ignore_patterns: Optional[list[str] | str] = None,
+        delete_patterns: Optional[list[str] | str] = None,
+        transfer_id: Optional[str] = None,
+    ) -> str:
+        """Upload a folder to the Hub using LFS via standard API."""
+        from .standard_upload import upload_folder as _upload_folder
+
+        transfer_id = transfer_id or generate_transfer_id()
+        is_cancelled_hook = lambda: self.is_cancelled(transfer_id)
+
+        return _upload_folder(
+            folder_path=folder_path,
+            repo_id=repo_id,
+            token=self._token,
+            event_queue=self.event_queue,
+            path_in_repo=path_in_repo,
+            repo_type=repo_type,
+            revision=revision,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+            delete_patterns=delete_patterns,
+            endpoint=self._endpoint,
+            transfer_id=transfer_id,
+            report_interval=self._report_interval,
+            is_cancelled=is_cancelled_hook,
+        )
+
     # ── Event Consumer Methods ────────────────────────────────────
 
     def get_events(self, timeout: float = 0) -> List[ProgressEvent]:
@@ -307,47 +344,137 @@ class HfProgressTracker:
     # ── Internal: Xet Upload Methods ──────────────────────────────
 
     def _upload_file_xet(
-        self, file_path: str, repo_id: str, path_in_repo: str, repo_type: str, revision: Optional[str], transfer_id: str, filename: str, is_cancelled: callable,
+        self,
+        file_path: str,
+        repo_id: str,
+        path_in_repo: str,
+        repo_type: str,
+        revision: Optional[str],
+        transfer_id: str,
+        filename: str,
+        is_cancelled: callable,
     ) -> str:
         from .xet_upload import upload_file_with_xet
+
         try:
             result = upload_file_with_xet(
-                file_path=file_path, repo_id=repo_id, token=self._token, event_queue=self.event_queue, repo_type=repo_type, revision=revision, endpoint=self._endpoint, transfer_id=transfer_id, report_interval=self._report_interval, is_cancelled=is_cancelled,
+                file_path=file_path,
+                repo_id=repo_id,
+                token=self._token,
+                event_queue=self.event_queue,
+                repo_type=repo_type,
+                revision=revision,
+                endpoint=self._endpoint,
+                transfer_id=transfer_id,
+                report_interval=self._report_interval,
+                is_cancelled=is_cancelled,
             )
             return result.hash or result.filename
         except ImportError:
             return self._upload_file_lfs(
-                file_path=file_path, repo_id=repo_id, path_in_repo=path_in_repo, repo_type=repo_type, revision=revision, transfer_id=transfer_id, filename=filename, is_cancelled=is_cancelled,
+                file_path=file_path,
+                repo_id=repo_id,
+                path_in_repo=path_in_repo,
+                repo_type=repo_type,
+                revision=revision,
+                transfer_id=transfer_id,
+                filename=filename,
+                is_cancelled=is_cancelled,
             )
 
     def _upload_bytes_xet(
-        self, file_content: bytes, filename: str, repo_id: str, path_in_repo: str, repo_type: str, revision: Optional[str], transfer_id: str, is_cancelled: callable,
+        self,
+        file_content: bytes,
+        filename: str,
+        repo_id: str,
+        path_in_repo: str,
+        repo_type: str,
+        revision: Optional[str],
+        transfer_id: str,
+        is_cancelled: callable,
     ) -> str:
         from .xet_upload import upload_bytes_with_xet
+
         try:
             result = upload_bytes_with_xet(
-                file_content=file_content, filename=filename, repo_id=repo_id, token=self._token, event_queue=self.event_queue, repo_type=repo_type, revision=revision, endpoint=self._endpoint, transfer_id=transfer_id, report_interval=self._report_interval, is_cancelled=is_cancelled,
+                file_content=file_content,
+                filename=filename,
+                repo_id=repo_id,
+                token=self._token,
+                event_queue=self.event_queue,
+                repo_type=repo_type,
+                revision=revision,
+                endpoint=self._endpoint,
+                transfer_id=transfer_id,
+                report_interval=self._report_interval,
+                is_cancelled=is_cancelled,
             )
             return result.hash or result.filename
         except ImportError:
             return self._upload_bytes_via_temp(
-                file_content=file_content, filename=filename, repo_id=repo_id, path_in_repo=path_in_repo, repo_type=repo_type, revision=revision, transfer_id=transfer_id, is_cancelled=is_cancelled,
+                file_content=file_content,
+                filename=filename,
+                repo_id=repo_id,
+                path_in_repo=path_in_repo,
+                repo_type=repo_type,
+                revision=revision,
+                transfer_id=transfer_id,
+                is_cancelled=is_cancelled,
             )
 
     # ── Internal: LFS Upload Methods ──────────────────────────────
 
     def _upload_file_lfs(
-        self, file_path: str, repo_id: str, path_in_repo: str, repo_type: str, revision: Optional[str], transfer_id: str, filename: str, is_cancelled: callable,
+        self,
+        file_path: str,
+        repo_id: str,
+        path_in_repo: str,
+        repo_type: str,
+        revision: Optional[str],
+        transfer_id: str,
+        filename: str,
+        is_cancelled: callable,
     ) -> str:
         from .standard_upload import upload_file as _upload_file
+
         return _upload_file(
-            file_path=file_path, repo_id=repo_id, token=self._token, event_queue=self.event_queue, path_in_repo=path_in_repo, repo_type=repo_type, revision=revision, endpoint=self._endpoint, transfer_id=transfer_id, report_interval=self._report_interval, is_cancelled=is_cancelled,
+            file_path=file_path,
+            repo_id=repo_id,
+            token=self._token,
+            event_queue=self.event_queue,
+            path_in_repo=path_in_repo,
+            repo_type=repo_type,
+            revision=revision,
+            endpoint=self._endpoint,
+            transfer_id=transfer_id,
+            report_interval=self._report_interval,
+            is_cancelled=is_cancelled,
         )
 
     def _upload_bytes_via_temp(
-        self, file_content: bytes, filename: str, repo_id: str, path_in_repo: str, repo_type: str, revision: Optional[str], transfer_id: str, is_cancelled: callable,
+        self,
+        file_content: bytes,
+        filename: str,
+        repo_id: str,
+        path_in_repo: str,
+        repo_type: str,
+        revision: Optional[str],
+        transfer_id: str,
+        is_cancelled: callable,
     ) -> str:
         from .standard_upload import upload_bytes as _upload_bytes
+
         return _upload_bytes(
-            file_content=file_content, filename=filename, repo_id=repo_id, token=self._token, event_queue=self.event_queue, path_in_repo=path_in_repo, repo_type=repo_type, revision=revision, endpoint=self._endpoint, transfer_id=transfer_id, report_interval=self._report_interval, is_cancelled=is_cancelled,
+            file_content=file_content,
+            filename=filename,
+            repo_id=repo_id,
+            token=self._token,
+            event_queue=self.event_queue,
+            path_in_repo=path_in_repo,
+            repo_type=repo_type,
+            revision=revision,
+            endpoint=self._endpoint,
+            transfer_id=transfer_id,
+            report_interval=self._report_interval,
+            is_cancelled=is_cancelled,
         )

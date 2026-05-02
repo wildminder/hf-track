@@ -28,6 +28,23 @@ class TestHfProgressTrackerInit:
     def test_custom_endpoint(self):
         tracker = HfProgressTracker(token="hf_test", endpoint="https://custom.api")
         assert tracker._endpoint == "https://custom.api"
+        
+    def test_bounded_queue(self):
+        """IMP-012: Ensure queue is bounded to prevent OOM."""
+        tracker = HfProgressTracker()
+        assert getattr(tracker.event_queue, "maxsize", 0) > 0
+
+
+class TestHfProgressTrackerCancellation:
+    """Tests for cancellation logic."""
+    
+    def test_cancel_flags_transfer(self):
+        tracker = HfProgressTracker()
+        transfer_id = "test-cancel-1"
+        
+        assert not tracker.is_cancelled(transfer_id)
+        tracker.cancel(transfer_id)
+        assert tracker.is_cancelled(transfer_id)
 
 
 class TestHfProgressTrackerEvents:
