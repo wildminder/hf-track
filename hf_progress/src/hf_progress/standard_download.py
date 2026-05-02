@@ -1,31 +1,10 @@
-"""Standard (non-Xet) download progress tracking via tqdm_class.
-
-Uses the ``tqdm_class`` parameter supported by ``hf_hub_download()``
-and ``snapshot_download()`` to intercept HTTP download progress.
-
-This is the cleanest integration path — no monkey-patching required.
-The custom tqdm subclass receives ``update(n)`` calls for each HTTP
-chunk downloaded, providing byte-level progress with speed tracking.
-
-How it works internally:
-    ``hf_hub_download(tqdm_class=...)``
-    → ``_hf_hub_download_to_cache(tqdm_class=...)``
-    → ``http_get(tqdm_class=...)``
-    → ``_get_progress_bar_context(tqdm_class=...)``
-    → ``cls(desc=..., total=..., unit="B", unit_scale=True)``
-    → ``progress.update(len(chunk))`` per HTTP chunk
-
-Key behavior: If your ``tqdm_class`` is NOT a subclass of
-``huggingface_hub.utils.tqdm``, the ``_create_progress_bar()``
-function calls ``cls(**kwargs)`` directly without injecting
-``disable`` or ``name`` — your class is fully responsible for
-its own behavior.
-"""
+"""Standard (non-Xet) download progress tracking via tqdm_class."""
 
 from __future__ import annotations
 
+import contextlib
 import queue
-from typing import Optional
+from typing import Callable, Optional
 
 from .callbacks import DownloadProgressTqdm
 from .types import (
@@ -35,6 +14,131 @@ from .types import (
     TransferDirection,
     generate_transfer_id,
 )
+
+
+@contextlib.contextmanager
+def patch_download_chunk_size(chunk_size: int = 256 * 1024):
+    from huggingface_hub import constants as hf_constants
+    import huggingface_hub.file_download as file_download
+
+    original_constants = hf_constants.DOWNLOAD_CHUNK_SIZE
+    original_fd = getattr(file_download.constants, 'DOWNLOAD_CHUNK_SIZE', None)
+
+    hf_constants.DOWNLOAD_CHUNK_SIZE = chunk_size
+    if original_fd is not None:
+        file_download.constants.DOWNLOAD_CHUNK_SIZE = chunk_size
+        
+    try:
+        yield
+    finally:
+        hf_constants.DOWNLOAD_CHUNK_SIZE = original_constants
+        if original_fd is not None:
+            file_download.constants.DOWNLOAD_CHUNK_SIZE = original_fd
+
+
+@contextlib.contextmanager
+def patch_xet_get():
+    try:
+        import huggingface_hub.file_download as fd
+        original_xet_get = fd.xet_get
+    except ImportError:
+        yield
+        return
+
+    def patched_xet_get(*args, **kwargs):
+        incomplete_path = kwargs.get("incomplete_path") if "incomplete_path" in kwargs else args[0]
+        xet_file_data = kwargs.get("xet_file_data") if "xet_file_data" in kwargs else args[1]
+        headers = kwargs.get("headers") if "headers" in kwargs else args[2]
+        
+        expected_size = kwargs.get("expected_size")
+        if expected_size is None and len(args) > 3:
+            expected_size = args[3]
+            
+        displayed_filename = kwargs.get("displayed_filename")
+        if displayed_filename is None and len(args) > 4:
+            displayed_filename = args[4]
+            
+        tqdm_class = kwargs.get("tqdm_class")
+        if tqdm_class is None and len(args) > 5:
+            tqdm_class = args[5]
+            
+        _tqdm_bar = kwargs.get("_tqdm_bar")
+        if _tqdm_bar is None and len(args) > 6:
+            _tqdm_bar = args[6]
+
+        try:
+            from hf_xet import PyXetDownloadInfo, download_files
+            from huggingface_hub.utils import refresh_xet_connection_info
+        except ImportError:
+            return original_xet_get(*args, **kwargs)
+
+        connection_info = refresh_xet_connection_info(file_data=xet_file_data, headers=headers)
+        def token_refresher():
+            ci = refresh_xet_connection_info(file_data=xet_file_data, headers=headers)
+            return ci.access_token, ci.expiration_unix_epoch
+
+        xet_download_info = [
+            PyXetDownloadInfo(
+                destination_path=str(incomplete_path.absolute()),
+                hash=xet_file_data.file_hash,
+                file_size=expected_size
+            )
+        ]
+
+        if not displayed_filename:
+            displayed_filename = incomplete_path.name
+        if len(displayed_filename) > 40:
+            displayed_filename = f"{displayed_filename[:40]}(…)"
+
+        progress_cm = fd._get_progress_bar_context(
+            desc=displayed_filename,
+            log_level=fd.logger.getEffectiveLevel(),
+            total=expected_size,
+            initial=0,
+            name="huggingface_hub.xet_get",
+            tqdm_class=tqdm_class,
+            _tqdm_bar=_tqdm_bar,
+        )
+
+        xet_headers = headers.copy()
+        xet_headers.pop("authorization", None)
+
+        with progress_cm as progress:
+            state = {"last_bytes": 0}
+            
+            def progress_updater(total_update, item_updates):
+                # Enforce termination if cancelled from within the progress context
+                is_cancelled = getattr(progress, "_is_cancelled", None)
+                if is_cancelled is not None and is_cancelled():
+                    raise RuntimeError("Transfer cancelled by user")
+
+                transfer_completed = getattr(total_update, "total_transfer_bytes_completed", 0)
+                bytes_completed = getattr(total_update, "total_bytes_completed", 0)
+                total_bytes = getattr(total_update, "total_bytes", 0) or expected_size
+                
+                display_bytes = transfer_completed if transfer_completed > 0 else bytes_completed
+                if bytes_completed >= total_bytes and total_bytes > 0:
+                    display_bytes = bytes_completed
+                    
+                delta = display_bytes - state["last_bytes"]
+                if delta > 0:
+                    progress.update(delta)
+                    state["last_bytes"] = display_bytes
+
+            download_files(
+                xet_download_info,
+                endpoint=connection_info.endpoint,
+                token_info=(connection_info.access_token, connection_info.expiration_unix_epoch),
+                token_refresher=token_refresher,
+                progress_updater=[progress_updater],
+                request_headers=xet_headers,
+            )
+            
+    fd.xet_get = patched_xet_get
+    try:
+        yield
+    finally:
+        fd.xet_get = original_xet_get
 
 
 def download_file(
@@ -48,51 +152,21 @@ def download_file(
     local_dir: Optional[str] = None,
     transfer_id: Optional[str] = None,
     report_interval: float = 0.1,
+    is_cancelled: Optional[Callable[[], bool]] = None,
     **kwargs,
 ) -> str:
-    """Download a single file with progress tracking via tqdm_class.
-
-    Uses ``hf_hub_download()`` with a custom ``tqdm_class`` that
-    emits ProgressEvent objects to the provided queue.
-
-    This works with both HTTP and Xet downloads — when Xet is
-    available, ``hf_hub_download()`` internally uses ``xet_get()``
-    which also respects the ``tqdm_class`` parameter.
-
-    Args:
-        repo_id: Repository ID (e.g. ``"bert-base-uncased"``).
-        filename: Filename within the repository.
-        token: HuggingFace API token.
-        event_queue: Queue for emitting ProgressEvent objects.
-        repo_type: Repository type (model, dataset, space).
-        revision: Optional git revision.
-        endpoint: Optional custom HuggingFace API endpoint.
-        local_dir: Optional local directory to download to. If set,
-            the file is saved directly to this directory (not the
-            HF cache). Symlinks are disabled in this mode.
-        transfer_id: Unique transfer identifier (auto-generated if None).
-        report_interval: Minimum seconds between progress events.
-        **kwargs: Additional arguments passed to ``hf_hub_download()``.
-
-    Returns:
-        Local path to the downloaded file.
-
-    Raises:
-        Exception: If the download fails.
-    """
     from huggingface_hub import hf_hub_download
 
     transfer_id = transfer_id or generate_transfer_id()
 
-    # Create a bound tqdm class
     tqdm_class = DownloadProgressTqdm.bind(
         event_queue=event_queue,
         transfer_id=transfer_id,
         filename=filename,
         report_interval=report_interval,
+        is_cancelled=is_cancelled,
     )
 
-    # Emit start event
     event_queue.put(
         ProgressEvent(
             event_type=EventType.START,
@@ -100,7 +174,7 @@ def download_file(
             direction=TransferDirection.DOWNLOAD,
             filename=filename,
             phase=ProgressPhase.DOWNLOADING,
-            total_bytes=0, # Unknown until download starts
+            total_bytes=0,
         )
     )
 
@@ -114,13 +188,12 @@ def download_file(
             endpoint=endpoint,
             tqdm_class=tqdm_class,
         )
-        # If local_dir is specified, download directly to that directory
-        # instead of using the HF cache system
         if local_dir is not None:
             download_kwargs["local_dir"] = local_dir
         download_kwargs.update(kwargs)
 
-        result = hf_hub_download(**download_kwargs)
+        with patch_download_chunk_size(), patch_xet_get():
+            result = hf_hub_download(**download_kwargs)
         return result
 
     except Exception as e:
@@ -149,44 +222,9 @@ def download_snapshot(
     local_dir: Optional[str] = None,
     transfer_id: Optional[str] = None,
     report_interval: float = 0.1,
+    is_cancelled: Optional[Callable[[], bool]] = None,
     **kwargs,
 ) -> str:
-    """Download a repository snapshot with progress tracking.
-
-    Uses ``snapshot_download()`` with a custom ``tqdm_class``.
-
-    **Important caveat**: ``snapshot_download()`` provides file-count
-    progress (N/M files downloaded), NOT per-file byte-level progress.
-    The ``tqdm_class`` controls the outer file-count bar. For per-file
-    byte progress, use ``download_file()`` for each file individually.
-
-    Internally, ``snapshot_download()`` uses an ``_AggregatedTqdm``
-    class to funnel per-file progress into an aggregate bytes bar.
-    The ``tqdm_class`` parameter is passed to the ``thread_map`` that
-    coordinates downloads.
-
-    Args:
-        repo_id: Repository ID.
-        token: HuggingFace API token.
-        event_queue: Queue for emitting ProgressEvent objects.
-        allow_patterns: Glob patterns for files to include.
-        ignore_patterns: Glob patterns for files to exclude.
-        repo_type: Repository type.
-        revision: Optional git revision.
-        endpoint: Optional custom HuggingFace API endpoint.
-        local_dir: Optional local directory to download to. If set,
-            files are saved directly to this directory (not the HF
-            cache). Symlinks are disabled in this mode.
-        transfer_id: Unique transfer identifier.
-        report_interval: Minimum seconds between progress events.
-        **kwargs: Additional arguments passed to ``snapshot_download()``.
-
-    Returns:
-        Local path to the downloaded snapshot directory.
-
-    Raises:
-        Exception: If the download fails.
-    """
     from huggingface_hub import snapshot_download
 
     transfer_id = transfer_id or generate_transfer_id()
@@ -194,8 +232,9 @@ def download_snapshot(
     tqdm_class = DownloadProgressTqdm.bind(
         event_queue=event_queue,
         transfer_id=transfer_id,
-        filename=f"snapshot:{repo_id}",
+        filename=f"{repo_id}",
         report_interval=report_interval,
+        is_cancelled=is_cancelled,
     )
 
     try:
@@ -209,12 +248,12 @@ def download_snapshot(
             endpoint=endpoint,
             tqdm_class=tqdm_class,
         )
-        # If local_dir is specified, download directly to that directory
         if local_dir is not None:
             download_kwargs["local_dir"] = local_dir
         download_kwargs.update(kwargs)
 
-        result = snapshot_download(**download_kwargs)
+        with patch_download_chunk_size(), patch_xet_get():
+            result = snapshot_download(**download_kwargs)
         return result
 
     except Exception as e:
@@ -223,7 +262,7 @@ def download_snapshot(
                 event_type=EventType.ERROR,
                 transfer_id=transfer_id,
                 direction=TransferDirection.DOWNLOAD,
-                filename=f"snapshot:{repo_id}",
+                filename=f"{repo_id}",
                 phase=ProgressPhase.ERROR,
                 error=str(e),
             )
