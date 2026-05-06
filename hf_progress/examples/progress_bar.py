@@ -6,10 +6,8 @@ standard library (no external deps beyond hf-progress).
 
 from __future__ import annotations
 
-import os
 import sys
 import time
-from typing import Optional
 
 from hf_progress import ProgressEvent, EventType, ProgressPhase
 
@@ -118,10 +116,12 @@ class ConsoleProgressDisplay:
     ):
         self.filename = filename
         self.bar_width = bar_width
+        self._refresh_interval = refresh_interval
         self._last_line_len = 0
         self._start_time = time.time()
         self._last_bytes = 0
         self._last_time = time.time()
+        self._last_render_time = 0.0
         self._smoothed_speed = 0.0
 
         print()
@@ -153,13 +153,19 @@ class ConsoleProgressDisplay:
             return
 
         if event.event_type == EventType.PROGRESS:
+            now = time.time()
+            # Render throttling: avoid overwhelming the console IO
+            if now - self._last_render_time < self._refresh_interval:
+                return
+            
+            self._last_render_time = now
             speed = event.speed if event.speed > 0 else self._compute_speed(event)
             self._clear_line()
             
             original_speed = event.speed
-            event.speed = speed  # type: ignore
+            event.speed = speed  # type: ignore[attr-defined] — temporarily override dataclass field for rendering
             line = "  " + render_progress_line(event, self.bar_width)
-            event.speed = original_speed  # type: ignore
+            event.speed = original_speed  # type: ignore[attr-defined] — restore original value
 
             sys.stderr.write(f"\r{line}")
             sys.stderr.flush()
@@ -182,9 +188,18 @@ class ConsoleProgressDisplay:
             self._last_line_len = 0
             return
 
+        if event.event_type == EventType.CANCELLED:
+            self._clear_line()
+            size_str = format_bytes(event.bytes_completed)
+            line = f" [STOP] Cancelled at {size_str} ({event.percentage:.1f}%)"
+            sys.stderr.write(f"\r{line}\n")
+            sys.stderr.flush()
+            self._last_line_len = 0
+            return
+
         if event.event_type == EventType.ERROR:
             self._clear_line()
-            line = f"  [ERR] Error: {event.error or 'Unknown error'}"
+            line = f" [ERR] Error: {event.error or 'Unknown error'}"
             sys.stderr.write(f"\r{line}\n")
             sys.stderr.flush()
             self._last_line_len = 0

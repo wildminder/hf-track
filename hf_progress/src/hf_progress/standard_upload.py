@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import tempfile
@@ -12,9 +13,17 @@ from .types import (
     EventType,
     ProgressEvent,
     ProgressPhase,
+    TransferCancelledError,
     TransferDirection,
     generate_transfer_id,
 )
+
+logger = logging.getLogger(__name__)
+
+
+# Narrow set of expected exceptions from the HuggingFace API.
+# Any unexpected exception still propagates after the ERROR event.
+_ExpectedUploadErrors = (OSError, ValueError, ConnectionError, RuntimeError)
 
 
 def upload_file(
@@ -73,8 +82,28 @@ def upload_file(
                 )
 
             return result
-
-    except Exception as e:
+    
+    except KeyboardInterrupt:
+        event_queue.put(
+            ProgressEvent.cancelled_event(
+                transfer_id=transfer_id,
+                direction=TransferDirection.UPLOAD,
+                filename=filename,
+            )
+        )
+        raise TransferCancelledError("Upload interrupted by user (Ctrl+C)")
+    except TransferCancelledError:
+        event_queue.put(
+            ProgressEvent.cancelled_event(
+                transfer_id=transfer_id,
+                direction=TransferDirection.UPLOAD,
+                filename=filename,
+            )
+        )
+        raise
+    except _ExpectedUploadErrors as e:
+        # Broad except purposely narrow to expected HF API errors.
+        # Emit ERROR event so consumers see the failure before re-raising.
         event_queue.put(
             ProgressEvent(
                 event_type=EventType.ERROR,
@@ -127,6 +156,7 @@ def upload_bytes(
             report_interval=report_interval,
             is_cancelled=is_cancelled,
         )
+    # Intentionally narrow: tempfile cleanup must run.
     finally:
         os.unlink(temp_path)
 
@@ -158,7 +188,7 @@ def upload_folder(
             try:
                 total_bytes += os.path.getsize(os.path.join(root, name))
             except OSError:
-                pass
+                logger.warning("Could not get size of %s — skipping", os.path.join(root, name))
 
     try:
         with tqdm_upload_patcher(
@@ -198,8 +228,26 @@ def upload_folder(
                 )
 
             return getattr(result, "commit_url", str(result))
-
-    except Exception as e:
+    
+    except KeyboardInterrupt:
+        event_queue.put(
+            ProgressEvent.cancelled_event(
+                transfer_id=transfer_id,
+                direction=TransferDirection.UPLOAD,
+                filename=f"folder:{os.path.basename(folder_path)}",
+            )
+        )
+        raise TransferCancelledError("Upload interrupted by user (Ctrl+C)")
+    except TransferCancelledError:
+        event_queue.put(
+            ProgressEvent.cancelled_event(
+                transfer_id=transfer_id,
+                direction=TransferDirection.UPLOAD,
+                filename=f"folder:{os.path.basename(folder_path)}",
+            )
+        )
+        raise
+    except _ExpectedUploadErrors as e:
         event_queue.put(
             ProgressEvent(
                 event_type=EventType.ERROR,

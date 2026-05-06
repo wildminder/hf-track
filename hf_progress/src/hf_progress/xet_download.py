@@ -13,6 +13,7 @@ from .types import (
     EventType,
     ProgressEvent,
     ProgressPhase,
+    TransferCancelledError,
     TransferDirection,
     generate_transfer_id,
 )
@@ -49,7 +50,7 @@ def download_file_with_xet(
     filename = os.path.basename(dest_path)
 
     token_manager = XetTokenManager(token, endpoint)
-    creds = token_manager.get_download_credentials(xet_file_data)
+    creds = token_manager.fetch_download_credentials(xet_file_data)
 
     download_info = [
         hf_xet.PyXetDownloadInfo(
@@ -63,6 +64,8 @@ def download_file_with_xet(
         filename=filename,
         total_bytes=file_size,
         event_queue=event_queue,
+        direction=TransferDirection.DOWNLOAD,
+        phase=ProgressPhase.DOWNLOADING,
         report_interval=report_interval,
         transfer_id=transfer_id,
         is_cancelled=is_cancelled,
@@ -89,7 +92,7 @@ def download_file_with_xet(
         if request_headers:
             kwargs["request_headers"] = request_headers
 
-        results = hf_xet.download_files(download_info, **kwargs)
+        hf_xet.download_files(download_info, **kwargs)
 
         event_queue.put(
             ProgressEvent(
@@ -112,7 +115,25 @@ def download_file_with_xet(
             transfer_id=transfer_id,
         )
 
+    except KeyboardInterrupt:
+        event_queue.put(
+            ProgressEvent.cancelled_event(
+                transfer_id=transfer_id,
+                direction=TransferDirection.DOWNLOAD,
+                filename=filename,
+            )
+        )
+        raise TransferCancelledError("Download interrupted by user (Ctrl+C)")
     except Exception as e:
+        if isinstance(e, TransferCancelledError):
+            event_queue.put(
+                ProgressEvent.cancelled_event(
+                    transfer_id=transfer_id,
+                    direction=TransferDirection.DOWNLOAD,
+                    filename=filename,
+                )
+            )
+            raise
         event_queue.put(
             ProgressEvent(
                 event_type=EventType.ERROR,
@@ -161,6 +182,8 @@ def download_files_with_xet(
                 filename=filename,
                 total_bytes=spec["file_size"],
                 event_queue=event_queue,
+                direction=TransferDirection.DOWNLOAD,
+                phase=ProgressPhase.DOWNLOADING,
                 report_interval=report_interval,
                 transfer_id=transfer_id,
                 file_index=i,
@@ -170,7 +193,7 @@ def download_files_with_xet(
         )
 
     token_manager = XetTokenManager(token, endpoint)
-    creds = token_manager.get_download_credentials(file_specs[0]["xet_file_data"])
+    creds = token_manager.fetch_download_credentials(file_specs[0]["xet_file_data"])
 
     for i, spec in enumerate(file_specs):
         filename = os.path.basename(spec["dest_path"])
@@ -197,7 +220,7 @@ def download_files_with_xet(
         if request_headers:
             kwargs["request_headers"] = request_headers
 
-        results = hf_xet.download_files(download_infos, **kwargs)
+        hf_xet.download_files(download_infos, **kwargs)
 
         download_results = []
         for i, spec in enumerate(file_specs):
@@ -228,7 +251,33 @@ def download_files_with_xet(
 
         return download_results
 
+    except KeyboardInterrupt:
+        for i, spec in enumerate(file_specs):
+            filename = os.path.basename(spec["dest_path"])
+            event_queue.put(
+                ProgressEvent.cancelled_event(
+                    transfer_id=transfer_id,
+                    direction=TransferDirection.DOWNLOAD,
+                    filename=filename,
+                    file_index=i,
+                    total_files=total_files,
+                )
+            )
+        raise TransferCancelledError("Download interrupted by user (Ctrl+C)")
     except Exception as e:
+        if isinstance(e, TransferCancelledError):
+            for i, spec in enumerate(file_specs):
+                filename = os.path.basename(spec["dest_path"])
+                event_queue.put(
+                    ProgressEvent.cancelled_event(
+                        transfer_id=transfer_id,
+                        direction=TransferDirection.DOWNLOAD,
+                        filename=filename,
+                        file_index=i,
+                        total_files=total_files,
+                    )
+                )
+            raise
         for i, spec in enumerate(file_specs):
             filename = os.path.basename(spec["dest_path"])
             event_queue.put(

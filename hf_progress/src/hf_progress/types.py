@@ -10,7 +10,7 @@ import enum
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 
 class ProgressPhase(str, enum.Enum):
@@ -38,6 +38,7 @@ class EventType(str, enum.Enum):
     PROGRESS = "progress"
     COMPLETE = "complete"
     ERROR = "error"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -60,7 +61,7 @@ class ProgressEvent:
         file_index: Index of this file in a multi-file transfer (0-based).
         total_files: Total number of files in the transfer.
         transfer_bytes_completed: Bytes actually transferred over network
-            (Xet only — may differ from bytes_completed due to dedup).
+            (Xet only -- may differ from bytes_completed due to dedup).
         transfer_bytes_total: Total bytes scheduled for network transfer
             (Xet only).
         transfer_speed: Network transfer speed in bytes/second (Xet only).
@@ -88,6 +89,95 @@ class ProgressEvent:
     error: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
     extra: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def start(
+        cls,
+        transfer_id: str,
+        direction: TransferDirection,
+        filename: str,
+        phase: ProgressPhase,
+        total_bytes: int = 0,
+        **kwargs,
+    ) -> ProgressEvent:
+        """Create a START event with sensible defaults."""
+        return cls(
+            event_type=EventType.START,
+            transfer_id=transfer_id,
+            direction=direction,
+            filename=filename,
+            phase=phase,
+            total_bytes=total_bytes,
+            **kwargs,
+        )
+
+    @classmethod
+    def complete(
+        cls,
+        transfer_id: str,
+        direction: TransferDirection,
+        filename: str,
+        phase: ProgressPhase = ProgressPhase.COMPLETE,
+        bytes_completed: int = 0,
+        total_bytes: int = 0,
+        **kwargs,
+    ) -> ProgressEvent:
+        """Create a COMPLETE event with percentage auto-set to 100."""
+        return cls(
+            event_type=EventType.COMPLETE,
+            transfer_id=transfer_id,
+            direction=direction,
+            filename=filename,
+            phase=phase,
+            bytes_completed=bytes_completed,
+            total_bytes=total_bytes,
+            percentage=100.0,
+            **kwargs,
+        )
+
+    @classmethod
+    def error_event(
+        cls,
+        transfer_id: str,
+        direction: TransferDirection,
+        filename: str,
+        error: str,
+        phase: ProgressPhase = ProgressPhase.ERROR,
+        **kwargs,
+    ) -> ProgressEvent:
+        """Create an ERROR event."""
+        return cls(
+            event_type=EventType.ERROR,
+            transfer_id=transfer_id,
+            direction=direction,
+            filename=filename,
+            phase=phase,
+            error=error,
+            **kwargs,
+        )
+
+    @classmethod
+    def cancelled_event(
+        cls,
+        transfer_id: str,
+        direction: TransferDirection,
+        filename: str,
+        bytes_completed: int = 0,
+        total_bytes: int = 0,
+        **kwargs,
+    ) -> ProgressEvent:
+        """Create a CANCELLED event."""
+        return cls(
+            event_type=EventType.CANCELLED,
+            transfer_id=transfer_id,
+            direction=direction,
+            filename=filename,
+            phase=ProgressPhase.ERROR,
+            bytes_completed=bytes_completed,
+            total_bytes=total_bytes,
+            error="Transfer cancelled by user",
+            **kwargs,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to a plain dict suitable for JSON encoding."""
@@ -121,12 +211,15 @@ class ProgressEvent:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> ProgressEvent:
         """Deserialize from a plain dict."""
+        # Infer default phase from direction if phase is missing
+        direction = TransferDirection(data["direction"])
+        default_phase = ProgressPhase.UPLOADING if direction == TransferDirection.UPLOAD else ProgressPhase.DOWNLOADING
         return cls(
             event_type=EventType(data["event_type"]),
             transfer_id=data["transfer_id"],
-            direction=TransferDirection(data["direction"]),
+            direction=direction,
             filename=data["filename"],
-            phase=ProgressPhase(data.get("phase", "uploading")),
+            phase=ProgressPhase(data.get("phase", default_phase.value)),
             bytes_completed=data.get("bytes_completed", 0),
             total_bytes=data.get("total_bytes", 0),
             percentage=data.get("percentage", 0.0),
@@ -171,3 +264,19 @@ class TransferResult:
 def generate_transfer_id() -> str:
     """Generate a unique transfer ID."""
     return str(uuid.uuid4())
+
+
+class TransferCancelledError(Exception):
+    """Raised when a transfer is cancelled by the user.
+
+    Callers can catch this specific exception to distinguish
+    user-initiated cancellation from other runtime errors.
+    """
+
+
+class TransferProgressError(Exception):
+    """Raised when a transfer operation encounters a recoverable error."""
+
+
+class TokenError(Exception):
+    """Raised when token resolution or authentication fails."""
