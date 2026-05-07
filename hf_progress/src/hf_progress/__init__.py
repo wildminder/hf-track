@@ -48,8 +48,11 @@ from .types import (
     EventType,
     ProgressEvent,
     ProgressPhase,
+    TransferCancelledError,
     TransferDirection,
+    TransferProgressError,
     TransferResult,
+    TokenError,
     generate_transfer_id,
 )
 
@@ -57,6 +60,7 @@ from .types import (
 from .callbacks import (
     DownloadProgressTqdm,
     XetDownloadProgressCallback,
+    XetProgressCallback,
     XetUploadProgressCallback,
     tqdm_upload_patcher,
 )
@@ -74,12 +78,14 @@ __all__ = [
     "EventType",
     "ProgressEvent",
     "ProgressPhase",
+    "TransferCancelledError",
     "TransferDirection",
     "TransferResult",
     "generate_transfer_id",
     # Callback classes
     "DownloadProgressTqdm",
     "XetDownloadProgressCallback",
+    "XetProgressCallback",
     "XetUploadProgressCallback",
     "tqdm_upload_patcher",
     # Token management

@@ -2,6 +2,7 @@
 """Download an entire HuggingFace repository with custom progress bar.
 
 Usage::
+
     python download_repo.py
     python download_repo.py --force
 """
@@ -9,16 +10,14 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import queue
 import sys
 import threading
 import uuid
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-
-from hf_progress import HfProgressTracker, EventType, is_xet_available
-from progress_bar import ConsoleProgressDisplay
+logger = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,7 +35,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def main() -> int:
+    # Late import: add project src to path only when run as a script
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+    from hf_progress import (
+        HfProgressTracker, 
+        EventType, 
+        is_xet_available,
+        TransferCancelledError,
+    )
+    from progress_bar import ConsoleProgressDisplay
+
     args = parse_args()
 
     if args.no_xet:
@@ -44,7 +54,7 @@ def main() -> None:
 
     token = args.token or os.environ.get("HF_TOKEN") or None
     if not token:
-        print("[!] No HF_TOKEN provided. Public repos will work, but gated repos require a token.\n")
+        print("[!] No HF_TOKEN provided. Public repos will work, but gated repos require a token.\n")  # nosec: log_sensitive
 
     repo_name = args.repo.split("/")[-1]
     output_dir = args.output or os.path.join(os.path.dirname(__file__), repo_name)
@@ -55,20 +65,16 @@ def main() -> None:
     print(" HuggingFace Repository Downloader")
     print("=" * 60)
     print(f" Repository : {args.repo}")
-    print(f" Type       : {args.repo_type}")
-    print(f" Output     : {output_dir}")
     xet_status = "[DISABLED]" if args.no_xet else ("[OK] available" if is_xet_available() else "[--] not installed (using HTTP)")
     print(f" Xet        : {xet_status}")
-    if args.force:
-        print(f" Force      : re-download even if cached")
     print("=" * 60)
 
     tracker = HfProgressTracker(token=token, report_interval=0.1)
-    
+
     # Generate explicit transfer_id so we can cancel it cleanly later
     transfer_id = str(uuid.uuid4())
 
-    display = ConsoleProgressDisplay(filename=args.repo, is_snapshot=False, bar_width=35)
+    display = ConsoleProgressDisplay(filename=args.repo, is_snapshot=True, bar_width=40)
 
     result_path = None
     error_occurred = None
@@ -85,40 +91,30 @@ def main() -> None:
                 force_download=args.force,
                 transfer_id=transfer_id,
             )
+        except TransferCancelledError:
+            # Silently exit background thread on user cancellation
+            pass
         except Exception as e:
             error_occurred = e
-        except BaseException as e:
-            # Handles things like KeyboardInterrupt slipping through
-            error_occurred = Exception("Cancelled by user")
 
     download_thread = threading.Thread(target=do_download, daemon=True)
     download_thread.start()
-
-    max_total_bytes = 0
 
     try:
         while download_thread.is_alive() or not tracker.event_queue.empty():
             try:
                 event = tracker.event_queue.get(timeout=0.05)
-
-                if event.event_type == EventType.PROGRESS:
-                    if event.total_bytes > max_total_bytes:
-                        max_total_bytes = event.total_bytes
-                    
-                    if max_total_bytes > 10000 and event.total_bytes < max_total_bytes // 2:
-                        continue
-
                 display.update(event)
-
             except queue.Empty:
+                logger.debug("Queue empty while waiting for events — polling")
                 continue
-                
+
     except KeyboardInterrupt:
-        print("\n\n  [STOP] Download interrupted by user.")
-        # Trigger abort to the background threads cleanly
+        print("\n\n [STOP] Download interrupted by user.")
         tracker.cancel(transfer_id)
-        # Use os._exit(1) to drop dead instantly and skip ThreadPoolExecutor blocking
-        os._exit(1)
+        # Give the background thread a moment to trap the cancel and exit cleanly
+        download_thread.join(timeout=2.0)
+        return 1
 
     download_thread.join(timeout=5.0)
 
@@ -132,12 +128,15 @@ def main() -> None:
     display.close()
 
     if error_occurred:
-        print(f"\n  [ERR] Download failed: {error_occurred}")
-        sys.exit(1)
+        print(f"\n [ERR] Download failed: {error_occurred}")
+        return 1
 
     if result_path:
-        print(f"\n  [DIR] Files saved to: {result_path}")
-    print()
+        print(f"\n [DIR] Files saved to: {result_path}")
+        print()
+
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import queue
 from typing import Callable, Optional
 
@@ -13,6 +14,7 @@ from .types import (
     ProgressPhase,
     TransferCancelledError,
     TransferDirection,
+    TransferError,
     generate_transfer_id,
 )
 
@@ -47,6 +49,11 @@ def patch_xet_get():
         return
 
     def patched_xet_get(*args, **kwargs):
+        # Respect HF_HUB_DISABLE_XET immediately
+        disable_xet = os.environ.get("HF_HUB_DISABLE_XET", "0").lower()
+        if disable_xet in ("1", "true", "yes"):
+            return original_xet_get(*args, **kwargs)
+
         # xet_get is a keyword-only function natively. Accessing args[0] throws IndexError.
         incomplete_path = kwargs.get("incomplete_path")
         xet_file_data = kwargs.get("xet_file_data")
@@ -222,7 +229,7 @@ def download_file(
                 direction=TransferDirection.DOWNLOAD,
                 filename=filename,
                 phase=ProgressPhase.ERROR,
-                error=str(e),
+                error=TransferError(message=str(e), error_type=type(e).__name__),
             )
         )
         raise
@@ -326,7 +333,7 @@ def download_snapshot(
                 direction=TransferDirection.DOWNLOAD,
                 filename=f"{repo_id}",
                 phase=ProgressPhase.ERROR,
-                error=str(e),
+                error=TransferError(message=str(e), error_type=type(e).__name__),
             )
         )
         raise

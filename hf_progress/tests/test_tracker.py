@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import queue
 import threading
 import time
 
-import pytest
 
 from hf_progress.tracker import HfProgressTracker
-from hf_progress.types import EventType, ProgressEvent, TransferDirection
+from hf_progress.types import EventType, ProgressEvent, TransferDirection, TransferError
 
 
 class TestHfProgressTrackerInit:
@@ -170,14 +168,15 @@ class TestHfProgressTrackerEvents:
                 direction=TransferDirection.UPLOAD,
                 filename="test.bin",
                 phase="error",
-                error="Connection refused",
+                error=TransferError(message="Connection refused", error_type="ConnectionError"),
             )
         )
 
         result = tracker.wait_for_complete("err-1", timeout=1)
         assert result is not None
         assert result.event_type == EventType.ERROR
-        assert result.error == "Connection refused"
+        assert isinstance(result.error, TransferError)
+        assert result.error.message == "Connection refused"
 
     def test_wait_for_complete_ignores_other_transfers(self):
         """wait_for_complete should only match the specified transfer_id."""
@@ -225,7 +224,7 @@ class TestHfProgressTrackerUploadRouting:
             with patch.object(
                 tracker, "_upload_file_xet", return_value="abc123"
             ) as mock:
-                result = tracker.upload_file(
+                tracker.upload_file(
                     file_path="/tmp/test.bin",
                     repo_id="user/repo",
                     transfer_id="test-1",
@@ -242,7 +241,7 @@ class TestHfProgressTrackerUploadRouting:
             with patch.object(
                 tracker, "_upload_file_lfs", return_value="https://..."
             ) as mock:
-                result = tracker.upload_file(
+                tracker.upload_file(
                     file_path="/tmp/test.bin",
                     repo_id="user/repo",
                     transfer_id="test-1",
@@ -259,7 +258,7 @@ class TestHfProgressTrackerUploadRouting:
             with patch.object(
                 tracker, "_upload_bytes_xet", return_value="abc123"
             ) as mock:
-                result = tracker.upload_bytes(
+                tracker.upload_bytes(
                     file_content=b"test data",
                     filename="test.bin",
                     repo_id="user/repo",
@@ -277,7 +276,7 @@ class TestHfProgressTrackerUploadRouting:
             with patch.object(
                 tracker, "_upload_bytes_via_temp", return_value="https://..."
             ) as mock:
-                result = tracker.upload_bytes(
+                tracker.upload_bytes(
                     file_content=b"test data",
                     filename="test.bin",
                     repo_id="user/repo",

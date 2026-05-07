@@ -2,6 +2,7 @@
 """Download a single file from HuggingFace with custom progress bar.
 
 Usage::
+
     python download_file.py
     python download_file.py --force
 """
@@ -9,16 +10,14 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import queue
 import sys
 import threading
 import uuid
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-
-from hf_progress import HfProgressTracker, EventType, is_xet_available
-from progress_bar import ConsoleProgressDisplay
+logger = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,7 +33,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def main() -> int:
+    # Late import: add project src to path only when run as a script
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+    from hf_progress import (
+        HfProgressTracker, 
+        is_xet_available, 
+        TransferCancelledError,
+    )
+    from progress_bar import ConsoleProgressDisplay
+
     args = parse_args()
 
     token = args.token or os.environ.get("HF_TOKEN") or None
@@ -55,7 +64,7 @@ def main() -> None:
     print("=" * 60)
 
     tracker = HfProgressTracker(token=token, report_interval=0.1)
-    
+
     # Generate explicit transfer_id so we can cancel it cleanly later
     transfer_id = str(uuid.uuid4())
 
@@ -76,10 +85,11 @@ def main() -> None:
                 force_download=args.force,
                 transfer_id=transfer_id,
             )
+        except TransferCancelledError:
+            # Silently exit background thread on user cancellation
+            pass
         except Exception as e:
             error_occurred = e
-        except BaseException as e:
-            error_occurred = Exception("Cancelled by user")
 
     download_thread = threading.Thread(target=do_download, daemon=True)
     download_thread.start()
@@ -90,12 +100,15 @@ def main() -> None:
                 event = tracker.event_queue.get(timeout=0.05)
                 display.update(event)
             except queue.Empty:
+                logger.debug("Queue empty while waiting for events — polling")
                 continue
-                
+
     except KeyboardInterrupt:
         print("\n\n [STOP] Download interrupted by user.")
         tracker.cancel(transfer_id)
-        os._exit(1)
+        # Give the background thread a moment to trap the cancel and exit cleanly
+        download_thread.join(timeout=2.0)
+        return 1
 
     download_thread.join(timeout=5.0)
 
@@ -109,21 +122,24 @@ def main() -> None:
     display.close()
 
     if error_occurred:
-        print(f"\n  [ERR] Download failed: {error_occurred}")
-        sys.exit(1)
+        print(f"\n [ERR] Download failed: {error_occurred}")
+        return 1
 
     if result_path:
         file_size = 0
         try:
             file_size = os.path.getsize(result_path)
         except OSError:
-            pass
+            file_size = 0
         from progress_bar import format_bytes
         size_str = format_bytes(file_size) if file_size > 0 else ""
-        print(f"\n  [FILE] File saved to: {result_path}")
+        print(f"\n [FILE] File saved to: {result_path}")
         if size_str:
-            print(f"  [SIZE] Size: {size_str}")
-    print()
+            print(f" [SIZE] Size: {size_str}")
+        print()
+
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

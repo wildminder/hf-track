@@ -16,6 +16,7 @@ from .types import (
     ProgressPhase,
     TransferCancelledError,
     TransferDirection,
+    TransferError,
     generate_transfer_id,
 )
 
@@ -141,7 +142,7 @@ def _upload_with_xet(
                 direction=TransferDirection.UPLOAD,
                 filename=filename,
                 phase=ProgressPhase.ERROR,
-                error=str(e),
+                error=TransferError(message=str(e), error_type=type(e).__name__),
             )
         )
         raise

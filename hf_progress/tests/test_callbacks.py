@@ -13,9 +13,57 @@ from hf_progress.callbacks import (
     DownloadProgressTqdm,
     XetDownloadProgressCallback,
     XetUploadProgressCallback,
+    XetProgressCallback,
     tqdm_upload_patcher,
 )
 from hf_progress.types import EventType, ProgressPhase, TransferDirection
+
+
+class TestXetProgressCallbackEstimation:
+    def _make_mock_total_update(self, **overrides):
+        defaults = {
+            "total_bytes": 1000,
+            "total_bytes_completed": 0,
+            "total_bytes_completion_rate": 500.0,
+            "total_transfer_bytes": 1000,
+            "total_transfer_bytes_completed": 0,
+            "total_transfer_bytes_completion_rate": 500.0,
+        }
+        defaults.update(overrides)
+        mock = MagicMock()
+        for key, value in defaults.items():
+            setattr(mock, key, value)
+        return mock
+
+    def test_progress_estimation_when_waiting_for_bytes(self):
+        """[NTH-001]: Verify progress is estimated when bytes_completed is 0 but speed > 0."""
+        q = queue.Queue()
+        callback = XetProgressCallback(
+            filename="test.bin",
+            total_bytes=10000,
+            event_queue=q,
+            transfer_id="test-est",
+        )
+        
+        # Manually backdate the start time to simulate 1 second of transfer
+        callback._start_time = time.time() - 1.0
+
+        # Pass 0 for completed bytes, but active speed is 1000.0
+        total_update = self._make_mock_total_update(
+            total_bytes=10000,
+            total_bytes_completed=0,
+            total_bytes_completion_rate=1000.0,
+            total_transfer_bytes=10000,
+            total_transfer_bytes_completed=0,
+            total_transfer_bytes_completion_rate=1000.0,
+        )
+        callback(total_update, [])
+
+        event = q.get_nowait()
+        # Should estimate approx 1000 bytes (1 second * 1000 bytes/sec)
+        assert event.bytes_completed > 0
+        assert event.bytes_completed >= 900
+        assert event.percentage > 0.0
 
 
 class TestXetUploadProgressCallback:
@@ -45,7 +93,6 @@ class TestXetUploadProgressCallback:
             total_bytes=1000,
             event_queue=q,
             transfer_id="test-1",
-            report_interval=0,  # No throttling
         )
 
         total_update = self._make_mock_total_update()
@@ -67,7 +114,7 @@ class TestXetUploadProgressCallback:
         assert event.dedup_saved_bytes == 100  # 500 - 400
 
     def test_every_call_emits_event(self):
-        """Every callback invocation should emit an event (no producer-side throttle).
+        """Every callback invocation should emit an event.
 
         The consumer is responsible for throttling/display refresh.
         """
@@ -89,26 +136,6 @@ class TestXetUploadProgressCallback:
         callback(total_update, [])
         assert q.qsize() == 2  # Both calls emit
 
-    def test_throttle_allows_after_interval(self):
-        """After the report_interval, calls should emit again."""
-        q = queue.Queue()
-        callback = XetUploadProgressCallback(
-            filename="test.bin",
-            total_bytes=1000,
-            event_queue=q,
-            report_interval=0.05,  # 50ms throttle
-        )
-
-        total_update = self._make_mock_total_update()
-
-        callback(total_update, [])
-        assert q.qsize() == 1
-
-        time.sleep(0.1)  # Wait for throttle to expire
-
-        callback(total_update, [])
-        assert q.qsize() == 2
-
     def test_dedup_saved_bytes(self):
         """Dedup saved bytes = bytes_completed - transfer_bytes_completed."""
         q = queue.Queue()
@@ -116,7 +143,6 @@ class TestXetUploadProgressCallback:
             filename="test.bin",
             total_bytes=1000,
             event_queue=q,
-            report_interval=0,
         )
 
         # 800 bytes completed, but only 200 transferred (600 deduped)
@@ -136,7 +162,6 @@ class TestXetUploadProgressCallback:
             filename="test.bin",
             total_bytes=1000,
             event_queue=q,
-            report_interval=0,
         )
 
         # transfer > completed (shouldn't happen, but be safe)
@@ -156,7 +181,6 @@ class TestXetUploadProgressCallback:
             filename="test.bin",
             total_bytes=0,
             event_queue=q,
-            report_interval=0,
         )
 
         total_update = self._make_mock_total_update(
@@ -175,7 +199,6 @@ class TestXetUploadProgressCallback:
             filename="test.bin",
             total_bytes=2000,
             event_queue=q,
-            report_interval=0,
         )
 
         total_update = self._make_mock_total_update(
@@ -195,7 +218,6 @@ class TestXetUploadProgressCallback:
             filename="test.bin",
             total_bytes=1000,
             event_queue=q,
-            report_interval=0,
         )
 
         # Minimal mock without all attributes
@@ -216,7 +238,6 @@ class TestXetUploadProgressCallback:
             transfer_id="test-idx",
             file_index=2,
             total_files=5,
-            report_interval=0,
         )
 
         total_update = self._make_mock_total_update()
@@ -270,7 +291,6 @@ class TestXetDownloadProgressCallback:
             filename="test.bin",
             total_bytes=1000,
             event_queue=q,
-            report_interval=0,  # No throttling
         )
 
         # Simulate Rust calling with detailed progress data
@@ -315,7 +335,6 @@ class TestXetDownloadProgressCallback:
             filename="test.bin",
             total_bytes=1000,
             event_queue=q,
-            report_interval=0,
         )
 
         # transfer_completed=300 > 0, so bytes_completed should be 300
@@ -339,7 +358,6 @@ class TestXetDownloadProgressCallback:
             filename="test.bin",
             total_bytes=1000,
             event_queue=q,
-            report_interval=0,
         )
 
         # When bytes_completed >= total_bytes, use the exact final value
@@ -361,7 +379,6 @@ class TestXetDownloadProgressCallback:
             filename="test.bin",
             total_bytes=1000,
             event_queue=q,
-            report_interval=0,
         )
 
         total_update = self._make_total_update(
@@ -373,7 +390,7 @@ class TestXetDownloadProgressCallback:
         assert event.percentage == 25.0
 
     def test_every_call_emits_event(self):
-        """Every callback invocation should emit an event (no producer-side throttle).
+        """Every callback invocation should emit an event.
 
         The consumer is responsible for throttling/display refresh.
         """
@@ -382,7 +399,6 @@ class TestXetDownloadProgressCallback:
             filename="test.bin",
             total_bytes=1000,
             event_queue=q,
-            report_interval=1.0,  # unused — kept for API compat
         )
 
         total_update = self._make_total_update(total_bytes_completed=100)
@@ -401,7 +417,6 @@ class TestXetDownloadProgressCallback:
             filename="test.bin",
             total_bytes=0,
             event_queue=q,
-            report_interval=0,
         )
 
         total_update = self._make_total_update(
@@ -419,7 +434,6 @@ class TestXetDownloadProgressCallback:
             filename="test.bin",
             total_bytes=1000,
             event_queue=q,
-            report_interval=0,
         )
 
         # Rust may send total_bytes=0 in some edge cases
@@ -473,7 +487,7 @@ class TestDownloadProgressTqdm:
         assert complete_events[0].percentage == 100.0
 
     def test_every_update_emits_event(self):
-        """Every update() call should emit an event (no producer-side throttle).
+        """Every update() call should emit an event.
 
         The consumer is responsible for throttling/display refresh.
         """

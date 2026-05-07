@@ -42,6 +42,32 @@ class EventType(str, enum.Enum):
 
 
 @dataclass
+class TransferError:
+    """Structured error information for failed transfers."""
+    message: str
+    error_type: str = "Exception"
+    retryable: bool = False
+
+    def __str__(self) -> str:
+        return self.message
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "message": self.message,
+            "error_type": self.error_type,
+            "retryable": self.retryable,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> TransferError:
+        return cls(
+            message=data.get("message", "Unknown error"),
+            error_type=data.get("error_type", "Exception"),
+            retryable=data.get("retryable", False),
+        )
+
+
+@dataclass
 class ProgressEvent:
     """Structured progress event emitted during transfers.
 
@@ -66,7 +92,7 @@ class ProgressEvent:
             (Xet only).
         transfer_speed: Network transfer speed in bytes/second (Xet only).
         dedup_saved_bytes: Bytes saved by deduplication (Xet upload only).
-        error: Error message (only set when event_type is "error").
+        error: Structured error object (only set when event_type is "error").
         timestamp: Unix timestamp when the event was created.
         extra: Additional metadata (strategy-specific fields).
     """
@@ -86,7 +112,7 @@ class ProgressEvent:
     transfer_bytes_total: int = 0
     transfer_speed: float = 0.0
     dedup_saved_bytes: int = 0
-    error: Optional[str] = None
+    error: Optional[TransferError] = None
     timestamp: float = field(default_factory=time.time)
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -141,7 +167,7 @@ class ProgressEvent:
         transfer_id: str,
         direction: TransferDirection,
         filename: str,
-        error: str,
+        error: TransferError,
         phase: ProgressPhase = ProgressPhase.ERROR,
         **kwargs,
     ) -> ProgressEvent:
@@ -175,7 +201,7 @@ class ProgressEvent:
             phase=ProgressPhase.ERROR,
             bytes_completed=bytes_completed,
             total_bytes=total_bytes,
-            error="Transfer cancelled by user",
+            error=TransferError(message="Transfer cancelled by user", error_type="TransferCancelledError"),
             **kwargs,
         )
 
@@ -203,7 +229,7 @@ class ProgressEvent:
         if self.dedup_saved_bytes:
             d["dedup_saved_bytes"] = self.dedup_saved_bytes
         if self.error is not None:
-            d["error"] = self.error
+            d["error"] = self.error.to_dict()
         if self.extra:
             d["extra"] = self.extra
         return d
@@ -214,6 +240,16 @@ class ProgressEvent:
         # Infer default phase from direction if phase is missing
         direction = TransferDirection(data["direction"])
         default_phase = ProgressPhase.UPLOADING if direction == TransferDirection.UPLOAD else ProgressPhase.DOWNLOADING
+        
+        error_obj = None
+        if "error" in data:
+            err_data = data["error"]
+            if isinstance(err_data, str):
+                # Backward compatibility for old JSON payloads
+                error_obj = TransferError(message=err_data)
+            else:
+                error_obj = TransferError.from_dict(err_data)
+
         return cls(
             event_type=EventType(data["event_type"]),
             transfer_id=data["transfer_id"],
@@ -230,7 +266,7 @@ class ProgressEvent:
             transfer_bytes_total=data.get("transfer_bytes_total", 0),
             transfer_speed=data.get("transfer_speed", 0.0),
             dedup_saved_bytes=data.get("dedup_saved_bytes", 0),
-            error=data.get("error"),
+            error=error_obj,
             timestamp=data.get("timestamp", time.time()),
             extra=data.get("extra", {}),
         )

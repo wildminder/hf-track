@@ -188,18 +188,15 @@ class ConsoleProgressDisplay:
             self._last_line_len = 0
             return
 
-        if event.event_type == EventType.CANCELLED:
+        if event.event_type == EventType.ERROR or event.event_type == EventType.CANCELLED:
             self._clear_line()
-            size_str = format_bytes(event.bytes_completed)
-            line = f" [STOP] Cancelled at {size_str} ({event.percentage:.1f}%)"
-            sys.stderr.write(f"\r{line}\n")
-            sys.stderr.flush()
-            self._last_line_len = 0
-            return
-
-        if event.event_type == EventType.ERROR:
-            self._clear_line()
-            line = f" [ERR] Error: {event.error or 'Unknown error'}"
+            
+            error_msg = "Unknown error"
+            if event.error:
+                # Handle new structured TransferError object
+                error_msg = event.error.message if hasattr(event.error, 'message') else str(event.error)
+                
+            line = f"  [ERR] {error_msg}"
             sys.stderr.write(f"\r{line}\n")
             sys.stderr.flush()
             self._last_line_len = 0

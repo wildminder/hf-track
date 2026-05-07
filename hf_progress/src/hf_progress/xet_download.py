@@ -15,6 +15,7 @@ from .types import (
     ProgressPhase,
     TransferCancelledError,
     TransferDirection,
+    TransferError,
     generate_transfer_id,
 )
 
@@ -141,7 +142,7 @@ def download_file_with_xet(
                 direction=TransferDirection.DOWNLOAD,
                 filename=filename,
                 phase=ProgressPhase.ERROR,
-                error=str(e),
+                error=TransferError(message=str(e), error_type=type(e).__name__),
             )
         )
         raise
@@ -287,7 +288,7 @@ def download_files_with_xet(
                     direction=TransferDirection.DOWNLOAD,
                     filename=filename,
                     phase=ProgressPhase.ERROR,
-                    error=str(e),
+                    error=TransferError(message=str(e), error_type=type(e).__name__),
                     file_index=i,
                     total_files=total_files,
                 )

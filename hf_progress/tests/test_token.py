@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-
+import os
 import pytest
+from unittest.mock import MagicMock, patch
 
 from hf_progress.token import XetCredentials, XetTokenManager, is_xet_available
 
@@ -12,10 +12,58 @@ from hf_progress.token import XetCredentials, XetTokenManager, is_xet_available
 class TestIsXetAvailable:
     """Tests for is_xet_available function."""
 
-    def test_returns_bool(self):
-        """Should return a boolean."""
-        result = is_xet_available()
-        assert isinstance(result, bool)
+    @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "0"})
+    def test_returns_true_when_xet_is_available_and_not_disabled(self):
+        """Should return True if hf_xet is importable and not disabled."""
+        real_import = __import__
+
+        def _mock_import(name, *args, **kwargs):
+            if name == "hf_xet":
+                return MagicMock()
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=_mock_import):
+            assert is_xet_available() is True
+
+    @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "1"})
+    def test_returns_false_when_xet_is_disabled_by_env_var(self):
+        """Should return False if HF_HUB_DISABLE_XET is set."""
+        assert is_xet_available() is False
+
+    @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "true"})
+    def test_returns_false_when_xet_is_disabled_by_env_var_true(self):
+        """Should return False if HF_HUB_DISABLE_XET is set to 'true'."""
+        assert is_xet_available() is False
+
+    @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "yes"})
+    def test_returns_false_when_xet_is_disabled_by_env_var_yes(self):
+        """Should return False if HF_HUB_DISABLE_XET is set to 'yes'."""
+        assert is_xet_available() is False
+        
+    @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "FALSE"})  # Ensure case-insensitivity
+    def test_returns_true_when_xet_is_available_and_env_var_is_false(self):
+        """Should return True if HF_HUB_DISABLE_XET is false (case-insensitive)."""
+        real_import = __import__
+
+        def _mock_import(name, *args, **kwargs):
+            if name == "hf_xet":
+                return MagicMock()
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=_mock_import):
+            assert is_xet_available() is True
+
+    def test_returns_false_when_xet_is_not_installed(self):
+        """Should return False if hf_xet is not installed."""
+        real_import = __import__
+
+        def _mock_import(name, *args, **kwargs):
+            if name == "hf_xet":
+                raise ImportError("No module named 'hf_xet'")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=_mock_import):
+            assert is_xet_available() is False
 
 
 class TestXetCredentials:
@@ -79,8 +127,8 @@ class TestXetTokenManager:
                 token="hf_test", endpoint=None
             )
 
-    def test_get_upload_credentials(self):
-        """get_upload_credentials should return XetCredentials."""
+    def test_fetch_upload_credentials(self):
+        """fetch_upload_credentials should return XetCredentials."""
         manager = XetTokenManager(token="hf_test")
 
         mock_connection_info = MagicMock()
@@ -95,14 +143,14 @@ class TestXetTokenManager:
                 "huggingface_hub.utils._xet.fetch_xet_connection_info_from_repo_info",
                 return_value=mock_connection_info,
             ) as mock_fetch:
-                creds = manager.get_upload_credentials("user/repo")
+                creds = manager.fetch_upload_credentials("user/repo")
 
                 assert creds.endpoint == "https://xet.example.com"
                 assert creds.token_info == ("xet_token_123", 1234567890)
                 assert creds.token_refresher is not None
                 mock_fetch.assert_called_once()
 
-    def test_get_upload_token_refresher(self):
+    def test_fetch_upload_token_refresher(self):
         """Token refresher should return a callable."""
         manager = XetTokenManager(token="hf_test")
 
@@ -116,15 +164,15 @@ class TestXetTokenManager:
                 "huggingface_hub.utils._xet.fetch_xet_connection_info_from_repo_info",
                 return_value=mock_connection_info,
             ):
-                refresher = manager.get_upload_token_refresher("user/repo")
+                refresher = manager.fetch_upload_token_refresher("user/repo")
                 assert callable(refresher)
 
                 token, exp = refresher()
                 assert token == "refreshed_token"
                 assert exp == 9999999999
 
-    def test_get_download_credentials(self):
-        """get_download_credentials should return XetCredentials."""
+    def test_fetch_download_credentials(self):
+        """fetch_download_credentials should return XetCredentials."""
         manager = XetTokenManager(token="hf_test")
 
         mock_connection_info = MagicMock()
@@ -140,7 +188,7 @@ class TestXetTokenManager:
                 "huggingface_hub.utils._xet.refresh_xet_connection_info",
                 return_value=mock_connection_info,
             ) as mock_refresh:
-                creds = manager.get_download_credentials(mock_file_data)
+                creds = manager.fetch_download_credentials(mock_file_data)
 
                 assert creds.endpoint == "https://xet.example.com"
                 assert creds.token_info == ("dl_token_123", 1234567890)
