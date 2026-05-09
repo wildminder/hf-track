@@ -20,13 +20,62 @@ Each worker:
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
+import signal
 import time
 from typing import Any, Dict, List
 
-import multiprocessing as mp
-
 from .subprocess_messages import SubprocessMessage
+
+
+# ── Initialization & Safe IO ─────────────────────────────────────
+
+def _init_worker() -> None:
+    """Initialize worker process state.
+    
+    Ignores SIGINT so that Ctrl+C is exclusively handled by the main
+    process (which will cleanly terminate this worker).
+    """
+    try:
+        if mp.current_process().name != "MainProcess":
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        pass
+
+
+def _safe_put(mp_queue: mp.Queue, message: SubprocessMessage) -> None:
+    """Put a message to the multiprocessing queue, suppressing all errors.
+
+    Catches ``BaseException`` (including ``KeyboardInterrupt``) so that
+    a second interrupt during error/cancel handling never produces a
+    traceback from the subprocess.
+    """
+    try:
+        mp_queue.put(message)
+    except BaseException:
+        pass
+
+
+def _handle_worker_exception(mp_queue: mp.Queue, e: BaseException) -> None:
+    """Safely format and send an exception as a terminal message."""
+    try:
+        from .types import TransferCancelledError
+        if isinstance(e, KeyboardInterrupt):
+            _safe_put(mp_queue, SubprocessMessage.cancelled(
+                message="Transfer interrupted by user (Ctrl+C)",
+            ))
+        elif isinstance(e, TransferCancelledError):
+            _safe_put(mp_queue, SubprocessMessage.cancelled(
+                message="Transfer cancelled by user",
+            ))
+        else:
+            _safe_put(mp_queue, SubprocessMessage.error(
+                message=str(e),
+                error_type=type(e).__name__,
+            ))
+    except BaseException:
+        pass
 
 
 # ── Serialization Helpers ────────────────────────────────────────
@@ -151,7 +200,7 @@ def _make_progress_callback(
         }
         try:
             mp_queue.put_nowait(SubprocessMessage.event(event_dict))
-        except Exception:
+        except BaseException:
             pass  # Drop event if queue is full or closed
 
     return progress_updater
@@ -171,6 +220,7 @@ def _download_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: m
         mp_queue: Queue for sending SubprocessMessage back to main process.
         cancel_event: Event set by main process to signal cancellation.
     """
+    _init_worker()
     from .types import EventType, ProgressPhase, TransferCancelledError, TransferDirection
 
     transfer_id = params["transfer_id"]
@@ -181,7 +231,7 @@ def _download_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: m
         import hf_xet
         from huggingface_hub.utils._xet import refresh_xet_connection_info
     except ImportError as e:
-        mp_queue.put(SubprocessMessage.error(
+        _safe_put(mp_queue, SubprocessMessage.error(
             message=str(e), error_type="ImportError", retryable=False,
         ))
         return
@@ -198,7 +248,7 @@ def _download_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: m
             ci = refresh_xet_connection_info(file_data=xet_file_data, headers=headers)
             return ci.access_token, ci.expiration_unix_epoch
     except Exception as e:
-        mp_queue.put(SubprocessMessage.error(
+        _safe_put(mp_queue, SubprocessMessage.error(
             message=f"Failed to get download credentials: {e}",
             error_type=type(e).__name__,
         ))
@@ -235,26 +285,15 @@ def _download_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: m
 
         hf_xet.download_files(download_info, **kwargs)
 
-        mp_queue.put(SubprocessMessage.result(
+        _safe_put(mp_queue, SubprocessMessage.result(
             filename=filename,
             destination_path=params["dest_path"],
             file_size=file_size,
             transfer_id=transfer_id,
         ))
 
-    except KeyboardInterrupt:
-        mp_queue.put(SubprocessMessage.cancelled(
-            message="Download interrupted by user (Ctrl+C)",
-        ))
-    except TransferCancelledError:
-        mp_queue.put(SubprocessMessage.cancelled(
-            message="Transfer cancelled by user",
-        ))
-    except Exception as e:
-        mp_queue.put(SubprocessMessage.error(
-            message=str(e),
-            error_type=type(e).__name__,
-        ))
+    except (KeyboardInterrupt, Exception) as e:
+        _handle_worker_exception(mp_queue, e)
 
 
 def _download_batch_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: mp.Event) -> None:
@@ -266,6 +305,7 @@ def _download_batch_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_ev
         mp_queue: Queue for sending SubprocessMessage back to main process.
         cancel_event: Event set by main process to signal cancellation.
     """
+    _init_worker()
     from .types import EventType, ProgressPhase, TransferCancelledError, TransferDirection
 
     transfer_id = params["transfer_id"]
@@ -276,7 +316,7 @@ def _download_batch_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_ev
         import hf_xet
         from huggingface_hub.utils._xet import refresh_xet_connection_info
     except ImportError as e:
-        mp_queue.put(SubprocessMessage.error(
+        _safe_put(mp_queue, SubprocessMessage.error(
             message=str(e), error_type="ImportError", retryable=False,
         ))
         return
@@ -292,7 +332,7 @@ def _download_batch_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_ev
             ci = refresh_xet_connection_info(file_data=xet_file_data, headers=headers)
             return ci.access_token, ci.expiration_unix_epoch
     except Exception as e:
-        mp_queue.put(SubprocessMessage.error(
+        _safe_put(mp_queue, SubprocessMessage.error(
             message=f"Failed to get download credentials: {e}",
             error_type=type(e).__name__,
         ))
@@ -338,7 +378,7 @@ def _download_batch_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_ev
         # Send individual result messages for each file
         for i, spec in enumerate(file_specs):
             filename = os.path.basename(spec["dest_path"])
-            mp_queue.put(SubprocessMessage.result(
+            _safe_put(mp_queue, SubprocessMessage.result(
                 filename=filename,
                 destination_path=spec["dest_path"],
                 file_size=spec["file_size"],
@@ -347,19 +387,8 @@ def _download_batch_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_ev
                 total_files=total_files,
             ))
 
-    except KeyboardInterrupt:
-        mp_queue.put(SubprocessMessage.cancelled(
-            message="Download interrupted by user (Ctrl+C)",
-        ))
-    except TransferCancelledError:
-        mp_queue.put(SubprocessMessage.cancelled(
-            message="Transfer cancelled by user",
-        ))
-    except Exception as e:
-        mp_queue.put(SubprocessMessage.error(
-            message=str(e),
-            error_type=type(e).__name__,
-        ))
+    except (KeyboardInterrupt, Exception) as e:
+        _handle_worker_exception(mp_queue, e)
 
 
 # ── Upload Workers ────────────────────────────────────────────────
@@ -373,6 +402,7 @@ def _upload_file_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event
         mp_queue: Queue for sending SubprocessMessage back to main process.
         cancel_event: Event set by main process to signal cancellation.
     """
+    _init_worker()
     from .types import EventType, ProgressPhase, TransferCancelledError, TransferDirection
 
     transfer_id = params["transfer_id"]
@@ -386,7 +416,7 @@ def _upload_file_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event
             fetch_xet_connection_info_from_repo_info,
         )
     except ImportError as e:
-        mp_queue.put(SubprocessMessage.error(
+        _safe_put(mp_queue, SubprocessMessage.error(
             message=str(e), error_type="ImportError", retryable=False,
         ))
         return
@@ -394,7 +424,7 @@ def _upload_file_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event
     try:
         file_size = os.path.getsize(file_path)
     except OSError as e:
-        mp_queue.put(SubprocessMessage.error(
+        _safe_put(mp_queue, SubprocessMessage.error(
             message=f"File not found: {file_path}", error_type=type(e).__name__,
         ))
         return
@@ -425,7 +455,7 @@ def _upload_file_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event
             )
             return info.access_token, info.expiration_unix_epoch
     except Exception as e:
-        mp_queue.put(SubprocessMessage.error(
+        _safe_put(mp_queue, SubprocessMessage.error(
             message=f"Failed to get upload credentials: {e}",
             error_type=type(e).__name__,
         ))
@@ -452,7 +482,7 @@ def _upload_file_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event
         )
 
         result_info = results[0] if results else None
-        mp_queue.put(SubprocessMessage.result(
+        _safe_put(mp_queue, SubprocessMessage.result(
             filename=filename,
             file_size=file_size,
             transfer_id=transfer_id,
@@ -460,19 +490,8 @@ def _upload_file_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event
             url=getattr(result_info, "url", None) if result_info else None,
         ))
 
-    except KeyboardInterrupt:
-        mp_queue.put(SubprocessMessage.cancelled(
-            message="Upload interrupted by user (Ctrl+C)",
-        ))
-    except TransferCancelledError:
-        mp_queue.put(SubprocessMessage.cancelled(
-            message="Transfer cancelled by user",
-        ))
-    except Exception as e:
-        mp_queue.put(SubprocessMessage.error(
-            message=str(e),
-            error_type=type(e).__name__,
-        ))
+    except (KeyboardInterrupt, Exception) as e:
+        _handle_worker_exception(mp_queue, e)
 
 
 def _upload_bytes_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: mp.Event) -> None:
@@ -489,6 +508,7 @@ def _upload_bytes_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_even
         mp_queue: Queue for sending SubprocessMessage back to main process.
         cancel_event: Event set by main process to signal cancellation.
     """
+    _init_worker()
     from .types import EventType, ProgressPhase, TransferCancelledError, TransferDirection
 
     transfer_id = params["transfer_id"]
@@ -503,7 +523,7 @@ def _upload_bytes_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_even
     elif file_path is not None:
         file_size = os.path.getsize(file_path)
     else:
-        mp_queue.put(SubprocessMessage.error(
+        _safe_put(mp_queue, SubprocessMessage.error(
             message="Either file_content or file_path must be provided",
             error_type="ValueError",
         ))
@@ -516,7 +536,7 @@ def _upload_bytes_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_even
             fetch_xet_connection_info_from_repo_info,
         )
     except ImportError as e:
-        mp_queue.put(SubprocessMessage.error(
+        _safe_put(mp_queue, SubprocessMessage.error(
             message=str(e), error_type="ImportError", retryable=False,
         ))
         return
@@ -547,7 +567,7 @@ def _upload_bytes_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_even
             )
             return info.access_token, info.expiration_unix_epoch
     except Exception as e:
-        mp_queue.put(SubprocessMessage.error(
+        _safe_put(mp_queue, SubprocessMessage.error(
             message=f"Failed to get upload credentials: {e}",
             error_type=type(e).__name__,
         ))
@@ -584,7 +604,7 @@ def _upload_bytes_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_even
             )
 
         result_info = results[0] if results else None
-        mp_queue.put(SubprocessMessage.result(
+        _safe_put(mp_queue, SubprocessMessage.result(
             filename=filename,
             file_size=file_size,
             transfer_id=transfer_id,
@@ -592,16 +612,5 @@ def _upload_bytes_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_even
             url=getattr(result_info, "url", None) if result_info else None,
         ))
 
-    except KeyboardInterrupt:
-        mp_queue.put(SubprocessMessage.cancelled(
-            message="Upload interrupted by user (Ctrl+C)",
-        ))
-    except TransferCancelledError:
-        mp_queue.put(SubprocessMessage.cancelled(
-            message="Transfer cancelled by user",
-        ))
-    except Exception as e:
-        mp_queue.put(SubprocessMessage.error(
-            message=str(e),
-            error_type=type(e).__name__,
-        ))
+    except (KeyboardInterrupt, Exception) as e:
+        _handle_worker_exception(mp_queue, e)
