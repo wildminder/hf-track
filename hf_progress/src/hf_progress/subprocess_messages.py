@@ -78,7 +78,12 @@ class SubprocessMessage:
         """
         return cls(
             msg_type=MSG_ERROR,
-            payload={"message": message, "error_type": error_type, "retryable": retryable},
+            payload={
+                "status": "error",
+                "message": message,
+                "error_type": error_type,
+                "retryable": retryable,
+            },
         )
 
     @classmethod
@@ -98,6 +103,7 @@ class SubprocessMessage:
         return cls(
             msg_type=MSG_CANCELLED,
             payload={
+                "status": "cancelled",
                 "message": message,
                 "bytes_completed": bytes_completed,
                 "total_bytes": total_bytes,

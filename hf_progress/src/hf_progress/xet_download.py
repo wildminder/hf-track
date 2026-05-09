@@ -145,10 +145,16 @@ def download_file_with_xet(
                 file_size=result.get("file_size", file_size),
                 transfer_id=transfer_id,
             )
+        elif (
+            result.get("status") == "cancelled"
+            or result.get("error_type") == "TransferCancelledError"
+            or "cancelled" in result.get("message", "").lower()
+            or "interrupted" in result.get("message", "").lower()
+        ):
+            raise TransferCancelledError(result.get("message", "Download cancelled by user"))
         else:
             # Error result from worker
             error_msg = result.get("message", "Download failed")
-            error_type = result.get("error_type", "Exception")
             raise TransferProgressError(error_msg)
 
     except KeyboardInterrupt:
@@ -291,6 +297,13 @@ def download_files_with_xet(
                     )
                 )
             return download_results
+        elif (
+            result.get("status") == "cancelled"
+            or result.get("error_type") == "TransferCancelledError"
+            or "cancelled" in result.get("message", "").lower()
+            or "interrupted" in result.get("message", "").lower()
+        ):
+            raise TransferCancelledError(result.get("message", "Download cancelled by user"))
         else:
             error_msg = result.get("message", "Batch download failed")
             error_type = result.get("error_type", "Exception")

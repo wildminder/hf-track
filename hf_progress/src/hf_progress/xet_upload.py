@@ -127,9 +127,15 @@ def _run_upload_in_subprocess(
                 transfer_id=transfer_id,
                 url=result.get("url"),
             )
+        elif (
+            result.get("status") == "cancelled"
+            or result.get("error_type") == "TransferCancelledError"
+            or "cancelled" in result.get("message", "").lower()
+            or "interrupted" in result.get("message", "").lower()
+        ):
+            raise TransferCancelledError(result.get("message", "Upload cancelled by user"))
         else:
             error_msg = result.get("message", "Upload failed")
-        error_type = result.get("error_type", "Exception")
         raise TransferProgressError(error_msg)
 
     except KeyboardInterrupt:
