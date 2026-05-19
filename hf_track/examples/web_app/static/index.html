@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>hf-track Web Demo</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>⬇️ hf-track Web Demo</h1>
+            <p class="subtitle">Real-time HuggingFace Hub download progress in the browser</p>
+        </header>
+
+        <section id="download-form-section">
+            <h2>Start a Download</h2>
+            <form id="download-form">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="repo-id">Repository ID</label>
+                        <input type="text" id="repo-id" name="repo_id"
+                               placeholder="e.g. bert-base-uncased" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="filename">Filename</label>
+                        <input type="text" id="filename" name="filename"
+                               placeholder="e.g. config.json" required>
+                    </div>
+                    <div class="form-group form-group-button">
+                        <button type="submit" id="start-btn">⬇ Start Download</button>
+                    </div>
+                </div>
+            </form>
+        </section>
+
+        <section id="active-section">
+            <h2>Active Transfers</h2>
+            <div id="active-transfers">
+                <p class="empty-state">No active transfers. Start a download above.</p>
+            </div>
+        </section>
+
+        <section id="history-section">
+            <h2>Transfer History</h2>
+            <div id="transfer-history">
+                <p class="empty-state">Completed transfers will appear here.</p>
+            </div>
+        </section>
+
+        <footer>
+            <div id="status-bar">
+                <span id="active-count">Active: 0</span>
+                <span id="queue-size">Queue: 0</span>
+            </div>
+            <p class="footer-note">Powered by <a href="https://github.com/example/hf-track" target="_blank">hf-track</a></p>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

@@ -29,3 +29,8 @@ src_ref/
 Thumbs.db
 .DS_Store
 
+_backup/
+tmp/
+
+# desloppify local state
+.desloppify/

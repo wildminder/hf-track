@@ -1,0 +1,3 @@
+[bandit]
+exclude_dirs = ["src_ref", ".pytest_cache", "tests"]
+skips = ["B101"]

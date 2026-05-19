@@ -1,0 +1,277 @@
+/* ── Reset & Base ──────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+    --bg-primary: #1a1a2e;
+    --bg-secondary: #16213e;
+    --bg-card: #0f3460;
+    --text-primary: #e0e0e0;
+    --text-secondary: #a0a0b0;
+    --accent-blue: #4cc9f0;
+    --accent-green: #06d6a0;
+    --accent-red: #ef476f;
+    --accent-yellow: #ffd166;
+    --radius: 8px;
+    --shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    line-height: 1.6;
+    min-height: 100vh;
+}
+
+a { color: var(--accent-blue); }
+
+/* ── Container ────────────────────────────────────────────────── */
+.container {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 2rem 1rem;
+}
+
+/* ── Header ───────────────────────────────────────────────────── */
+header {
+    text-align: center;
+    margin-bottom: 2rem;
+}
+
+header h1 {
+    font-size: 2rem;
+    font-weight: 700;
+    margin-bottom: 0.25rem;
+}
+
+.subtitle {
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+}
+
+/* ── Form ─────────────────────────────────────────────────────── */
+#download-form-section {
+    background: var(--bg-secondary);
+    border-radius: var(--radius);
+    padding: 1.5rem;
+    margin-bottom: 2rem;
+    box-shadow: var(--shadow);
+}
+
+#download-form-section h2 {
+    font-size: 1.1rem;
+    margin-bottom: 1rem;
+    color: var(--accent-blue);
+}
+
+.form-row {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.form-group {
+    flex: 1;
+    min-width: 180px;
+}
+
+.form-group label {
+    display: block;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    margin-bottom: 0.25rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.form-group input {
+    width: 100%;
+    padding: 0.6rem 0.8rem;
+    border: 1px solid #333;
+    border-radius: var(--radius);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 0.95rem;
+}
+
+.form-group input:focus {
+    outline: none;
+    border-color: var(--accent-blue);
+    box-shadow: 0 0 0 2px rgba(76, 201, 240, 0.2);
+}
+
+.form-group-button {
+    display: flex;
+    align-items: flex-end;
+}
+
+#start-btn {
+    width: 100%;
+    padding: 0.6rem 1.2rem;
+    border: none;
+    border-radius: var(--radius);
+    background: var(--accent-blue);
+    color: var(--bg-primary);
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.1s;
+    white-space: nowrap;
+}
+
+#start-btn:hover { background: #3ab8dd; }
+#start-btn:active { transform: scale(0.97); }
+
+/* ── Sections ─────────────────────────────────────────────────── */
+#active-section, #history-section {
+    margin-bottom: 2rem;
+}
+
+#active-section h2, #history-section h2 {
+    font-size: 1.1rem;
+    margin-bottom: 1rem;
+    color: var(--accent-blue);
+}
+
+.empty-state {
+    color: var(--text-secondary);
+    font-style: italic;
+    text-align: center;
+    padding: 1.5rem;
+}
+
+/* ── Transfer Card ────────────────────────────────────────────── */
+.transfer-card {
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    padding: 1rem 1.25rem;
+    margin-bottom: 0.75rem;
+    box-shadow: var(--shadow);
+    animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(-8px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.transfer-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+}
+
+.filename {
+    font-weight: 600;
+    font-size: 0.95rem;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.status-badge {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.2rem 0.6rem;
+    border-radius: 12px;
+    white-space: nowrap;
+}
+
+.status-badge.running  { background: rgba(76, 201, 240, 0.2); color: var(--accent-blue); }
+.status-badge.completed { background: rgba(6, 214, 160, 0.2); color: var(--accent-green); }
+.status-badge.error    { background: rgba(239, 71, 111, 0.2); color: var(--accent-red); }
+.status-badge.cancelled { background: rgba(255, 209, 102, 0.2); color: var(--accent-yellow); }
+
+.cancel-btn {
+    background: none;
+    border: 1px solid var(--accent-red);
+    color: var(--accent-red);
+    border-radius: var(--radius);
+    padding: 0.2rem 0.6rem;
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.cancel-btn:hover {
+    background: rgba(239, 71, 111, 0.15);
+}
+
+/* ── Progress Bar ─────────────────────────────────────────────── */
+.progress-bar-container {
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    height: 8px;
+    overflow: hidden;
+    margin-bottom: 0.5rem;
+}
+
+.progress-bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    background: var(--accent-blue);
+    transition: width 0.3s ease, background 0.3s ease;
+    min-width: 0;
+}
+
+.progress-bar-fill.completed { background: var(--accent-green); }
+.progress-bar-fill.error     { background: var(--accent-red); }
+.progress-bar-fill.cancelled { background: var(--accent-yellow); }
+
+/* ── Transfer Stats ───────────────────────────────────────────── */
+.transfer-stats {
+    display: flex;
+    gap: 1.5rem;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    flex-wrap: wrap;
+}
+
+.transfer-stats span {
+    white-space: nowrap;
+}
+
+.percentage { color: var(--text-primary); font-weight: 600; }
+.speed { color: var(--accent-blue); }
+
+/* ── Error Message ────────────────────────────────────────────── */
+.error-message {
+    color: var(--accent-red);
+    font-size: 0.8rem;
+    margin-top: 0.5rem;
+    word-break: break-word;
+}
+
+/* ── Footer ───────────────────────────────────────────────────── */
+footer {
+    text-align: center;
+    margin-top: 2rem;
+    padding-top: 1rem;
+    border-top: 1px solid #333;
+}
+
+#status-bar {
+    display: flex;
+    justify-content: center;
+    gap: 2rem;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    margin-bottom: 0.5rem;
+}
+
+.footer-note {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+/* ── Responsive ───────────────────────────────────────────────── */
+@media (max-width: 600px) {
+    .form-row { flex-direction: column; }
+    .form-group-button { margin-top: 0; }
+    .transfer-stats { gap: 0.75rem; }
+    header h1 { font-size: 1.5rem; }
+}
