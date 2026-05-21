@@ -69,8 +69,8 @@ class TestWebAppEndpoints:
         spec.loader.exec_module(mod)
         return TestClient(mod.app)
 
-    def test_download_endpoint_returns_transfer_id(self, client):
-        """POST /hf-track/download returns a transfer_id."""
+    def test_download_file_returns_transfer_id(self, client):
+        """POST /hf-track/download with filename returns a transfer_id."""
         resp = client.post(
             "/hf-track/download",
             params={"repo_id": "test/repo", "filename": "test.bin"},
@@ -79,24 +79,35 @@ class TestWebAppEndpoints:
         data = resp.json()
         assert "transfer_id" in data
         assert isinstance(data["transfer_id"], str)
+        assert data.get("is_snapshot") is False
 
-    def test_upload_endpoint_returns_transfer_id(self, client):
-        """POST /hf-track/upload returns a transfer_id."""
+    def test_download_snapshot_returns_transfer_id(self, client):
+        """POST /hf-track/download without filename downloads full repo."""
         resp = client.post(
-            "/hf-track/upload",
-            params={"repo_id": "test/repo", "file_path": "/tmp/test.bin"},
+            "/hf-track/download",
+            params={"repo_id": "test/repo"},
         )
         assert resp.status_code == 200
         data = resp.json()
         assert "transfer_id" in data
         assert isinstance(data["transfer_id"], str)
+        assert data.get("is_snapshot") is True
 
-    def test_cancel_endpoint(self, client):
-        """POST /hf-track/cancel/{id} returns success."""
+    def test_upload_endpoint_removed(self, client):
+        """POST /hf-track/upload returns 404 or 405 (upload removed)."""
+        resp = client.post(
+            "/hf-track/upload",
+            params={"repo_id": "test/repo", "file_path": "/tmp/test.bin"},
+        )
+        # Upload endpoint was removed — 404 or 405 is expected
+        assert resp.status_code in (404, 405)
+
+    def test_cancel_endpoint_unknown_id(self, client):
+        """POST /hf-track/cancel/{unknown_id} returns not_found."""
         resp = client.post("/hf-track/cancel/test-transfer-id")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "success"
+        assert data["status"] == "not_found"
 
     def test_status_endpoint(self, client):
         """GET /hf-track/status returns active_transfers dict."""
@@ -129,15 +140,15 @@ class TestWebAppEndpoints:
         assert clear_resp.status_code == 200
         assert clear_resp.json()["status"] == "success"
 
-    def test_download_missing_params(self, client):
-        """POST without required params returns 422."""
+    def test_download_missing_repo_id(self, client):
+        """POST without repo_id returns 422."""
         resp = client.post("/hf-track/download")
         assert resp.status_code == 422
 
-    def test_upload_missing_params(self, client):
-        """POST without required params returns 422."""
+    def test_upload_endpoint_removed(self, client):
+        """POST /hf-track/upload returns 404 or 405 (upload removed)."""
         resp = client.post("/hf-track/upload")
-        assert resp.status_code == 422
+        assert resp.status_code in (404, 405)
 
     def test_events_route_exists(self, client):
         """GET /hf-track/events/{id} is a registered route."""

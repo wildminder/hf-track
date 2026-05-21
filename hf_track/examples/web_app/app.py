@@ -11,29 +11,45 @@ Then open http://localhost:8000 in your browser.
 
 Endpoints:
 
-- ``POST /hf-track/download`` — Start a download
-- ``POST /hf-track/upload`` — Start an upload
+- ``POST /hf-track/download`` — Start a download (single file or full repo)
 - ``POST /hf-track/cancel/{transfer_id}`` — Cancel a running transfer
-- ``GET  /hf-track/events/{transfer_id}`` — SSE stream for a transfer
-- ``GET  /hf-track/status`` — List active transfers
+- ``GET /hf-track/events/{transfer_id}`` — SSE stream for a transfer
+- ``GET /hf-track/status`` — List active transfers
 - ``DELETE /hf-track/transfer/{transfer_id}`` — Clear transfer state
+
+Xet toggle:
+    The ``use_xet`` parameter controls whether Xet storage is used.
+    When disabled, ``HF_HUB_DISABLE_XET=1`` is set so that
+    ``huggingface_hub`` routes downloads through standard HTTP instead
+    of ``hf_xet``. When enabled, the env var is cleared so Xet is
+    available (with subprocess isolation via ``XetSubprocessRunner``).
+
+    .. note:: ``HF_HUB_DISABLE_XET`` is a process-wide environment
+       variable. Concurrent downloads with different ``use_xet`` settings
+       may interfere. For a production app, use separate processes or
+       a queue-based architecture.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
+import queue
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from sse_starlette import EventSourceResponse
 
-from hf_track import HfTracker
-from hf_track.types import EventType
+from hf_track import HfTracker, TransferCancelledError
+from hf_track.types import EventType, ProgressEvent, TransferDirection
+
+logger = logging.getLogger("hf_track.web_app")
 
 # ── Create tracker and FastAPI app ────────────────────────────────
 tracker = HfTracker()
@@ -45,6 +61,9 @@ app = FastAPI(
 
 # ── In-memory transfer state ──────────────────────────────────────
 _active_transfers: Dict[str, dict] = {}
+_transfer_threads: Dict[str, threading.Thread] = {}
+_transfer_events: Dict[str, List[ProgressEvent]] = {}
+_events_lock = threading.Lock()
 _TTL_SECONDS = 3600  # 1 hour expiry for completed transfers
 
 
@@ -59,29 +78,76 @@ def _cleanup_expired_transfers() -> None:
     ]
     for tid in expired:
         _active_transfers.pop(tid, None)
+        _transfer_threads.pop(tid, None)
+        with _events_lock:
+            _transfer_events.pop(tid, None)
+
+
+# ── Background event router ───────────────────────────────────────
+# Drains tracker.event_queue and routes each event to the
+# per-transfer buffer (_transfer_events) so SSE streams can read
+# them without stealing events from each other.
+
+_event_router_stop = threading.Event()
+
+
+def _event_router_loop() -> None:
+    """Background thread: drain tracker.event_queue → _transfer_events."""
+    while not _event_router_stop.is_set():
+        try:
+            event = tracker.event_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        with _events_lock:
+            tid = event.transfer_id
+            if tid in _transfer_events:
+                _transfer_events[tid].append(event)
+            # If the transfer_id is not in _transfer_events, the event
+            # is for a transfer we don't track (e.g. from a different
+            # consumer). Drop it silently.
+
+
+_event_router_thread = threading.Thread(
+    target=_event_router_loop, daemon=True, name="hf-track-event-router"
+)
+_event_router_thread.start()
 
 
 # ── Background worker functions (module-level, not closures) ──────
 
 
-def _do_upload(
+def _do_download(
     transfer_id: str,
-    file_path: str,
     repo_id: str,
-    path_in_repo: Optional[str],
+    filename: Optional[str],
     repo_type: str,
+    local_dir: Optional[str],
+    use_xet: bool,
 ) -> None:
-    """Upload worker — runs in a daemon thread."""
+    """Download a single file — runs in a daemon thread.
+
+    Sets ``HF_HUB_DISABLE_XET`` based on *use_xet* before calling
+    the tracker, matching the approach used by the CLI examples
+    (``download_file.py``, ``download_repo.py``).
+    """
+    if not use_xet:
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+    else:
+        os.environ.pop("HF_HUB_DISABLE_XET", None)
+
     try:
-        tracker.upload_file(
-            file_path=file_path,
+        tracker.download_file(
             repo_id=repo_id,
-            path_in_repo=path_in_repo,
+            filename=filename,
             repo_type=repo_type,
+            local_dir=local_dir,
             transfer_id=transfer_id,
         )
         if transfer_id in _active_transfers:
             _active_transfers[transfer_id]["status"] = "completed"
+    except TransferCancelledError:
+        if transfer_id in _active_transfers:
+            _active_transfers[transfer_id]["status"] = "cancelled"
     except (OSError, ConnectionError, ValueError) as e:
         if transfer_id in _active_transfers:
             _active_transfers[transfer_id]["status"] = "error"
@@ -95,22 +161,38 @@ def _do_upload(
             _active_transfers[transfer_id]["completed_at"] = time.time()
 
 
-def _do_download(
+def _do_download_snapshot(
     transfer_id: str,
     repo_id: str,
-    filename: str,
+    allow_patterns: Optional[str],
     repo_type: str,
+    local_dir: Optional[str],
+    use_xet: bool,
 ) -> None:
-    """Download worker — runs in a daemon thread."""
+    """Download an entire repo (or filtered subset) — runs in a daemon thread.
+
+    Sets ``HF_HUB_DISABLE_XET`` based on *use_xet* before calling
+    the tracker, matching the approach used by the CLI examples.
+    """
+    if not use_xet:
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+    else:
+        os.environ.pop("HF_HUB_DISABLE_XET", None)
+
     try:
-        tracker.download_file(
+        patterns = [allow_patterns] if allow_patterns else None
+        tracker.download_snapshot(
             repo_id=repo_id,
-            filename=filename,
+            allow_patterns=patterns,
             repo_type=repo_type,
+            local_dir=local_dir,
             transfer_id=transfer_id,
         )
         if transfer_id in _active_transfers:
             _active_transfers[transfer_id]["status"] = "completed"
+    except TransferCancelledError:
+        if transfer_id in _active_transfers:
+            _active_transfers[transfer_id]["status"] = "cancelled"
     except (OSError, ConnectionError, ValueError) as e:
         if transfer_id in _active_transfers:
             _active_transfers[transfer_id]["status"] = "error"
@@ -127,77 +209,95 @@ def _do_download(
 # ── API endpoints (module-level, no closures) ─────────────────────
 
 
-@app.post("/hf-track/upload")
-async def start_upload(
-    repo_id: str,
-    file_path: str,
-    path_in_repo: Optional[str] = None,
-    repo_type: str = "model",
-):
-    """Start a file upload in a background thread."""
-    transfer_id = str(uuid.uuid4())
-    _active_transfers[transfer_id] = {
-        "direction": "upload",
-        "repo_id": repo_id,
-        "filename": file_path,
-        "status": "running",
-        "started_at": time.time(),
-    }
-    _cleanup_expired_transfers()
-
-    thread = threading.Thread(
-        target=_do_upload,
-        args=(transfer_id, file_path, repo_id, path_in_repo, repo_type),
-        daemon=True,
-    )
-    thread.start()
-    return {"transfer_id": transfer_id}
-
-
 @app.post("/hf-track/download")
 async def start_download(
     repo_id: str,
-    filename: str,
+    filename: Optional[str] = None,
+    local_dir: Optional[str] = None,
+    use_xet: bool = True,
     repo_type: str = "model",
+    allow_patterns: Optional[str] = None,
 ):
-    """Start a file download in a background thread."""
+    """Start a download in a background thread.
+
+    If *filename* is provided, downloads a single file.
+    If *filename* is omitted, downloads the entire repository snapshot.
+    If *local_dir* is provided, files are saved there instead of the HF cache.
+    If *use_xet* is False, forces standard HTTP download (no Xet).
+    If *allow_patterns* is provided (snapshot only), only matching files are downloaded.
+    """
     transfer_id = str(uuid.uuid4())
+    display_name = filename or f"{repo_id} (full repo)"
     _active_transfers[transfer_id] = {
         "direction": "download",
         "repo_id": repo_id,
-        "filename": filename,
+        "filename": display_name,
+        "local_dir": local_dir,
+        "use_xet": use_xet,
+        "is_snapshot": filename is None,
         "status": "running",
         "started_at": time.time(),
     }
+    # Initialize per-transfer event buffer so the event router
+    # can start recording events for this transfer immediately.
+    with _events_lock:
+        _transfer_events[transfer_id] = []
+
     _cleanup_expired_transfers()
 
-    thread = threading.Thread(
-        target=_do_download,
-        args=(transfer_id, repo_id, filename, repo_type),
-        daemon=True,
-    )
+    if filename:
+        target = _do_download
+        args = (transfer_id, repo_id, filename, repo_type, local_dir, use_xet)
+    else:
+        target = _do_download_snapshot
+        args = (transfer_id, repo_id, allow_patterns, repo_type, local_dir, use_xet)
+
+    thread = threading.Thread(target=target, args=args, daemon=True)
+    _transfer_threads[transfer_id] = thread
     thread.start()
-    return {"transfer_id": transfer_id}
+    return {
+        "transfer_id": transfer_id,
+        "is_snapshot": filename is None,
+        "use_xet": use_xet,
+    }
 
 
 @app.get("/hf-track/events/{transfer_id}")
 async def stream_events(transfer_id: str, request: Request):
-    """Stream progress events for a transfer via SSE."""
+    """Stream progress events for a transfer via SSE.
+
+    Reads from the per-transfer event buffer instead of the global
+    queue, so concurrent SSE streams don't steal each other's events.
+    Uses a cursor-based approach: new events appended by the event
+    router thread are picked up on each poll iteration.
+    """
 
     async def event_stream():
+        cursor = 0
         while True:
             if await request.is_disconnected():
                 return
-            events = tracker.get_events()
-            for event in events:
-                if event.transfer_id == transfer_id:
-                    yield {"data": json.dumps(event.to_dict())}
-                    if event.event_type in (
-                        EventType.COMPLETE,
-                        EventType.ERROR,
-                        EventType.CANCELLED,
-                    ):
-                        return
+            # Read new events from the per-transfer buffer
+            with _events_lock:
+                events = list(_transfer_events.get(transfer_id, []))
+            new_events = events[cursor:]
+            for event in new_events:
+                cursor += 1
+                yield {"data": json.dumps(event.to_dict())}
+                if event.event_type in (
+                    EventType.COMPLETE,
+                    EventType.ERROR,
+                    EventType.CANCELLED,
+                ):
+                    return
+            # If the transfer is no longer running and we've sent all
+            # its events, close the stream.
+            transfer = _active_transfers.get(transfer_id, {})
+            if (
+                transfer.get("status") in ("completed", "error", "cancelled")
+                and not new_events
+            ):
+                return
             await asyncio.sleep(0.1)
 
     return EventSourceResponse(event_stream())
@@ -215,10 +315,48 @@ async def get_status():
 
 @app.post("/hf-track/cancel/{transfer_id}")
 async def cancel_transfer(transfer_id: str):
-    """Cancel a running transfer."""
+    """Cancel a running transfer.
+
+    Calls ``tracker.cancel()`` which:
+    1. Sets the cancellation flag (checked by is_cancelled hooks)
+    2. Terminates any Xet subprocess associated with this transfer
+
+    Also emits a CANCELLED event so the SSE stream terminates
+    immediately, and waits briefly for the worker thread to finish.
+    """
+    if transfer_id not in _active_transfers:
+        return {"status": "not_found", "message": f"Transfer {transfer_id} not found."}
+
+    transfer = _active_transfers[transfer_id]
+    direction_str = transfer.get("direction", "download")
+    direction = TransferDirection(direction_str)
+    filename = transfer.get("filename", "")
+
+    # tracker.cancel() sets the flag AND terminates the Xet subprocess
     tracker.cancel(transfer_id)
-    if transfer_id in _active_transfers:
-        _active_transfers[transfer_id]["status"] = "cancelled"
+
+    # Emit a CANCELLED event so the SSE stream terminates immediately
+    # (the worker thread may be blocked in a long HTTP read and not
+    # check the is_cancelled hook for a while).
+    cancelled_event = ProgressEvent.cancelled_event(
+        transfer_id=transfer_id,
+        direction=direction,
+        filename=filename,
+    )
+    # Put into the global queue (for any direct consumers)
+    tracker.event_queue.put(cancelled_event)
+    # Also put into the per-transfer buffer (for SSE streams)
+    with _events_lock:
+        if transfer_id in _transfer_events:
+            _transfer_events[transfer_id].append(cancelled_event)
+
+    _active_transfers[transfer_id]["status"] = "cancelled"
+
+    # Wait for the worker thread to finish
+    thread = _transfer_threads.get(transfer_id)
+    if thread and thread.is_alive():
+        thread.join(timeout=3.0)
+
     return {"status": "success", "message": f"Transfer {transfer_id} cancelled."}
 
 
@@ -227,6 +365,8 @@ async def clear_transfer(transfer_id: str):
     """Explicitly clear a transfer from memory."""
     if transfer_id in _active_transfers:
         _active_transfers.pop(transfer_id)
+        with _events_lock:
+            _transfer_events.pop(transfer_id, None)
         return {"status": "success", "message": "Transfer state cleared."}
     return {"status": "not_found", "message": "Transfer ID not found."}
 
@@ -238,6 +378,10 @@ app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 
 # ── Run with uvicorn ──────────────────────────────────────────────
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+    )
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)

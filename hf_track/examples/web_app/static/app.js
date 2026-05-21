@@ -46,14 +46,15 @@ function formatPercentage(pct) {
 // ── Transfer State ───────────────────────────────────────────────
 
 class TransferState {
-    constructor(transferId, filename) {
-        this.transferId = transferId;
-        this.filename = filename;
-        this.status = "running";  // running | completed | error | cancelled
-        this.eventSource = null;
-        this.lastEvent = null;
-        this.cardElement = null;
-    }
+  constructor(transferId, filename, isSnapshot = false) {
+    this.transferId = transferId;
+    this.filename = filename;
+    this.isSnapshot = isSnapshot;
+    this.status = "running"; // running | completed | error | cancelled
+    this.eventSource = null;
+    this.lastEvent = null;
+    this.cardElement = null;
+  }
 }
 
 // ── App Controller ───────────────────────────────────────────────
@@ -63,26 +64,36 @@ const App = {
 
     // ── Form Submission ──────────────────────────────────────────
 
-    async startDownload(repoId, filename) {
+    async startDownload(repoId, filename, localDir, useXet, allowPatterns) {
         try {
-            const resp = await fetch(
-                `/hf-track/download?repo_id=${encodeURIComponent(repoId)}&filename=${encodeURIComponent(filename)}`,
-                { method: "POST" }
-            );
-            if (!resp.ok) {
-                const err = await resp.text();
-                alert(`Failed to start download: ${err}`);
-                return;
+            const isSnapshot = !filename;
+            const displayName = filename || `${repoId} (full repo)`;
+            let url = `/hf-track/download?repo_id=${encodeURIComponent(repoId)}`;
+            if (filename) {
+                url += `&filename=${encodeURIComponent(filename)}`;
             }
-            const data = await resp.json();
-            const state = new TransferState(data.transfer_id, filename);
-            this.transfers.set(data.transfer_id, state);
-            this.createTransferCard(state);
-            this.listenToEvents(state);
-            this.updateStatusBar();
-        } catch (e) {
-            alert(`Network error: ${e.message}`);
+            if (localDir) {
+                url += `&local_dir=${encodeURIComponent(localDir)}`;
+            }
+            url += `&use_xet=${useXet ? "true" : "false"}`;
+            if (allowPatterns) {
+                url += `&allow_patterns=${encodeURIComponent(allowPatterns)}`;
+            }
+        const resp = await fetch(url, { method: "POST" });
+        if (!resp.ok) {
+          const err = await resp.text();
+          alert(`Failed to start download: ${err}`);
+          return;
         }
+        const data = await resp.json();
+        const state = new TransferState(data.transfer_id, displayName, isSnapshot);
+        this.transfers.set(data.transfer_id, state);
+        this.createTransferCard(state);
+        this.listenToEvents(state);
+        this.updateStatusBar();
+      } catch (e) {
+        alert(`Network error: ${e.message}`);
+      }
     },
 
     // ── DOM: Create Transfer Card ────────────────────────────────
@@ -288,15 +299,18 @@ const App = {
 // ── Initialize ───────────────────────────────────────────────────
 
 document.addEventListener("DOMContentLoaded", () => {
-    const form = document.getElementById("download-form");
+  const form = document.getElementById("download-form");
     form.addEventListener("submit", (e) => {
         e.preventDefault();
         const repoId = document.getElementById("repo-id").value.trim();
         const filename = document.getElementById("filename").value.trim();
-        if (!repoId || !filename) return;
-        App.startDownload(repoId, filename);
-        // Don't clear inputs — user may want to download another file from same repo
-    });
+        const localDir = document.getElementById("local-dir").value.trim();
+        const useXet = document.getElementById("use-xet").checked;
+        const allowPatterns = document.getElementById("allow-patterns").value.trim();
+        if (!repoId) return;
+        App.startDownload(repoId, filename || null, localDir || null, useXet, allowPatterns || null);
+    // Don't clear inputs — user may want to download another file from same repo
+  });
 
     // Poll status bar every 2 seconds
     setInterval(() => App.updateStatusBar(), 2000);

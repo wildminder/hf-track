@@ -1,4 +1,53 @@
 /* ── Reset & Base ──────────────────────────────────────────────── */
+
+.optional-hint {
+  font-size: 0.8em;
+  color: var(--text-muted);
+  font-weight: normal;
+}
+
+.form-help {
+  margin: 0.5rem 0 0 0;
+  font-size: 0.85em;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.form-help code {
+  background: var(--bg-tertiary);
+  padding: 0.1em 0.4em;
+  border-radius: 3px;
+  font-size: 0.95em;
+}
+
+.form-group-checkbox {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding-bottom: 0.3rem;
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  font-size: 0.95em;
+  color: var(--text-primary);
+}
+
+.checkbox-label input[type="checkbox"] {
+  width: 1.1rem;
+  height: 1.1rem;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.checkbox-hint {
+  font-size: 0.75em;
+  color: var(--text-muted);
+  margin-top: 0.2rem;
+}
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {

@@ -16,21 +16,39 @@
         <section id="download-form-section">
             <h2>Start a Download</h2>
             <form id="download-form">
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="repo-id">Repository ID</label>
-                        <input type="text" id="repo-id" name="repo_id"
-                               placeholder="e.g. bert-base-uncased" required>
-                    </div>
-                    <div class="form-group">
-                        <label for="filename">Filename</label>
-                        <input type="text" id="filename" name="filename"
-                               placeholder="e.g. config.json" required>
-                    </div>
-                    <div class="form-group form-group-button">
-                        <button type="submit" id="start-btn">⬇ Start Download</button>
-                    </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label for="repo-id">Repository ID</label>
+                  <input type="text" id="repo-id" name="repo_id"
+                    placeholder="e.g. bert-base-uncased" required>
                 </div>
+                <div class="form-group">
+                  <label for="filename">Filename <span class="optional-hint">(optional)</span></label>
+                  <input type="text" id="filename" name="filename"
+                    placeholder="e.g. config.json — leave empty for full repo">
+                </div>
+            <div class="form-group">
+                <label for="local-dir">Path to download <span class="optional-hint">(optional)</span></label>
+                <input type="text" id="local-dir" name="local_dir"
+                placeholder="e.g. ./downloads — defaults to HF cache">
+            </div>
+            <div class="form-group">
+                <label for="allow-patterns">Allow patterns <span class="optional-hint">(optional, snapshot only)</span></label>
+                <input type="text" id="allow-patterns" name="allow_patterns"
+                placeholder="e.g. *.safetensors — filter files in snapshot">
+            </div>
+            <div class="form-group form-group-checkbox">
+                  <label class="checkbox-label" for="use-xet">
+                    <input type="checkbox" id="use-xet" name="use_xet" checked>
+                    <span>Use Xet</span>
+                  </label>
+                  <span class="checkbox-hint">Faster when available; uncheck for standard download</span>
+                </div>
+                <div class="form-group form-group-button">
+                  <button type="submit" id="start-btn">⬇ Start Download</button>
+                </div>
+              </div>
+              <p class="form-help">Leave <strong>Filename</strong> empty to download the entire repository. Set <strong>Path to download</strong> to choose where files are saved locally (defaults to the HuggingFace cache directory). Uncheck <strong>Use Xet</strong> to force standard HTTP download instead of Xet storage. Use <strong>Allow patterns</strong> to filter which files are included in a snapshot download (e.g. <code>*.safetensors</code>).</p>
             </form>
         </section>
 
