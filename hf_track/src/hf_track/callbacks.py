@@ -309,11 +309,20 @@ class DownloadProgressTqdm(base_tqdm):
             file_index=files_completed,
             total_files=total_files,
         )
+        self._emit_event(event)
+        return result
+
+    def _emit_event(self, event: ProgressEvent) -> None:
+        """Emit a progress event to the event queue.
+
+        Override this method in subclasses to route events through
+        alternative channels (e.g. ``mp.Queue`` in subprocess workers).
+        The default implementation puts events into ``self._event_queue``.
+        """
         try:
             self._event_queue.put_nowait(event)
         except queue.Full:
             logger.warning("Download progress event queue full — dropping %s event", event.event_type.value)
-        return result
 
     def close(self):
         if self._closed:
@@ -324,7 +333,7 @@ class DownloadProgressTqdm(base_tqdm):
         if self._event_queue is not None and getattr(self, "total", None) is not None and getattr(self, "is_bytes_bar", False):
             n_val = getattr(self, "n", 0)
             total_val = getattr(self, "total", 0)
-            
+
             is_complete = n_val >= total_val
             is_xet_cached = n_val == 0 and total_val > 0
 
@@ -346,8 +355,8 @@ class DownloadProgressTqdm(base_tqdm):
                     file_index=files_completed,
                     total_files=total_files,
                 )
-                self._event_queue.put(event)
-                
+                self._emit_event(event)
+
         super().close()
 
     @classmethod

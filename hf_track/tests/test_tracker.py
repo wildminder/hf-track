@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
+from unittest.mock import MagicMock, patch
 
+import pytest
 
 from hf_track.tracker import HfTracker
-from hf_track.types import EventType, ProgressEvent, TransferDirection, TransferError
+from hf_track.types import (
+    EventType,
+    ProgressEvent,
+    TransferCancelledError,
+    TransferDirection,
+    TransferError,
+)
 
 
 class TestHfTrackerInit:
@@ -396,3 +405,290 @@ class TestHfTrackerEventFlow:
         # Should have consumed all events
         remaining = tracker.get_events()
         assert len(remaining) == 0
+
+
+# ── _download_snapshot_xet Tests ─────────────────────────────────
+
+
+class TestDownloadSnapshotXet:
+    """Tests for HfTracker._download_snapshot_xet — thin wrapper that
+    delegates to download_snapshot_with_xet().
+    """
+
+    @patch("hf_track.xet_download.download_snapshot_with_xet")
+    def test_delegates_to_download_snapshot_with_xet(self, mock_dl_snap):
+        """_download_snapshot_xet delegates to download_snapshot_with_xet."""
+        tracker = HfTracker(token="hf_test")
+        mock_dl_snap.return_value = "/tmp/test"
+
+        tracker._download_snapshot_xet(
+            repo_id="test/repo",
+            allow_patterns=None,
+            ignore_patterns=None,
+            repo_type="model",
+            revision="main",
+            local_dir="/tmp/test",
+            transfer_id="tid-1",
+            is_cancelled=lambda: False,
+        )
+
+        mock_dl_snap.assert_called_once()
+
+    @patch("hf_track.xet_download.download_snapshot_with_xet")
+    def test_passes_all_params(self, mock_dl_snap):
+        """All params are forwarded to download_snapshot_with_xet."""
+        tracker = HfTracker(token="hf_test")
+        mock_dl_snap.return_value = "/tmp/test"
+
+        hook = lambda: False
+        tracker._download_snapshot_xet(
+            repo_id="test/repo",
+            allow_patterns=["*.bin"],
+            ignore_patterns=["*.tmp"],
+            repo_type="dataset",
+            revision="v1.0",
+            local_dir="/tmp/test",
+            transfer_id="tid-1",
+            is_cancelled=hook,
+            force_download=True,
+        )
+
+        call_kwargs = mock_dl_snap.call_args.kwargs
+        assert call_kwargs["repo_id"] == "test/repo"
+        assert call_kwargs["allow_patterns"] == ["*.bin"]
+        assert call_kwargs["ignore_patterns"] == ["*.tmp"]
+        assert call_kwargs["repo_type"] == "dataset"
+        assert call_kwargs["revision"] == "v1.0"
+        assert call_kwargs["local_dir"] == "/tmp/test"
+        assert call_kwargs["transfer_id"] == "tid-1"
+        assert call_kwargs["is_cancelled"] is hook
+        assert call_kwargs["force_download"] is True
+        assert call_kwargs["token"] == "hf_test"
+        assert call_kwargs["event_queue"] is tracker.event_queue
+
+    @patch("hf_track.xet_download.download_snapshot_with_xet")
+    def test_passes_force_download_default_false(self, mock_dl_snap):
+        """force_download defaults to False."""
+        tracker = HfTracker(token="hf_test")
+        mock_dl_snap.return_value = "/tmp/test"
+
+        tracker._download_snapshot_xet(
+            repo_id="test/repo",
+            allow_patterns=None,
+            ignore_patterns=None,
+            repo_type="model",
+            revision=None,
+            local_dir="/tmp/test",
+            transfer_id="tid-1",
+            is_cancelled=lambda: False,
+        )
+
+        call_kwargs = mock_dl_snap.call_args.kwargs
+        assert call_kwargs["force_download"] is False
+
+    @patch("hf_track.xet_download.download_snapshot_with_xet")
+    def test_returns_result_path(self, mock_dl_snap):
+        """Returns the path from download_snapshot_with_xet."""
+        tracker = HfTracker(token="hf_test")
+        mock_dl_snap.return_value = "/my/download/path"
+
+        result = tracker._download_snapshot_xet(
+            repo_id="test/repo",
+            allow_patterns=None,
+            ignore_patterns=None,
+            repo_type="model",
+            revision=None,
+            local_dir="/tmp/test",
+            transfer_id="tid-1",
+            is_cancelled=lambda: False,
+        )
+
+        assert result == "/my/download/path"
+
+    @patch("hf_track.xet_download.download_snapshot_with_xet")
+    def test_propagates_cancelled_error(self, mock_dl_snap):
+        """TransferCancelledError from download_snapshot_with_xet propagates."""
+        tracker = HfTracker(token="hf_test")
+        mock_dl_snap.side_effect = TransferCancelledError("cancelled")
+
+        with pytest.raises(TransferCancelledError, match="cancelled"):
+            tracker._download_snapshot_xet(
+                repo_id="test/repo",
+                allow_patterns=None,
+                ignore_patterns=None,
+                repo_type="model",
+                revision=None,
+                local_dir="/tmp/test",
+                transfer_id="tid-1",
+                is_cancelled=lambda: False,
+            )
+
+    @patch("hf_track.xet_download.download_snapshot_with_xet")
+    def test_propagates_other_errors(self, mock_dl_snap):
+        """Other exceptions from download_snapshot_with_xet propagate."""
+        tracker = HfTracker(token="hf_test")
+        mock_dl_snap.side_effect = RuntimeError("xet crashed")
+
+        with pytest.raises(RuntimeError, match="xet crashed"):
+            tracker._download_snapshot_xet(
+                repo_id="test/repo",
+                allow_patterns=None,
+                ignore_patterns=None,
+                repo_type="model",
+                revision=None,
+                local_dir="/tmp/test",
+                transfer_id="tid-1",
+                is_cancelled=lambda: False,
+            )
+
+    # NOTE: Old tests that tested metadata-discovery logic (repo_info,
+    # get_hf_file_metadata, fnmatch filtering, etc.) have been removed.
+    # The new _download_snapshot_xet is a thin wrapper that delegates
+    # to download_snapshot_with_xet(), which runs snapshot_download()
+    # in a subprocess. Those internal details are now handled by
+    # huggingface_hub internally.
+
+
+# ── download_snapshot Routing Tests ──────────────────────────────
+
+
+class TestDownloadSnapshotRouting:
+    """Tests for download_snapshot() xet routing logic."""
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_snapshot_xet")
+    def test_routes_to_xet_when_available(self, mock_xet, _mock_avail):
+        """is_xet_available()=True → _download_snapshot_xet is called."""
+        tracker = HfTracker(token="hf_test")
+        mock_xet.return_value = "/tmp/repo"
+
+        tracker.download_snapshot(repo_id="test/repo")
+
+        mock_xet.assert_called_once()
+
+    @patch("hf_track.tracker.is_xet_available", return_value=False)
+    @patch("hf_track.standard_download.download_snapshot")
+    def test_routes_to_standard_when_not_installed(self, mock_standard, _mock_avail):
+        """is_xet_available()=False → standard download is called."""
+        tracker = HfTracker(token="hf_test")
+        mock_standard.return_value = "/tmp/repo"
+
+        tracker.download_snapshot(repo_id="test/repo")
+
+        mock_standard.assert_called_once()
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_snapshot_xet")
+    def test_fallback_on_value_error(self, mock_xet, _mock_avail):
+        """_download_snapshot_xet raises ValueError → standard download used."""
+        tracker = HfTracker(token="hf_test")
+        mock_xet.side_effect = ValueError("No xet files")
+
+        with patch("hf_track.standard_download.download_snapshot", return_value="/tmp/repo") as mock_std:
+            result = tracker.download_snapshot(repo_id="test/repo")
+
+        mock_xet.assert_called_once()
+        mock_std.assert_called_once()
+        assert result == "/tmp/repo"
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_snapshot_xet")
+    def test_fallback_on_runtime_error(self, mock_xet, _mock_avail):
+        """_download_snapshot_xet raises RuntimeError → standard download used."""
+        tracker = HfTracker(token="hf_test")
+        mock_xet.side_effect = RuntimeError("xet crashed")
+
+        with patch("hf_track.standard_download.download_snapshot", return_value="/tmp/repo") as mock_std:
+            result = tracker.download_snapshot(repo_id="test/repo")
+
+        mock_xet.assert_called_once()
+        mock_std.assert_called_once()
+        assert result == "/tmp/repo"
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_snapshot_xet")
+    def test_no_fallback_on_cancelled(self, mock_xet, _mock_avail):
+        """_download_snapshot_xet raises TransferCancelledError → propagates."""
+        tracker = HfTracker(token="hf_test")
+        mock_xet.side_effect = TransferCancelledError("cancelled")
+
+        with pytest.raises(TransferCancelledError):
+            tracker.download_snapshot(repo_id="test/repo")
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_snapshot_xet")
+    def test_cleanup_on_xet_success(self, mock_xet, _mock_avail):
+        """cleanup_transfer() is called after successful xet download."""
+        tracker = HfTracker(token="hf_test")
+        mock_xet.return_value = "/tmp/repo"
+
+        with patch.object(tracker, "cleanup_transfer") as mock_cleanup:
+            tracker.download_snapshot(repo_id="test/repo", transfer_id="tid-1")
+
+        mock_cleanup.assert_called_once_with("tid-1")
+
+    @patch("hf_track.tracker.is_xet_available", return_value=False)
+    @patch("hf_track.standard_download.download_snapshot")
+    def test_cleanup_on_standard_success(self, mock_standard, _mock_avail):
+        """cleanup_transfer() is called after successful standard download."""
+        tracker = HfTracker(token="hf_test")
+        mock_standard.return_value = "/tmp/repo"
+
+        with patch.object(tracker, "cleanup_transfer") as mock_cleanup:
+            tracker.download_snapshot(repo_id="test/repo", transfer_id="tid-1")
+
+        mock_cleanup.assert_called_once_with("tid-1")
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_snapshot_xet")
+    def test_cleanup_on_cancelled(self, mock_xet, _mock_avail):
+        """cleanup_transfer() is called after TransferCancelledError."""
+        tracker = HfTracker(token="hf_test")
+        mock_xet.side_effect = TransferCancelledError("cancelled")
+
+        with patch.object(tracker, "cleanup_transfer") as mock_cleanup:
+            with pytest.raises(TransferCancelledError):
+                tracker.download_snapshot(repo_id="test/repo", transfer_id="tid-1")
+
+        mock_cleanup.assert_called_once_with("tid-1")
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_snapshot_xet")
+    def test_fallback_logs_warning(self, mock_xet, _mock_avail, caplog):
+        """Warning is logged when xet fails and falls back to standard."""
+        tracker = HfTracker(token="hf_test")
+        mock_xet.side_effect = ValueError("No xet files")
+
+        with patch("hf_track.standard_download.download_snapshot", return_value="/tmp/repo"):
+            with caplog.at_level(logging.WARNING):
+                tracker.download_snapshot(repo_id="test/repo")
+
+        assert any("falling back to standard" in r.message.lower() for r in caplog.records)
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_snapshot_xet")
+    def test_passes_all_params_to_xet(self, mock_xet, _mock_avail):
+        """Xet download receives correct params including force_download."""
+        tracker = HfTracker(token="hf_test")
+        mock_xet.return_value = "/tmp/repo"
+
+        tracker.download_snapshot(
+            repo_id="test/repo",
+            allow_patterns=["*.bin"],
+            ignore_patterns=["*.tmp"],
+            repo_type="dataset",
+            revision="v1.0",
+            local_dir="/tmp/test",
+            transfer_id="tid-1",
+            force_download=True,
+        )
+
+        call_kwargs = mock_xet.call_args.kwargs
+        assert call_kwargs["repo_id"] == "test/repo"
+        assert call_kwargs["allow_patterns"] == ["*.bin"]
+        assert call_kwargs["ignore_patterns"] == ["*.tmp"]
+        assert call_kwargs["repo_type"] == "dataset"
+        assert call_kwargs["revision"] == "v1.0"
+        assert call_kwargs["local_dir"] == "/tmp/test"
+        assert call_kwargs["transfer_id"] == "tid-1"
+        assert call_kwargs["force_download"] is True

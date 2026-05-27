@@ -138,6 +138,7 @@ def download_snapshot(
     transfer_id: Optional[str] = None,
     report_interval: float = 0.1,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    force_download: bool = False,
     **kwargs,
 ) -> str:
     from huggingface_hub import snapshot_download
@@ -162,6 +163,7 @@ def download_snapshot(
             token=token,
             endpoint=endpoint,
             tqdm_class=tqdm_class,
+            force_download=force_download,
         )
         if local_dir is not None:
             download_kwargs["local_dir"] = local_dir

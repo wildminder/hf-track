@@ -216,20 +216,22 @@ class XetTokenManager:
 
 
 def is_xet_available() -> bool:
-    """Check if hf_xet package is installed and importable.
+    """Check if hf_xet package is installed without importing it.
+
+    Uses ``importlib.util.find_spec`` to detect the package without
+    loading the Rust ``.pyd`` extension into the current process.
+    This is critical for subprocess isolation: if ``hf_xet`` is loaded
+    in the main process, it cannot be safely terminated via SIGTERM.
 
     Respects the HF_HUB_DISABLE_XET environment variable.
 
     Returns:
-        True if ``hf_xet`` can be imported and is not disabled, False otherwise.
+        True if ``hf_xet`` is findable on ``sys.path`` and not disabled, False otherwise.
     """
+    import importlib.util
+
     disable_xet = os.environ.get("HF_HUB_DISABLE_XET", "0").lower()
     if disable_xet in ("1", "true", "yes"):
         return False
 
-    try:
-        import hf_xet  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("hf_xet") is not None

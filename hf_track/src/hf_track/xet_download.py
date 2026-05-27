@@ -7,12 +7,15 @@ affecting the main process.
 
 from __future__ import annotations
 
+import logging
 import os
 import queue
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
-from ._xet_worker import _download_batch_worker, _download_worker, _serialize_xet_file_data
+logger = logging.getLogger(__name__)
+
+from ._xet_worker import _download_batch_worker, _download_worker, _serialize_xet_file_data, _snapshot_worker
 from .subprocess_runner import XetSubprocessRunner
 from .token import is_xet_available
 from .types import (
@@ -358,6 +361,148 @@ def download_files_with_xet(
                     total_files=total_files,
                 )
             )
+        raise
+    finally:
+        runner.terminate()
+
+
+def download_snapshot_with_xet(
+    repo_id: str,
+    token: Optional[str],
+    event_queue: queue.Queue,
+    allow_patterns=None,
+    ignore_patterns=None,
+    repo_type: str = "model",
+    revision: Optional[str] = None,
+    endpoint: Optional[str] = None,
+    local_dir: Optional[str] = None,
+    transfer_id: Optional[str] = None,
+    report_interval: float = 0.1,
+    is_cancelled: Optional[Callable[[], bool]] = None,
+    force_download: bool = False,
+) -> str:
+    """Download a repository snapshot via an isolated subprocess.
+
+    Spawns a child process that calls ``huggingface_hub.snapshot_download()``.
+    Inside the child, ``huggingface_hub`` internally decides whether to use
+    xet or HTTP for each file. Either way, ``hf_xet`` is loaded only in the
+    child process — safe to terminate without affecting the main process.
+
+    Args:
+        repo_id: HuggingFace repository ID.
+        token: HuggingFace API token.
+        event_queue: Queue for ProgressEvent objects.
+        allow_patterns: Optional list of glob patterns to include.
+        ignore_patterns: Optional list of glob patterns to exclude.
+        repo_type: Repository type (model/dataset/space).
+        revision: Optional git revision.
+        endpoint: Optional custom API endpoint.
+        local_dir: Local directory to download files to.
+        transfer_id: Optional pre-existing transfer ID.
+        report_interval: Event reporting interval (seconds).
+        is_cancelled: Optional cancellation hook (checked in main process).
+        force_download: Whether to force re-download even if files exist.
+
+    Returns:
+        Path to the local directory containing downloaded files.
+
+    Raises:
+        ImportError: If hf_xet is not installed.
+        TransferCancelledError: If the transfer is cancelled.
+        TransferProgressError: If the download fails.
+    """
+    if not is_xet_available():
+        raise ImportError("hf_xet is not installed.")
+
+    transfer_id = transfer_id or generate_transfer_id()
+
+    # Emit START event from main process
+    event_queue.put(
+        ProgressEvent(
+            event_type=EventType.START,
+            transfer_id=transfer_id,
+            direction=TransferDirection.DOWNLOAD,
+            filename=repo_id,
+            phase=ProgressPhase.DOWNLOADING,
+        )
+    )
+
+    params = {
+        "repo_id": repo_id,
+        "token": token,
+        "repo_type": repo_type,
+        "revision": revision,
+        "local_dir": local_dir,
+        "allow_patterns": allow_patterns,
+        "ignore_patterns": ignore_patterns,
+        "endpoint": endpoint,
+        "transfer_id": transfer_id,
+        "report_interval": report_interval,
+        "force_download": force_download,
+    }
+
+    runner = XetSubprocessRunner()
+    runner.start(
+        worker_func=_snapshot_worker,
+        params=params,
+        event_queue=event_queue,
+    )
+
+    try:
+        while True:
+            result = runner.wait(timeout=1.0)
+            if result is not None:
+                break
+            if is_cancelled is not None and is_cancelled():
+                runner.terminate()
+                event_queue.put(
+                    ProgressEvent.cancelled_event(
+                        transfer_id=transfer_id,
+                        direction=TransferDirection.DOWNLOAD,
+                        filename=repo_id,
+                    )
+                )
+                raise TransferCancelledError("Snapshot download cancelled by user")
+
+        if result.get("status") == "success":
+            return result.get("destination_path", local_dir or repo_id)
+        elif (
+            result.get("status") == "cancelled"
+            or result.get("error_type") == "TransferCancelledError"
+            or "cancelled" in result.get("message", "").lower()
+            or "interrupted" in result.get("message", "").lower()
+        ):
+            raise TransferCancelledError(result.get("message", "Snapshot download cancelled by user"))
+        else:
+            error_msg = result.get("message", "Snapshot download failed")
+            raise TransferProgressError(error_msg)
+
+    except KeyboardInterrupt:
+        runner.terminate()
+        event_queue.put(
+            ProgressEvent.cancelled_event(
+                transfer_id=transfer_id,
+                direction=TransferDirection.DOWNLOAD,
+                filename=repo_id,
+            )
+        )
+        raise TransferCancelledError("Snapshot download interrupted by user (Ctrl+C)")
+    except TransferCancelledError:
+        raise
+    except TransferProgressError:
+        raise
+    except Exception as e:
+        runner.terminate()
+        event_queue.put(
+            ProgressEvent(
+                event_type=EventType.ERROR,
+                transfer_id=transfer_id,
+                direction=TransferDirection.DOWNLOAD,
+                filename=repo_id,
+                phase=ProgressPhase.ERROR,
+                error=TransferError(message=str(e), error_type=type(e).__name__),
+            )
+        )
         raise
     finally:
         runner.terminate()

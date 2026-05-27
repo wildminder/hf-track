@@ -64,7 +64,7 @@ const App = {
 
     // ── Form Submission ──────────────────────────────────────────
 
-    async startDownload(repoId, filename, localDir, useXet, allowPatterns) {
+    async startDownload(repoId, filename, localDir, useXet, allowPatterns, forceDownload) {
         try {
             const isSnapshot = !filename;
             const displayName = filename || `${repoId} (full repo)`;
@@ -76,6 +76,7 @@ const App = {
                 url += `&local_dir=${encodeURIComponent(localDir)}`;
             }
             url += `&use_xet=${useXet ? "true" : "false"}`;
+            url += `&force_download=${forceDownload ? "true" : "false"}`;
             if (allowPatterns) {
                 url += `&allow_patterns=${encodeURIComponent(allowPatterns)}`;
             }
@@ -306,9 +307,10 @@ document.addEventListener("DOMContentLoaded", () => {
         const filename = document.getElementById("filename").value.trim();
         const localDir = document.getElementById("local-dir").value.trim();
         const useXet = document.getElementById("use-xet").checked;
+        const forceDownload = document.getElementById("force-download").checked;
         const allowPatterns = document.getElementById("allow-patterns").value.trim();
         if (!repoId) return;
-        App.startDownload(repoId, filename || null, localDir || null, useXet, allowPatterns || null);
+        App.startDownload(repoId, filename || null, localDir || null, useXet, allowPatterns || null, forceDownload);
     // Don't clear inputs — user may want to download another file from same repo
   });
 

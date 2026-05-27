@@ -131,6 +131,7 @@ class HfTracker:
         revision: Optional[str] = None,
         local_dir: Optional[str] = None,
         transfer_id: Optional[str] = None,
+        force_download: bool = False,
         **kwargs,
     ) -> str:
         from .standard_download import download_snapshot as _download_snapshot
@@ -138,6 +139,28 @@ class HfTracker:
         transfer_id, is_cancelled_hook = self._prepare_transfer(transfer_id)
 
         try:
+            if is_xet_available():
+                try:
+                    return self._download_snapshot_xet(
+                        repo_id=repo_id,
+                        allow_patterns=allow_patterns,
+                        ignore_patterns=ignore_patterns,
+                        repo_type=repo_type,
+                        revision=revision,
+                        local_dir=local_dir,
+                        transfer_id=transfer_id,
+                        is_cancelled=is_cancelled_hook,
+                        force_download=force_download,
+                    )
+                except TransferCancelledError:
+                    raise  # Never fallback on cancellation
+                except Exception as xet_err:
+                    logger.warning(
+                        "Xet snapshot download failed for %s, "
+                        "falling back to standard: %s",
+                        repo_id, xet_err,
+                    )
+
             return _download_snapshot(
                 repo_id=repo_id,
                 token=self._token,
@@ -151,6 +174,7 @@ class HfTracker:
                 transfer_id=transfer_id,
                 report_interval=self._report_interval,
                 is_cancelled=is_cancelled_hook,
+                force_download=force_download,
                 **kwargs,
             )
         except KeyboardInterrupt:
@@ -402,6 +426,62 @@ class HfTracker:
         )
 
         return result.destination_path
+
+    def _download_snapshot_xet(
+        self,
+        repo_id: str,
+        allow_patterns: Optional[list],
+        ignore_patterns: Optional[list],
+        repo_type: str,
+        revision: Optional[str],
+        local_dir: Optional[str],
+        transfer_id: str,
+        is_cancelled: Callable[[], bool],
+        force_download: bool = False,
+    ) -> str:
+        """Download repo snapshot via Xet in an isolated subprocess.
+
+        Delegates to ``download_snapshot_with_xet()`` which spawns a child
+        process via ``XetSubprocessRunner``. Inside the child,
+        ``huggingface_hub.snapshot_download()`` runs and internally decides
+        whether to use xet or HTTP for each file. Either way, ``hf_xet``
+        is loaded only in the child process — safe to terminate.
+
+        Args:
+            repo_id: HuggingFace repository ID.
+            allow_patterns: Optional list of glob patterns to include.
+            ignore_patterns: Optional list of glob patterns to exclude.
+            repo_type: Repository type (model/dataset/space).
+            revision: Optional git revision.
+            local_dir: Local directory to download files to.
+            transfer_id: Pre-existing transfer ID.
+            is_cancelled: Cancellation hook checked by the subprocess runner.
+            force_download: Whether to force re-download even if files exist.
+
+        Returns:
+            Path to the local directory containing downloaded files.
+
+        Raises:
+            TransferCancelledError: If the transfer is cancelled.
+            TransferProgressError: If the download fails.
+        """
+        from .xet_download import download_snapshot_with_xet
+
+        return download_snapshot_with_xet(
+            repo_id=repo_id,
+            token=self._token,
+            event_queue=self.event_queue,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+            repo_type=repo_type,
+            revision=revision,
+            endpoint=self._endpoint,
+            local_dir=local_dir,
+            transfer_id=transfer_id,
+            report_interval=self._report_interval,
+            is_cancelled=is_cancelled,
+            force_download=force_download,
+        )
 
     # ── Internal: Xet Upload Methods ──────────────────────────────
 

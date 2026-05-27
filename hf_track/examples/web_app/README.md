@@ -65,18 +65,25 @@ graph LR
 
 The **Use Xet** checkbox controls whether Xet storage is used for downloads:
 
-- **Checked (default)**: Xet is used if available. Downloads via `hf_xet` run in an isolated subprocess (`XetSubprocessRunner`) for Ctrl+C safety and clean cancellation.
-- **Unchecked**: Sets `HF_HUB_DISABLE_XET=1` so `huggingface_hub` routes downloads through standard HTTP instead of Xet.
+- **Checked (default)**: Xet is used if available. Both single-file and snapshot downloads via `hf_xet` run in an isolated subprocess (`XetSubprocessRunner`) for clean cancellation support.
+- **Unchecked**: Sets `HF_HUB_DISABLE_XET=1` so `HfTracker` routes downloads through standard HTTP instead of Xet.
 
-This matches the approach used by the CLI examples (`download_file.py`, `download_repo.py`).
+The environment variable is set by the endpoint handler **before** the download thread starts, ensuring the xet availability check sees the correct value. This matches the approach used by the CLI examples (`download_file.py`, `download_repo.py`).
 
 > **Note**: `HF_HUB_DISABLE_XET` is a process-wide environment variable. Concurrent downloads with different `use_xet` settings may interfere. For a production app, use separate processes or a queue-based architecture.
+
+### Force Re-download
+
+The **Force re-download** checkbox controls whether files are re-downloaded even if they already exist locally:
+
+- **Unchecked (default)**: Skips files that are already present and match the expected hash.
+- **Checked**: Passes `force_download=True` to `HfTracker`, which re-downloads all files regardless.
 
 ## API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/hf-track/download` | Start a download (params: `repo_id`, `filename`, `local_dir`, `use_xet`, `repo_type`, `allow_patterns`) |
+| `POST` | `/hf-track/download` | Start a download (params: `repo_id`, `filename`, `local_dir`, `use_xet`, `force_download`, `repo_type`, `allow_patterns`) |
 | `POST` | `/hf-track/cancel/{transfer_id}` | Cancel a running transfer |
 | `GET` | `/hf-track/events/{transfer_id}` | SSE stream for a transfer's progress events |
 | `GET` | `/hf-track/status` | List active transfers and queue size |
@@ -90,6 +97,7 @@ This matches the approach used by the CLI examples (`download_file.py`, `downloa
 | `filename` | string | `None` | Single file to download. Omit for full repo snapshot. |
 | `local_dir` | string | `None` | Local directory to save files. Defaults to HF cache. |
 | `use_xet` | bool | `true` | Enable/disable Xet storage for downloads. |
+| `force_download` | bool | `false` | Re-download files even if they already exist locally. |
 | `repo_type` | string | `"model"` | Repository type: `model`, `dataset`, or `space`. |
 | `allow_patterns` | string | `None` | Glob pattern to filter files in snapshot download (e.g. `*.safetensors`). |
 

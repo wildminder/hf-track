@@ -38,17 +38,24 @@
                 placeholder="e.g. *.safetensors — filter files in snapshot">
             </div>
             <div class="form-group form-group-checkbox">
-                  <label class="checkbox-label" for="use-xet">
+                <label class="checkbox-label" for="use-xet">
                     <input type="checkbox" id="use-xet" name="use_xet" checked>
                     <span>Use Xet</span>
-                  </label>
-                  <span class="checkbox-hint">Faster when available; uncheck for standard download</span>
-                </div>
-                <div class="form-group form-group-button">
-                  <button type="submit" id="start-btn">⬇ Start Download</button>
-                </div>
+                </label>
+                <span class="checkbox-hint">Faster when available; uncheck for standard download</span>
+            </div>
+            <div class="form-group form-group-checkbox">
+                <label class="checkbox-label" for="force-download">
+                    <input type="checkbox" id="force-download" name="force_download">
+                    <span>Force re-download</span>
+                </label>
+                <span class="checkbox-hint">Re-download files even if they already exist locally</span>
+            </div>
+            <div class="form-group form-group-button">
+                <button type="submit" id="start-btn">⬇ Start Download</button>
+            </div>
               </div>
-              <p class="form-help">Leave <strong>Filename</strong> empty to download the entire repository. Set <strong>Path to download</strong> to choose where files are saved locally (defaults to the HuggingFace cache directory). Uncheck <strong>Use Xet</strong> to force standard HTTP download instead of Xet storage. Use <strong>Allow patterns</strong> to filter which files are included in a snapshot download (e.g. <code>*.safetensors</code>).</p>
+              <p class="form-help">Leave <strong>Filename</strong> empty to download the entire repository. Set <strong>Path to download</strong> to choose where files are saved locally (defaults to the HuggingFace cache directory). Uncheck <strong>Use Xet</strong> to force standard HTTP download instead of Xet storage. Check <strong>Force re-download</strong> to re-download files even if they already exist locally. Use <strong>Allow patterns</strong> to filter which files are included in a snapshot download (e.g. <code>*.safetensors</code>).</p>
             </form>
         </section>
 

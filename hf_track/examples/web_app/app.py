@@ -18,16 +18,22 @@ Endpoints:
 - ``DELETE /hf-track/transfer/{transfer_id}`` — Clear transfer state
 
 Xet toggle:
-    The ``use_xet`` parameter controls whether Xet storage is used.
-    When disabled, ``HF_HUB_DISABLE_XET=1`` is set so that
-    ``huggingface_hub`` routes downloads through standard HTTP instead
-    of ``hf_xet``. When enabled, the env var is cleared so Xet is
-    available (with subprocess isolation via ``XetSubprocessRunner``).
+The ``use_xet`` parameter controls whether Xet storage is used.
+When disabled, ``HF_HUB_DISABLE_XET=1`` is set in the endpoint
+handler (before the download thread is spawned) so that
+``is_xet_available()`` returns False and downloads route through
+standard HTTP. When enabled, the env var is cleared so Xet is
+available (with subprocess isolation via ``XetSubprocessRunner``).
 
-    .. note:: ``HF_HUB_DISABLE_XET`` is a process-wide environment
-       variable. Concurrent downloads with different ``use_xet`` settings
-       may interfere. For a production app, use separate processes or
-       a queue-based architecture.
+Force re-download:
+The ``force_download`` parameter controls whether files are
+re-downloaded even if they already exist locally. When True,
+the tracker re-downloads all files regardless of cached copies.
+
+.. note:: ``HF_HUB_DISABLE_XET`` is a process-wide environment
+variable. Concurrent downloads with different ``use_xet`` settings
+may interfere. For a production app, use separate processes or
+a queue-based architecture.
 """
 from __future__ import annotations
 
@@ -123,17 +129,19 @@ def _do_download(
     repo_type: str,
     local_dir: Optional[str],
     use_xet: bool,
+    force_download: bool = False,
 ) -> None:
     """Download a single file — runs in a daemon thread.
 
-    Sets ``HF_HUB_DISABLE_XET`` based on *use_xet* before calling
-    the tracker, matching the approach used by the CLI examples
-    (``download_file.py``, ``download_repo.py``).
+    The ``HF_HUB_DISABLE_XET`` env var is set by the endpoint handler
+    (before this thread is spawned), so the worker does not need to
+    modify it.
     """
-    if not use_xet:
-        os.environ["HF_HUB_DISABLE_XET"] = "1"
-    else:
-        os.environ.pop("HF_HUB_DISABLE_XET", None)
+    from hf_track.token import is_xet_available
+    logger.info(
+        "file worker: use_xet=%s, is_xet_available=%s, HF_HUB_DISABLE_XET=%s",
+        use_xet, is_xet_available(), os.environ.get("HF_HUB_DISABLE_XET", "NOT SET"),
+    )
 
     try:
         tracker.download_file(
@@ -142,6 +150,7 @@ def _do_download(
             repo_type=repo_type,
             local_dir=local_dir,
             transfer_id=transfer_id,
+            force_download=force_download,
         )
         if transfer_id in _active_transfers:
             _active_transfers[transfer_id]["status"] = "completed"
@@ -168,16 +177,19 @@ def _do_download_snapshot(
     repo_type: str,
     local_dir: Optional[str],
     use_xet: bool,
+    force_download: bool = False,
 ) -> None:
     """Download an entire repo (or filtered subset) — runs in a daemon thread.
 
-    Sets ``HF_HUB_DISABLE_XET`` based on *use_xet* before calling
-    the tracker, matching the approach used by the CLI examples.
+    The ``HF_HUB_DISABLE_XET`` env var is set by the endpoint handler
+    (before this thread is spawned), so the worker does not need to
+    modify it.
     """
-    if not use_xet:
-        os.environ["HF_HUB_DISABLE_XET"] = "1"
-    else:
-        os.environ.pop("HF_HUB_DISABLE_XET", None)
+    from hf_track.token import is_xet_available
+    logger.info(
+        "snapshot worker: use_xet=%s, is_xet_available=%s, HF_HUB_DISABLE_XET=%s",
+        use_xet, is_xet_available(), os.environ.get("HF_HUB_DISABLE_XET", "NOT SET"),
+    )
 
     try:
         patterns = [allow_patterns] if allow_patterns else None
@@ -187,6 +199,7 @@ def _do_download_snapshot(
             repo_type=repo_type,
             local_dir=local_dir,
             transfer_id=transfer_id,
+            force_download=force_download,
         )
         if transfer_id in _active_transfers:
             _active_transfers[transfer_id]["status"] = "completed"
@@ -217,6 +230,7 @@ async def start_download(
     use_xet: bool = True,
     repo_type: str = "model",
     allow_patterns: Optional[str] = None,
+    force_download: bool = False,
 ):
     """Start a download in a background thread.
 
@@ -225,6 +239,7 @@ async def start_download(
     If *local_dir* is provided, files are saved there instead of the HF cache.
     If *use_xet* is False, forces standard HTTP download (no Xet).
     If *allow_patterns* is provided (snapshot only), only matching files are downloaded.
+    If *force_download* is True, re-downloads files even if they already exist locally.
     """
     transfer_id = str(uuid.uuid4())
     display_name = filename or f"{repo_id} (full repo)"
@@ -243,14 +258,22 @@ async def start_download(
     with _events_lock:
         _transfer_events[transfer_id] = []
 
+    # Set xet env var BEFORE spawning the download thread.
+    # This ensures is_xet_available() returns the correct value
+    # when tracker.download_snapshot() or tracker.download_file() checks it.
+    if not use_xet:
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+    else:
+        os.environ.pop("HF_HUB_DISABLE_XET", None)
+
     _cleanup_expired_transfers()
 
     if filename:
         target = _do_download
-        args = (transfer_id, repo_id, filename, repo_type, local_dir, use_xet)
+        args = (transfer_id, repo_id, filename, repo_type, local_dir, use_xet, force_download)
     else:
         target = _do_download_snapshot
-        args = (transfer_id, repo_id, allow_patterns, repo_type, local_dir, use_xet)
+        args = (transfer_id, repo_id, allow_patterns, repo_type, local_dir, use_xet, force_download)
 
     thread = threading.Thread(target=target, args=args, daemon=True)
     _transfer_threads[transfer_id] = thread
@@ -259,6 +282,7 @@ async def start_download(
         "transfer_id": transfer_id,
         "is_snapshot": filename is None,
         "use_xet": use_xet,
+        "force_download": force_download,
     }
 
 

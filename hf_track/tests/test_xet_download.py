@@ -329,3 +329,405 @@ class TestXetDownloadResult:
         assert result.destination_path == "/tmp/model.bin"
         assert result.file_size == 1024
         assert result.transfer_id == "test-123"
+
+
+# ── download_snapshot_with_xet ─────────────────────────────────
+
+
+class TestDownloadSnapshotWithXet:
+    """Tests for download_snapshot_with_xet function."""
+
+    def test_raises_import_error_when_xet_unavailable(self):
+        """Should raise ImportError when hf_xet is not installed."""
+        from hf_track.xet_download import download_snapshot_with_xet
+
+        with patch("hf_track.xet_download.is_xet_available", return_value=False):
+            with pytest.raises(ImportError, match="hf_xet is not installed"):
+                download_snapshot_with_xet(
+                    repo_id="test/repo",
+                    token="test-token",
+                    event_queue=queue.Queue(),
+                )
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_emits_start_event(self, MockRunner, _mock_xet_avail):
+        """Should emit a START event before downloading."""
+        from hf_track.xet_download import download_snapshot_with_xet
+
+        mock_runner = MagicMock()
+        mock_runner.wait.return_value = {
+            "status": "success",
+            "filename": "test/repo",
+            "destination_path": "/tmp/test_repo",
+            "file_size": 0,
+            "transfer_id": "snap-1",
+        }
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        download_snapshot_with_xet(
+            repo_id="test/repo",
+            token="test-token",
+            event_queue=event_queue,
+            transfer_id="snap-1",
+        )
+
+        # First event should be START
+        start_event = event_queue.get_nowait()
+        assert start_event.event_type == EventType.START
+        assert start_event.transfer_id == "snap-1"
+        assert start_event.direction == TransferDirection.DOWNLOAD
+        assert start_event.filename == "test/repo"
+        assert start_event.phase == ProgressPhase.DOWNLOADING
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_returns_destination_path_on_success(self, MockRunner, _mock_xet_avail):
+        """Should return the destination_path from the result."""
+        from hf_track.xet_download import download_snapshot_with_xet
+
+        mock_runner = MagicMock()
+        mock_runner.wait.return_value = {
+            "status": "success",
+            "filename": "test/repo",
+            "destination_path": "/my/local/dir",
+            "file_size": 4096,
+            "transfer_id": "snap-2",
+        }
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        result = download_snapshot_with_xet(
+            repo_id="test/repo",
+            token="test-token",
+            event_queue=event_queue,
+            transfer_id="snap-2",
+            local_dir="/my/local/dir",
+        )
+
+        assert result == "/my/local/dir"
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_raises_cancelled_on_cancelled_result(self, MockRunner, _mock_xet_avail):
+        """Should raise TransferCancelledError when worker returns cancelled status."""
+        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.types import TransferCancelledError
+
+        mock_runner = MagicMock()
+        mock_runner.wait.return_value = {
+            "status": "cancelled",
+            "message": "Download cancelled by user",
+        }
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        with pytest.raises(TransferCancelledError, match="cancelled"):
+            download_snapshot_with_xet(
+                repo_id="test/repo",
+                token="test-token",
+                event_queue=event_queue,
+                transfer_id="snap-cancel",
+            )
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_raises_progress_error_on_error_result(self, MockRunner, _mock_xet_avail):
+        """Should raise TransferProgressError when worker returns error status."""
+        from hf_track.xet_download import download_snapshot_with_xet
+
+        mock_runner = MagicMock()
+        mock_runner.wait.return_value = {
+            "status": "error",
+            "message": "Download failed: network error",
+            "error_type": "ConnectionError",
+        }
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        with pytest.raises(TransferProgressError, match="network error"):
+            download_snapshot_with_xet(
+                repo_id="test/repo",
+                token="test-token",
+                event_queue=event_queue,
+                transfer_id="snap-err",
+            )
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_cancel_via_is_cancelled_hook(self, MockRunner, _mock_xet_avail):
+        """Should terminate runner and raise TransferCancelledError when is_cancelled returns True."""
+        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.types import TransferCancelledError
+
+        mock_runner = MagicMock()
+        call_count = [0]
+
+        def wait_side_effect(timeout=None):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return None  # First call: timeout (worker still running)
+            return {"status": "success"}  # Shouldn't reach here
+
+        mock_runner.wait.side_effect = wait_side_effect
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        with pytest.raises(TransferCancelledError):
+            download_snapshot_with_xet(
+                repo_id="test/repo",
+                token="test-token",
+                event_queue=event_queue,
+                transfer_id="snap-hook-cancel",
+                is_cancelled=lambda: call_count[0] >= 1,
+            )
+
+        mock_runner.terminate.assert_called()
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_terminates_runner_on_keyboard_interrupt(self, MockRunner, _mock_xet_avail):
+        """Should terminate runner and raise TransferCancelledError on KeyboardInterrupt."""
+        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.types import TransferCancelledError
+
+        mock_runner = MagicMock()
+        mock_runner.wait.side_effect = KeyboardInterrupt
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        with pytest.raises(TransferCancelledError, match="Ctrl\\+C"):
+            download_snapshot_with_xet(
+                repo_id="test/repo",
+                token="test-token",
+                event_queue=event_queue,
+                transfer_id="snap-ctrlc",
+            )
+
+        mock_runner.terminate.assert_called()
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_terminates_runner_on_unexpected_exception(self, MockRunner, _mock_xet_avail):
+        """Should terminate runner and emit ERROR event on unexpected exceptions."""
+        from hf_track.xet_download import download_snapshot_with_xet
+
+        mock_runner = MagicMock()
+        mock_runner.wait.side_effect = RuntimeError("unexpected crash")
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        with pytest.raises(RuntimeError, match="unexpected crash"):
+            download_snapshot_with_xet(
+                repo_id="test/repo",
+                token="test-token",
+                event_queue=event_queue,
+                transfer_id="snap-crash",
+            )
+
+        mock_runner.terminate.assert_called()
+        # Should have emitted an ERROR event
+        events = []
+        while not event_queue.empty():
+            events.append(event_queue.get_nowait())
+        error_events = [e for e in events if e.event_type == EventType.ERROR]
+        assert len(error_events) == 1
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_terminates_runner_in_finally(self, MockRunner, _mock_xet_avail):
+        """Runner.terminate() should always be called in the finally block."""
+        from hf_track.xet_download import download_snapshot_with_xet
+
+        mock_runner = MagicMock()
+        mock_runner.wait.return_value = {
+            "status": "success",
+            "destination_path": "/tmp/ok",
+            "transfer_id": "snap-finally",
+        }
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        download_snapshot_with_xet(
+            repo_id="test/repo",
+            token="test-token",
+            event_queue=event_queue,
+            transfer_id="snap-finally",
+        )
+
+        mock_runner.terminate.assert_called()
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_passes_all_params_to_runner(self, MockRunner, _mock_xet_avail):
+        """All params should be forwarded to the subprocess runner via params dict."""
+        from hf_track.xet_download import download_snapshot_with_xet
+
+        mock_runner = MagicMock()
+        mock_runner.wait.return_value = {
+            "status": "success",
+            "destination_path": "/tmp/ok",
+            "transfer_id": "snap-params",
+        }
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        download_snapshot_with_xet(
+            repo_id="test/repo",
+            token="test-token",
+            event_queue=event_queue,
+            allow_patterns=["*.bin"],
+            ignore_patterns=["*.tmp"],
+            repo_type="dataset",
+            revision="v1.0",
+            endpoint="https://custom.endpoint",
+            local_dir="/my/dir",
+            transfer_id="snap-params",
+            report_interval=0.5,
+            force_download=True,
+        )
+
+        mock_runner.start.assert_called_once()
+        call_kwargs = mock_runner.start.call_args
+        params = call_kwargs.kwargs["params"]
+        assert params["repo_id"] == "test/repo"
+        assert params["token"] == "test-token"
+        assert params["allow_patterns"] == ["*.bin"]
+        assert params["ignore_patterns"] == ["*.tmp"]
+        assert params["repo_type"] == "dataset"
+        assert params["revision"] == "v1.0"
+        assert params["endpoint"] == "https://custom.endpoint"
+        assert params["local_dir"] == "/my/dir"
+        assert params["transfer_id"] == "snap-params"
+        assert params["report_interval"] == 0.5
+        assert params["force_download"] is True
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_generates_transfer_id_when_not_provided(self, MockRunner, _mock_xet_avail):
+        """Should generate a transfer_id if not provided."""
+        from hf_track.xet_download import download_snapshot_with_xet
+
+        mock_runner = MagicMock()
+        mock_runner.wait.return_value = {
+            "status": "success",
+            "destination_path": "/tmp/ok",
+            "transfer_id": "auto-gen",
+        }
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        download_snapshot_with_xet(
+            repo_id="test/repo",
+            token="test-token",
+            event_queue=event_queue,
+        )
+
+        # Should have generated a transfer_id (UUID format)
+        start_event = event_queue.get_nowait()
+        assert start_event.transfer_id  # Not empty
+        assert len(start_event.transfer_id) == 36  # UUID format
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_uses_snapshot_worker(self, MockRunner, _mock_xet_avail):
+        """Should use _snapshot_worker as the worker function."""
+        from hf_track.xet_download import download_snapshot_with_xet, _snapshot_worker
+
+        mock_runner = MagicMock()
+        mock_runner.wait.return_value = {
+            "status": "success",
+            "destination_path": "/tmp/ok",
+            "transfer_id": "snap-worker",
+        }
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        download_snapshot_with_xet(
+            repo_id="test/repo",
+            token="test-token",
+            event_queue=event_queue,
+            transfer_id="snap-worker",
+        )
+
+        mock_runner.start.assert_called_once()
+        call_kwargs = mock_runner.start.call_args
+        assert call_kwargs.kwargs["worker_func"] is _snapshot_worker
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_cancelled_error_propagates_without_terminate(self, MockRunner, _mock_xet_avail):
+        """TransferCancelledError from result handling should propagate cleanly."""
+        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.types import TransferCancelledError
+
+        mock_runner = MagicMock()
+        mock_runner.wait.return_value = {
+            "status": "cancelled",
+            "message": "User cancelled",
+            "error_type": "TransferCancelledError",
+        }
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        with pytest.raises(TransferCancelledError, match="User cancelled"):
+            download_snapshot_with_xet(
+                repo_id="test/repo",
+                token="test-token",
+                event_queue=event_queue,
+                transfer_id="snap-prop-cancel",
+            )
+
+        # terminate is still called in finally
+        mock_runner.terminate.assert_called()
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_fallback_to_repo_id_when_no_destination_path(self, MockRunner, _mock_xet_avail):
+        """Should fall back to repo_id when destination_path is missing from result."""
+        from hf_track.xet_download import download_snapshot_with_xet
+
+        mock_runner = MagicMock()
+        mock_runner.wait.return_value = {
+            "status": "success",
+            "transfer_id": "snap-no-dest",
+        }
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        result = download_snapshot_with_xet(
+            repo_id="test/repo",
+            token="test-token",
+            event_queue=event_queue,
+            transfer_id="snap-no-dest",
+        )
+
+        # Falls back to local_dir or repo_id
+        assert result == "test/repo"

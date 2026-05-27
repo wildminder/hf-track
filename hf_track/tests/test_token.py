@@ -10,20 +10,19 @@ from hf_track.token import XetCredentials, XetTokenManager, is_xet_available
 
 
 class TestIsXetAvailable:
-    """Tests for is_xet_available function."""
+    """Tests for is_xet_available function.
+
+    Uses ``importlib.util.find_spec`` instead of ``import hf_xet``,
+    so we mock ``find_spec`` rather than ``builtins.__import__``.
+    """
 
     @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "0"})
-    def test_returns_true_when_xet_is_available_and_not_disabled(self):
-        """Should return True if hf_xet is importable and not disabled."""
-        real_import = __import__
-
-        def _mock_import(name, *args, **kwargs):
-            if name == "hf_xet":
-                return MagicMock()
-            return real_import(name, *args, **kwargs)
-
-        with patch("builtins.__import__", side_effect=_mock_import):
-            assert is_xet_available() is True
+    @patch("importlib.util.find_spec")
+    def test_returns_true_when_xet_is_available_and_not_disabled(self, mock_find_spec):
+        """Should return True if hf_xet is findable and not disabled."""
+        mock_find_spec.return_value = MagicMock()  # non-None = found
+        assert is_xet_available() is True
+        mock_find_spec.assert_called_once_with("hf_xet")
 
     @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "1"})
     def test_returns_false_when_xet_is_disabled_by_env_var(self):
@@ -39,31 +38,53 @@ class TestIsXetAvailable:
     def test_returns_false_when_xet_is_disabled_by_env_var_yes(self):
         """Should return False if HF_HUB_DISABLE_XET is set to 'yes'."""
         assert is_xet_available() is False
-        
+
     @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "FALSE"})  # Ensure case-insensitivity
-    def test_returns_true_when_xet_is_available_and_env_var_is_false(self):
+    @patch("importlib.util.find_spec")
+    def test_returns_true_when_xet_is_available_and_env_var_is_false(self, mock_find_spec):
         """Should return True if HF_HUB_DISABLE_XET is false (case-insensitive)."""
-        real_import = __import__
+        mock_find_spec.return_value = MagicMock()  # non-None = found
+        assert is_xet_available() is True
 
-        def _mock_import(name, *args, **kwargs):
-            if name == "hf_xet":
-                return MagicMock()
-            return real_import(name, *args, **kwargs)
+    @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "0"})
+    @patch("importlib.util.find_spec")
+    def test_returns_false_when_xet_is_not_installed(self, mock_find_spec):
+        """Should return False if hf_xet is not installed (find_spec returns None)."""
+        mock_find_spec.return_value = None
+        assert is_xet_available() is False
+        mock_find_spec.assert_called_once_with("hf_xet")
 
-        with patch("builtins.__import__", side_effect=_mock_import):
-            assert is_xet_available() is True
+    @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "0"})
+    def test_does_not_import_hf_xet_module(self):
+        """is_xet_available must NOT load hf_xet into sys.modules.
 
-    def test_returns_false_when_xet_is_not_installed(self):
-        """Should return False if hf_xet is not installed."""
-        real_import = __import__
+        This is the core fix: using find_spec instead of import ensures
+        the Rust .pyd extension is never loaded in the main process,
+        preserving subprocess isolation for safe termination.
+        """
+        import sys
+        # Remove hf_xet from sys.modules if it was previously loaded
+        had_xet = "hf_xet" in sys.modules
+        sys.modules.pop("hf_xet", None)
 
-        def _mock_import(name, *args, **kwargs):
-            if name == "hf_xet":
-                raise ImportError("No module named 'hf_xet'")
-            return real_import(name, *args, **kwargs)
+        # find_spec for hf_xet will return None (not installed in test env)
+        is_xet_available()
 
-        with patch("builtins.__import__", side_effect=_mock_import):
-            assert is_xet_available() is False
+        # hf_xet must NOT appear in sys.modules after the check
+        assert "hf_xet" not in sys.modules, (
+            "is_xet_available() must not import hf_xet into the main process"
+        )
+
+        # Restore if it was there before
+        if had_xet:
+            sys.modules["hf_xet"] = MagicMock()
+
+    @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "1"})
+    @patch("importlib.util.find_spec")
+    def test_does_not_call_find_spec_when_disabled(self, mock_find_spec):
+        """Should not call find_spec at all when HF_HUB_DISABLE_XET is set."""
+        is_xet_available()
+        mock_find_spec.assert_not_called()
 
 
 class TestXetCredentials:

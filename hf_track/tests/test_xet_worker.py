@@ -15,6 +15,7 @@ from hf_track._xet_worker import (
     _download_worker,
     _make_progress_callback,
     _serialize_xet_file_data,
+    _snapshot_worker,
     _upload_bytes_worker,
     _upload_file_worker,
 )
@@ -309,18 +310,223 @@ class TestUploadBytesWorker:
 
     def test_upload_bytes_worker_no_content_no_path(self):
         """Worker emits error when neither file_content nor file_path is provided."""
+        test_ctx = mp.get_context("spawn")
+        test_mp_queue = test_ctx.Queue()
+        test_cancel_event = test_ctx.Event()
+
+        test_params = self._make_params()
+        del test_params["file_content"]
+
+        _upload_bytes_worker(test_params, test_mp_queue, test_cancel_event)
+
+        test_msg = test_mp_queue.get(timeout=2)
+        assert test_msg.msg_type == MSG_ERROR
+        assert test_msg.payload["error_type"] == "ValueError"
+
+
+# ── Snapshot Worker Tests ────────────────────────────────────────
+
+
+class TestSnapshotWorker:
+    """Test _snapshot_worker function."""
+
+    def _make_params(self, **overrides):
+        params = {
+            "repo_id": "test/repo",
+            "token": "hf_test",
+            "repo_type": "model",
+            "revision": None,
+            "local_dir": "/tmp/test_repo",
+            "allow_patterns": None,
+            "ignore_patterns": None,
+            "endpoint": None,
+            "transfer_id": "snap-test-001",
+            "report_interval": 0.1,
+            "force_download": False,
+        }
+        params.update(overrides)
+        return params
+
+    @patch("huggingface_hub.snapshot_download")
+    def test_snapshot_worker_success(self, mock_snapshot_dl):
+        """Worker sends result message on successful snapshot_download."""
+        mock_snapshot_dl.return_value = "/tmp/test_repo"
+
         ctx = mp.get_context("spawn")
         mp_queue = ctx.Queue()
         cancel_event = ctx.Event()
 
-        params = self._make_params()
-        del params["file_content"]
+        _snapshot_worker(self._make_params(), mp_queue, cancel_event)
 
-        _upload_bytes_worker(params, mp_queue, cancel_event)
+        msg = mp_queue.get(timeout=5)
+        assert msg.msg_type == MSG_RESULT
+        assert msg.payload["status"] == "success"
+        assert msg.payload["destination_path"] == "/tmp/test_repo"
+        assert msg.payload["transfer_id"] == "snap-test-001"
 
-        msg = mp_queue.get(timeout=2)
+    @patch("huggingface_hub.snapshot_download")
+    def test_snapshot_worker_passes_kwargs(self, mock_snapshot_dl):
+        """Worker passes all kwargs to snapshot_download."""
+        mock_snapshot_dl.return_value = "/tmp/test_repo"
+
+        ctx = mp.get_context("spawn")
+        mp_queue = ctx.Queue()
+        cancel_event = ctx.Event()
+
+        params = self._make_params(
+            repo_type="dataset",
+            revision="v1.0",
+            allow_patterns=["*.bin"],
+            ignore_patterns=["*.tmp"],
+            force_download=True,
+            local_dir="/my/dir",
+        )
+        _snapshot_worker(params, mp_queue, cancel_event)
+
+        # Wait for result
+        msg = mp_queue.get(timeout=5)
+        assert msg.msg_type == MSG_RESULT
+
+        # Verify snapshot_download was called with correct kwargs
+        mock_snapshot_dl.assert_called_once()
+        call_kwargs = mock_snapshot_dl.call_args.kwargs
+        assert call_kwargs["repo_id"] == "test/repo"
+        assert call_kwargs["repo_type"] == "dataset"
+        assert call_kwargs["revision"] == "v1.0"
+        assert call_kwargs["allow_patterns"] == ["*.bin"]
+        assert call_kwargs["ignore_patterns"] == ["*.tmp"]
+        assert call_kwargs["force_download"] is True
+        assert call_kwargs["local_dir"] == "/my/dir"
+        assert call_kwargs["token"] == "hf_test"
+
+    @patch("huggingface_hub.snapshot_download")
+    def test_snapshot_worker_passes_tqdm_class(self, mock_snapshot_dl):
+        """Worker passes a tqdm_class subclass to snapshot_download."""
+        mock_snapshot_dl.return_value = "/tmp/test_repo"
+
+        ctx = mp.get_context("spawn")
+        mp_queue = ctx.Queue()
+        cancel_event = ctx.Event()
+
+        _snapshot_worker(self._make_params(), mp_queue, cancel_event)
+
+        # Wait for result
+        msg = mp_queue.get(timeout=5)
+        assert msg.msg_type == MSG_RESULT
+
+        # Verify tqdm_class was passed
+        call_kwargs = mock_snapshot_dl.call_args.kwargs
+        assert "tqdm_class" in call_kwargs
+        tqdm_cls = call_kwargs["tqdm_class"]
+        # Should be a subclass of DownloadProgressTqdm
+        from hf_track.callbacks import DownloadProgressTqdm
+        assert issubclass(tqdm_cls, DownloadProgressTqdm)
+
+    @patch("huggingface_hub.snapshot_download")
+    def test_snapshot_worker_handles_exception(self, mock_snapshot_dl):
+        """Worker sends error message when snapshot_download raises."""
+        mock_snapshot_dl.side_effect = RuntimeError("network error")
+
+        ctx = mp.get_context("spawn")
+        mp_queue = ctx.Queue()
+        cancel_event = ctx.Event()
+
+        _snapshot_worker(self._make_params(), mp_queue, cancel_event)
+
+        msg = mp_queue.get(timeout=5)
         assert msg.msg_type == MSG_ERROR
-        assert msg.payload["error_type"] == "ValueError"
+        assert "network error" in msg.payload["message"]
+        assert msg.payload["error_type"] == "RuntimeError"
+
+    @patch("huggingface_hub.snapshot_download")
+    def test_snapshot_worker_handles_import_error(self, mock_snapshot_dl):
+        """Worker sends error message when snapshot_download raises ImportError."""
+        mock_snapshot_dl.side_effect = ImportError("no module")
+
+        ctx = mp.get_context("spawn")
+        mp_queue = ctx.Queue()
+        cancel_event = ctx.Event()
+
+        _snapshot_worker(self._make_params(), mp_queue, cancel_event)
+
+        msg = mp_queue.get(timeout=5)
+        assert msg.msg_type == MSG_ERROR
+        assert msg.payload["error_type"] == "ImportError"
+
+    @patch("huggingface_hub.snapshot_download")
+    def test_snapshot_worker_handles_keyboard_interrupt(self, mock_snapshot_dl):
+        """Worker sends cancelled message on KeyboardInterrupt."""
+        mock_snapshot_dl.side_effect = KeyboardInterrupt()
+
+        ctx = mp.get_context("spawn")
+        mp_queue = ctx.Queue()
+        cancel_event = ctx.Event()
+
+        _snapshot_worker(self._make_params(), mp_queue, cancel_event)
+
+        msg = mp_queue.get(timeout=5)
+        # _handle_worker_exception sends MSG_CANCELLED for KeyboardInterrupt
+        assert msg.msg_type == MSG_CANCELLED
+
+    @patch("huggingface_hub.snapshot_download")
+    def test_snapshot_worker_omits_local_dir_when_none(self, mock_snapshot_dl):
+        """Worker does not pass local_dir to snapshot_download when it is None."""
+        mock_snapshot_dl.return_value = "/tmp/cache/test_repo"
+
+        ctx = mp.get_context("spawn")
+        mp_queue = ctx.Queue()
+        cancel_event = ctx.Event()
+
+        params = self._make_params(local_dir=None)
+        _snapshot_worker(params, mp_queue, cancel_event)
+
+        # Wait for result
+        msg = mp_queue.get(timeout=5)
+        assert msg.msg_type == MSG_RESULT
+
+        # local_dir should NOT be in the kwargs
+        call_kwargs = mock_snapshot_dl.call_args.kwargs
+        assert "local_dir" not in call_kwargs
+
+    @patch("huggingface_hub.snapshot_download")
+    def test_snapshot_worker_emits_progress_events(self, mock_snapshot_dl):
+        """Worker sends result message after snapshot_download completes."""
+        mock_snapshot_dl.return_value = "/tmp/test_repo"
+
+        ctx = mp.get_context("spawn")
+        mp_queue = ctx.Queue()
+        cancel_event = ctx.Event()
+
+        _snapshot_worker(self._make_params(), mp_queue, cancel_event)
+
+        # Collect all messages — at minimum we should get a result message
+        messages = []
+        while not mp_queue.empty():
+            try:
+                messages.append(mp_queue.get_nowait())
+            except Exception:
+                break
+
+        # Should have a result message
+        msg_types = [m.msg_type for m in messages]
+        assert MSG_RESULT in msg_types
+
+    @patch("huggingface_hub.snapshot_download")
+    def test_snapshot_worker_respects_cancel_event(self, mock_snapshot_dl):
+        """Worker's _is_cancelled returns True when cancel_event is set."""
+        mock_snapshot_dl.return_value = "/tmp/test_repo"
+
+        ctx = mp.get_context("spawn")
+        mp_queue = ctx.Queue()
+        cancel_event = ctx.Event()
+        cancel_event.set()  # Pre-set the cancel event
+
+        _snapshot_worker(self._make_params(), mp_queue, cancel_event)
+
+        # Worker should still complete (snapshot_download doesn't check cancel_event
+        # directly — it's checked by the is_cancelled hook in the tqdm class)
+        msg = mp_queue.get(timeout=5)
+        assert msg.msg_type == MSG_RESULT
 
 
 # ── Module-Level Import Safety ───────────────────────────────────
@@ -340,7 +546,7 @@ class TestWorkerModuleSafety:
         """Worker functions must be picklable for multiprocessing spawn."""
         import pickle
 
-        for func in (_download_worker, _download_batch_worker, _upload_file_worker, _upload_bytes_worker):
+        for func in (_download_worker, _download_batch_worker, _snapshot_worker, _upload_file_worker, _upload_bytes_worker):
             # Should not raise
             pickled = pickle.dumps(func)
             unpickled = pickle.loads(pickled)

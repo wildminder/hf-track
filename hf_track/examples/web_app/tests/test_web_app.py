@@ -302,9 +302,13 @@ class TestAPIEndpoints:
 class TestWorkerFunctions:
     """Unit tests for _do_download and _do_download_snapshot."""
 
-    def test_do_download_xet_disabled_sets_env_var(self, app_module):
-        """When use_xet=False, HF_HUB_DISABLE_XET is set to '1'."""
-        # Clean up env var first
+    def test_do_download_no_env_var_modification(self, app_module):
+        """_do_download() does not modify HF_HUB_DISABLE_XET.
+
+        The env var is set by the endpoint handler before the thread
+        is spawned, so the worker should not touch it.
+        """
+        # Set env var before calling worker (simulating endpoint handler)
         os.environ.pop("HF_HUB_DISABLE_XET", None)
         transfer_id = str(uuid.uuid4())
         app_module._active_transfers[transfer_id] = {
@@ -322,16 +326,20 @@ class TestWorkerFunctions:
                 local_dir=None,
                 use_xet=False,
             )
-            assert os.environ.get("HF_HUB_DISABLE_XET") == "1"
-            mock_dl.assert_called_once()
+        # Worker should NOT have set the env var
+        assert os.environ.get("HF_HUB_DISABLE_XET") is None
+        mock_dl.assert_called_once()
 
         # Cleanup
         os.environ.pop("HF_HUB_DISABLE_XET", None)
         app_module._active_transfers.pop(transfer_id, None)
         app_module._transfer_events.pop(transfer_id, None)
 
-    def test_do_download_xet_enabled_clears_env_var(self, app_module):
-        """When use_xet=True, HF_HUB_DISABLE_XET is cleared."""
+    def test_do_download_does_not_clear_env_var(self, app_module):
+        """_do_download() does not clear HF_HUB_DISABLE_XET when use_xet=True.
+
+        The env var is managed by the endpoint handler, not the worker.
+        """
         os.environ["HF_HUB_DISABLE_XET"] = "1"
         transfer_id = str(uuid.uuid4())
         app_module._active_transfers[transfer_id] = {
@@ -349,8 +357,9 @@ class TestWorkerFunctions:
                 local_dir=None,
                 use_xet=True,
             )
-            assert "HF_HUB_DISABLE_XET" not in os.environ
-            mock_dl.assert_called_once()
+        # Worker should NOT have cleared the env var
+        assert os.environ.get("HF_HUB_DISABLE_XET") == "1"
+        mock_dl.assert_called_once()
 
         # Cleanup
         os.environ.pop("HF_HUB_DISABLE_XET", None)
@@ -589,8 +598,12 @@ class TestWorkerFunctions:
         app_module._active_transfers.pop(transfer_id, None)
         app_module._transfer_events.pop(transfer_id, None)
 
-    def test_do_snapshot_xet_disabled_sets_env_var(self, app_module):
-        """When use_xet=False, snapshot download sets HF_HUB_DISABLE_XET=1."""
+    def test_do_snapshot_no_env_var_modification(self, app_module):
+        """_do_download_snapshot() does not modify HF_HUB_DISABLE_XET.
+
+        The env var is set by the endpoint handler before the thread
+        is spawned, so the worker should not touch it.
+        """
         os.environ.pop("HF_HUB_DISABLE_XET", None)
         transfer_id = str(uuid.uuid4())
         app_module._active_transfers[transfer_id] = {
@@ -608,7 +621,8 @@ class TestWorkerFunctions:
                 local_dir=None,
                 use_xet=False,
             )
-            assert os.environ.get("HF_HUB_DISABLE_XET") == "1"
+        # Worker should NOT have set the env var
+        assert os.environ.get("HF_HUB_DISABLE_XET") is None
 
         # Cleanup
         os.environ.pop("HF_HUB_DISABLE_XET", None)
@@ -1010,3 +1024,181 @@ class TestRequirements:
         req_file = WEB_APP_DIR / "requirements.txt"
         content = req_file.read_text()
         assert "sse" in content.lower()
+
+
+# ── Endpoint Xet Env Var Tests ────────────────────────────────────
+
+
+class TestEndpointXetEnvVar:
+    """Tests for the endpoint handler setting HF_HUB_DISABLE_XET."""
+
+    def test_endpoint_sets_xet_disabled(self, client):
+        """POST with use_xet=false sets HF_HUB_DISABLE_XET=1."""
+        os.environ.pop("HF_HUB_DISABLE_XET", None)
+        resp = client.post(
+            "/hf-track/download",
+            params={"repo_id": "test/repo", "filename": "file.bin", "use_xet": "false"},
+        )
+        assert resp.status_code == 200
+        assert os.environ.get("HF_HUB_DISABLE_XET") == "1"
+        # Cleanup
+        os.environ.pop("HF_HUB_DISABLE_XET", None)
+
+    def test_endpoint_clears_xet_enabled(self, client):
+        """POST with use_xet=true clears HF_HUB_DISABLE_XET."""
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+        resp = client.post(
+            "/hf-track/download",
+            params={"repo_id": "test/repo", "filename": "file.bin", "use_xet": "true"},
+        )
+        assert resp.status_code == 200
+        assert "HF_HUB_DISABLE_XET" not in os.environ
+        # Cleanup
+        os.environ.pop("HF_HUB_DISABLE_XET", None)
+
+    def test_endpoint_sets_xet_for_snapshot(self, client):
+        """POST snapshot with use_xet=false sets HF_HUB_DISABLE_XET=1."""
+        os.environ.pop("HF_HUB_DISABLE_XET", None)
+        resp = client.post(
+            "/hf-track/download",
+            params={"repo_id": "test/repo", "use_xet": "false"},
+        )
+        assert resp.status_code == 200
+        assert os.environ.get("HF_HUB_DISABLE_XET") == "1"
+        # Cleanup
+        os.environ.pop("HF_HUB_DISABLE_XET", None)
+
+
+# ── Force Download Tests ──────────────────────────────────────────
+
+
+class TestForceDownload:
+    """Tests for the force_download parameter."""
+
+    def test_download_with_force_download_true(self, client):
+        """POST with force_download=true returns 200."""
+        resp = client.post(
+            "/hf-track/download",
+            params={"repo_id": "test/repo", "filename": "file.bin", "force_download": "true"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data.get("force_download") is True
+
+    def test_download_with_force_download_default(self, client):
+        """Default force_download is False."""
+        resp = client.post(
+            "/hf-track/download",
+            params={"repo_id": "test/repo", "filename": "file.bin"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data.get("force_download") is False
+
+    def test_force_download_in_response(self, client):
+        """Response includes force_download value."""
+        resp = client.post(
+            "/hf-track/download",
+            params={"repo_id": "test/repo", "force_download": "true"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data.get("force_download") is True
+
+
+# ── Cancel Snapshot Flow Tests ────────────────────────────────────
+
+
+class TestCancelSnapshotFlow:
+    """Tests for cancelling snapshot downloads."""
+
+    def test_cancel_snapshot_calls_tracker_cancel(self, app_module):
+        """Cancel of snapshot calls tracker.cancel()."""
+        transfer_id = str(uuid.uuid4())
+        app_module._active_transfers[transfer_id] = {
+            "direction": "download",
+            "repo_id": "test/repo",
+            "filename": "test/repo (full repo)",
+            "local_dir": None,
+            "use_xet": True,
+            "is_snapshot": True,
+            "status": "running",
+            "started_at": time.time(),
+        }
+        with app_module._events_lock:
+            app_module._transfer_events[transfer_id] = []
+
+        with patch.object(app_module.tracker, "cancel") as mock_cancel:
+            app_module.tracker.cancel(transfer_id)
+
+        mock_cancel.assert_called_once_with(transfer_id)
+
+        # Cleanup
+        app_module._active_transfers.pop(transfer_id, None)
+        with app_module._events_lock:
+            app_module._transfer_events.pop(transfer_id, None)
+
+    def test_cancel_snapshot_emits_cancelled_event(self, app_module):
+        """CANCELLED event appears in per-transfer buffer after cancel."""
+        transfer_id = str(uuid.uuid4())
+        app_module._active_transfers[transfer_id] = {
+            "direction": "download",
+            "repo_id": "test/repo",
+            "filename": "test/repo (full repo)",
+            "status": "running",
+            "started_at": time.time(),
+        }
+        with app_module._events_lock:
+            app_module._transfer_events[transfer_id] = []
+
+        # Simulate what the cancel endpoint does
+        app_module.tracker.cancel(transfer_id)
+        cancelled_event = ProgressEvent.cancelled_event(
+            transfer_id=transfer_id,
+            direction=TransferDirection.DOWNLOAD,
+            filename="test/repo (full repo)",
+        )
+        with app_module._events_lock:
+            app_module._transfer_events[transfer_id].append(cancelled_event)
+        app_module._active_transfers[transfer_id]["status"] = "cancelled"
+
+        with app_module._events_lock:
+            events = app_module._transfer_events.get(transfer_id, [])
+
+        assert len(events) >= 1
+        assert events[0].event_type == EventType.CANCELLED
+
+        # Cleanup
+        app_module._active_transfers.pop(transfer_id, None)
+        with app_module._events_lock:
+            app_module._transfer_events.pop(transfer_id, None)
+
+    def test_cancel_snapshot_sets_status(self, app_module):
+        """Status is set to 'cancelled' after cancel."""
+        transfer_id = str(uuid.uuid4())
+        app_module._active_transfers[transfer_id] = {
+            "direction": "download",
+            "repo_id": "test/repo",
+            "filename": "test/repo (full repo)",
+            "status": "running",
+            "started_at": time.time(),
+        }
+        with app_module._events_lock:
+            app_module._transfer_events[transfer_id] = []
+
+        app_module.tracker.cancel(transfer_id)
+        app_module._active_transfers[transfer_id]["status"] = "cancelled"
+
+        assert app_module._active_transfers[transfer_id]["status"] == "cancelled"
+
+        # Cleanup
+        app_module._active_transfers.pop(transfer_id, None)
+        with app_module._events_lock:
+            app_module._transfer_events.pop(transfer_id, None)
+
+    def test_cancel_snapshot_unknown_returns_not_found(self, client):
+        """Cancel of unknown transfer_id returns not_found."""
+        resp = client.post("/hf-track/cancel/unknown-transfer-id")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data.get("status") == "not_found"

@@ -391,6 +391,98 @@ def _download_batch_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_ev
         _handle_worker_exception(mp_queue, e)
 
 
+# ── Snapshot Download Worker ─────────────────────────────────────
+
+def _snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: mp.Event) -> None:
+    """Worker function for snapshot downloads via ``huggingface_hub.snapshot_download``.
+
+    Runs in a child process. Calls ``snapshot_download()`` which internally
+    handles xet routing — if ``hf_xet`` is available, it uses xet; otherwise
+    it falls back to HTTP. Either way, the ``hf_xet`` extension is loaded
+    only in this child process, safe to terminate.
+
+    Progress events are emitted via a ``DownloadProgressTqdm`` subclass
+    that routes events through ``mp_queue`` instead of ``queue.Queue``.
+
+    Args:
+        params: Dict with keys: repo_id, token, repo_type, revision,
+            local_dir, allow_patterns, ignore_patterns, endpoint,
+            transfer_id, report_interval, force_download.
+        mp_queue: Queue for sending SubprocessMessage back to main process.
+        cancel_event: Event set by main process to signal cancellation.
+    """
+    _init_worker()
+    from .types import EventType, ProgressPhase, TransferCancelledError, TransferDirection
+    from .callbacks import DownloadProgressTqdm, _dummy_file, state_manager
+    from .subprocess_messages import SubprocessMessage
+
+    transfer_id = params["transfer_id"]
+    repo_id = params["repo_id"]
+
+    def _is_cancelled() -> bool:
+        return cancel_event.is_set()
+
+    # Subclass DownloadProgressTqdm to route events through mp_queue
+    class _SubprocessDownloadTqdm(DownloadProgressTqdm):
+        """DownloadProgressTqdm subclass that sends events via mp_queue."""
+
+        def _emit_event(self, event):
+            """Override: route events through mp_queue as SubprocessMessage."""
+            try:
+                mp_queue.put_nowait(SubprocessMessage.event(event.to_dict()))
+            except BaseException:
+                pass  # Drop event if queue is full or closed
+
+    # Bind the subclass with transfer parameters
+    _BoundTqdm = DownloadProgressTqdm.bind(
+        event_queue=None,  # Not used — _emit_event is overridden
+        transfer_id=transfer_id,
+        filename=repo_id,
+        report_interval=params.get("report_interval", 0.1),
+        is_cancelled=_is_cancelled,
+    )
+
+    # Create a combined class that inherits both _SubprocessDownloadTqdm
+    # and _BoundTqdm, so we get both the mp_queue routing and the bound params
+    class _SubprocessBoundTqdm(_SubprocessDownloadTqdm, _BoundTqdm):
+        pass
+
+    _SubprocessBoundTqdm.__name__ = f"SubprocessBoundTqdm_{transfer_id[:8]}"
+    _SubprocessBoundTqdm.__qualname__ = f"SubprocessBoundTqdm_{transfer_id[:8]}"
+
+    try:
+        from huggingface_hub import snapshot_download
+
+        download_kwargs = dict(
+            repo_id=repo_id,
+            repo_type=params.get("repo_type", "model"),
+            revision=params.get("revision"),
+            allow_patterns=params.get("allow_patterns"),
+            ignore_patterns=params.get("ignore_patterns"),
+            token=params.get("token"),
+            endpoint=params.get("endpoint"),
+            tqdm_class=_SubprocessBoundTqdm,
+            force_download=params.get("force_download", False),
+        )
+        if params.get("local_dir"):
+            download_kwargs["local_dir"] = params["local_dir"]
+
+        result_path = snapshot_download(**download_kwargs)  # nosec B615
+
+        # Get final stats from state_manager for the COMPLETE event
+        stats = state_manager.get_state(transfer_id)
+        _safe_put(mp_queue, SubprocessMessage.result(
+            filename=repo_id,
+            destination_path=result_path,
+            transfer_id=transfer_id,
+            direction="download",
+            file_size=stats.get("bytes_completed", 0),
+        ))
+
+    except (KeyboardInterrupt, Exception) as e:
+        _handle_worker_exception(mp_queue, e)
+
+
 # ── Upload Workers ────────────────────────────────────────────────
 
 def _upload_file_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: mp.Event) -> None:
