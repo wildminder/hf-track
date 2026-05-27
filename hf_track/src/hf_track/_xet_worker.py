@@ -20,6 +20,7 @@ Each worker:
 
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 import os
 import signal
@@ -27,6 +28,8 @@ import time
 from typing import Any, Dict, List
 
 from .subprocess_messages import SubprocessMessage
+
+logger = logging.getLogger(__name__)
 
 
 # ── Initialization & Safe IO ─────────────────────────────────────
@@ -431,7 +434,7 @@ def _snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: m
             try:
                 mp_queue.put_nowait(SubprocessMessage.event(event.to_dict()))
             except BaseException:
-                pass  # Drop event if queue is full or closed
+                pass
 
     # Bind the subclass with transfer parameters
     _BoundTqdm = DownloadProgressTqdm.bind(
@@ -467,16 +470,45 @@ def _snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: m
         if params.get("local_dir"):
             download_kwargs["local_dir"] = params["local_dir"]
 
-        result_path = snapshot_download(**download_kwargs)  # nosec B615
-
+        result_path = snapshot_download(**download_kwargs) # nosec B615
+    
         # Get final stats from state_manager for the COMPLETE event
         stats = state_manager.get_state(transfer_id)
+        bytes_completed = stats.get("bytes_completed", 0)
+        total_bytes = stats.get("total_bytes", 0)
+        files_completed = stats.get("files_completed", 0)
+        total_files = stats.get("total_files", 0)
+    
+        # Emit a COMPLETE event directly through mp_queue (matching
+        # the standard_download pattern) so the main process receives
+        # a proper COMPLETE with file_index/total_files.
+        complete_event_dict = {
+            "event_type": EventType.COMPLETE.value,
+            "transfer_id": transfer_id,
+            "direction": TransferDirection.DOWNLOAD.value,
+            "filename": repo_id,
+            "phase": ProgressPhase.COMPLETE.value,
+            "bytes_completed": bytes_completed,
+            "total_bytes": total_bytes,
+            "percentage": 100.0,
+            "speed": 0,
+            "file_index": files_completed,
+            "total_files": total_files,
+        }
+        _safe_put(mp_queue, SubprocessMessage.event(complete_event_dict))
+    
+        # Also send the result message so XetSubprocessRunner.wait()
+        # knows the worker finished successfully.
         _safe_put(mp_queue, SubprocessMessage.result(
             filename=repo_id,
             destination_path=result_path,
             transfer_id=transfer_id,
             direction="download",
-            file_size=stats.get("bytes_completed", 0),
+            file_size=bytes_completed,
+            bytes_completed=bytes_completed,
+            total_bytes=total_bytes,
+            files_completed=files_completed,
+            total_files=total_files,
         ))
 
     except (KeyboardInterrupt, Exception) as e:

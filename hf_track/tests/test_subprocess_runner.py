@@ -371,6 +371,94 @@ class TestXetSubprocessRunnerRelay:
         if runner._relay_thread is not None:
             runner._relay_thread.join(timeout=2)
 
+    def test_complete_event_includes_snapshot_stats(self):
+        """COMPLETE event from result payload includes file_index/total_files."""
+        runner = XetSubprocessRunner()
+        event_queue = queue.Queue()
+
+        # Use echo worker that sends a result with snapshot-level fields
+        runner.start(
+            worker_func=_echo_worker,
+            params={"n_events": 0, "transfer_id": "test-snap-stats"},
+            event_queue=event_queue,
+        )
+
+        # Manually inject a result message with snapshot stats
+        # (simulating what _snapshot_worker sends)
+        runner._mp_queue.put(SubprocessMessage.result(
+            filename="test/repo",
+            destination_path="/tmp/test_repo",
+            transfer_id="test-snap-stats",
+            direction="download",
+            file_size=5000,
+            bytes_completed=5000,
+            total_bytes=5000,
+            files_completed=3,
+            total_files=3,
+        ))
+
+        result = runner.wait(timeout=5)
+        assert result is not None
+
+        # Collect events from event_queue
+        events = []
+        while True:
+            try:
+                event = event_queue.get(timeout=1)
+                events.append(event)
+            except queue.Empty:
+                break
+
+        runner.terminate()
+
+        # Should have a COMPLETE event with file_index and total_files
+        complete_events = [e for e in events if e.event_type == EventType.COMPLETE]
+        assert len(complete_events) == 1
+        complete_event = complete_events[0]
+        assert complete_event.bytes_completed == 5000
+        assert complete_event.total_bytes == 5000
+        assert complete_event.file_index == 3  # files_completed
+        assert complete_event.total_files == 3
+
+    def test_complete_event_fallback_to_file_size(self):
+        """COMPLETE event falls back to file_size when bytes_completed not in payload."""
+        runner = XetSubprocessRunner()
+        event_queue = queue.Queue()
+
+        runner.start(
+            worker_func=_echo_worker,
+            params={"n_events": 0, "transfer_id": "test-fallback"},
+            event_queue=event_queue,
+        )
+
+        # Send a result with only file_size (single-file download pattern)
+        runner._mp_queue.put(SubprocessMessage.result(
+            filename="file.bin",
+            destination_path="/tmp/file.bin",
+            transfer_id="test-fallback",
+            direction="download",
+            file_size=1000,
+        ))
+
+        result = runner.wait(timeout=5)
+        assert result is not None
+
+        events = []
+        while True:
+            try:
+                event = event_queue.get(timeout=1)
+                events.append(event)
+            except queue.Empty:
+                break
+
+        runner.terminate()
+
+        complete_events = [e for e in events if e.event_type == EventType.COMPLETE]
+        assert len(complete_events) == 1
+        # Should fall back to file_size for both bytes_completed and total_bytes
+        assert complete_events[0].bytes_completed == 1000
+        assert complete_events[0].total_bytes == 1000
+
 
 # ── Wait Tests ───────────────────────────────────────────────────
 

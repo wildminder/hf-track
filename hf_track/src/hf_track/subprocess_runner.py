@@ -154,8 +154,7 @@ class XetSubprocessRunner:
                         except queue.Full:
                             logger.warning(
                                 "Event queue full — dropping %s event for %s",
-                                event.event_type.value,
-                                event.filename,
+                                event.event_type.value, event.filename,
                             )
                 except Exception as e:
                     logger.warning("Failed to translate event message: %s", e)
@@ -203,20 +202,33 @@ class XetSubprocessRunner:
                 break
 
     def _emit_complete_from_result(self, payload: Dict[str, Any]) -> None:
-        """Emit a COMPLETE ProgressEvent from a result payload."""
+        """Emit a COMPLETE ProgressEvent from a result payload.
+
+        For snapshot downloads, the payload may include
+        ``bytes_completed``, ``total_bytes``, ``files_completed``,
+        and ``total_files`` fields from the subprocess worker's
+        ``state_manager``.  For single-file downloads, only
+        ``file_size`` is available.
+        """
         if self._event_queue is None:
             return
         try:
             from .types import ProgressPhase, TransferDirection
+            # Prefer explicit bytes_completed/total_bytes from snapshot
+            # workers; fall back to file_size for single-file workers.
+            bytes_completed = payload.get("bytes_completed", 0) or payload.get("file_size", 0)
+            total_bytes = payload.get("total_bytes", 0) or bytes_completed
             event = ProgressEvent(
                 event_type=EventType.COMPLETE,
                 transfer_id=payload.get("transfer_id", ""),
                 direction=TransferDirection(payload.get("direction", "download")),
                 filename=payload.get("filename", ""),
                 phase=ProgressPhase.COMPLETE,
-                bytes_completed=payload.get("file_size", 0),
-                total_bytes=payload.get("file_size", 0),
+                bytes_completed=bytes_completed,
+                total_bytes=total_bytes,
                 percentage=100.0,
+                file_index=payload.get("files_completed", 0),
+                total_files=payload.get("total_files", 0),
             )
             self._event_queue.put(event)
         except Exception as e:

@@ -19,7 +19,7 @@ from hf_track._xet_worker import (
     _upload_bytes_worker,
     _upload_file_worker,
 )
-from hf_track.subprocess_messages import MSG_CANCELLED, MSG_ERROR, MSG_RESULT, SubprocessMessage
+from hf_track.subprocess_messages import MSG_CANCELLED, MSG_ERROR, MSG_EVENT, MSG_RESULT, SubprocessMessage
 
 
 # ── Serialization Tests ──────────────────────────────────────────
@@ -347,9 +347,26 @@ class TestSnapshotWorker:
         params.update(overrides)
         return params
 
+    def _drain_messages(self, mp_queue):
+        """Drain all messages from mp_queue and return as a list."""
+        messages = []
+        while True:
+            try:
+                messages.append(mp_queue.get_nowait())
+            except Exception:
+                break
+        return messages
+
+    def _find_message(self, messages, msg_type):
+        """Find the first message of a given type in a list."""
+        for msg in messages:
+            if msg.msg_type == msg_type:
+                return msg
+        return None
+
     @patch("huggingface_hub.snapshot_download")
     def test_snapshot_worker_success(self, mock_snapshot_dl):
-        """Worker sends result message on successful snapshot_download."""
+        """Worker sends COMPLETE event and result message on successful snapshot_download."""
         mock_snapshot_dl.return_value = "/tmp/test_repo"
 
         ctx = mp.get_context("spawn")
@@ -358,11 +375,17 @@ class TestSnapshotWorker:
 
         _snapshot_worker(self._make_params(), mp_queue, cancel_event)
 
-        msg = mp_queue.get(timeout=5)
-        assert msg.msg_type == MSG_RESULT
-        assert msg.payload["status"] == "success"
-        assert msg.payload["destination_path"] == "/tmp/test_repo"
-        assert msg.payload["transfer_id"] == "snap-test-001"
+        messages = self._drain_messages(mp_queue)
+        # Should have a COMPLETE event followed by a result message
+        complete_msg = self._find_message(messages, MSG_EVENT)
+        assert complete_msg is not None
+        assert complete_msg.payload["event_type"] == "complete"
+
+        result_msg = self._find_message(messages, MSG_RESULT)
+        assert result_msg is not None
+        assert result_msg.payload["status"] == "success"
+        assert result_msg.payload["destination_path"] == "/tmp/test_repo"
+        assert result_msg.payload["transfer_id"] == "snap-test-001"
 
     @patch("huggingface_hub.snapshot_download")
     def test_snapshot_worker_passes_kwargs(self, mock_snapshot_dl):
@@ -383,9 +406,10 @@ class TestSnapshotWorker:
         )
         _snapshot_worker(params, mp_queue, cancel_event)
 
-        # Wait for result
-        msg = mp_queue.get(timeout=5)
-        assert msg.msg_type == MSG_RESULT
+        # Drain all messages — should include a result
+        messages = self._drain_messages(mp_queue)
+        result_msg = self._find_message(messages, MSG_RESULT)
+        assert result_msg is not None
 
         # Verify snapshot_download was called with correct kwargs
         mock_snapshot_dl.assert_called_once()
@@ -410,9 +434,10 @@ class TestSnapshotWorker:
 
         _snapshot_worker(self._make_params(), mp_queue, cancel_event)
 
-        # Wait for result
-        msg = mp_queue.get(timeout=5)
-        assert msg.msg_type == MSG_RESULT
+        # Drain all messages — should include a result
+        messages = self._drain_messages(mp_queue)
+        result_msg = self._find_message(messages, MSG_RESULT)
+        assert result_msg is not None
 
         # Verify tqdm_class was passed
         call_kwargs = mock_snapshot_dl.call_args.kwargs
@@ -480,17 +505,18 @@ class TestSnapshotWorker:
         params = self._make_params(local_dir=None)
         _snapshot_worker(params, mp_queue, cancel_event)
 
-        # Wait for result
-        msg = mp_queue.get(timeout=5)
-        assert msg.msg_type == MSG_RESULT
+        # Drain all messages — should include a result
+        messages = self._drain_messages(mp_queue)
+        result_msg = self._find_message(messages, MSG_RESULT)
+        assert result_msg is not None
 
         # local_dir should NOT be in the kwargs
         call_kwargs = mock_snapshot_dl.call_args.kwargs
         assert "local_dir" not in call_kwargs
 
     @patch("huggingface_hub.snapshot_download")
-    def test_snapshot_worker_emits_progress_events(self, mock_snapshot_dl):
-        """Worker sends result message after snapshot_download completes."""
+    def test_snapshot_worker_emits_complete_event(self, mock_snapshot_dl):
+        """Worker sends COMPLETE event before result message."""
         mock_snapshot_dl.return_value = "/tmp/test_repo"
 
         ctx = mp.get_context("spawn")
@@ -499,17 +525,44 @@ class TestSnapshotWorker:
 
         _snapshot_worker(self._make_params(), mp_queue, cancel_event)
 
-        # Collect all messages — at minimum we should get a result message
-        messages = []
-        while not mp_queue.empty():
-            try:
-                messages.append(mp_queue.get_nowait())
-            except Exception:
-                break
+        # Collect all messages
+        messages = self._drain_messages(mp_queue)
 
-        # Should have a result message
+        # Should have both a COMPLETE event and a result message
         msg_types = [m.msg_type for m in messages]
+        assert MSG_EVENT in msg_types
         assert MSG_RESULT in msg_types
+
+        # Find the COMPLETE event
+        complete_events = [
+            m for m in messages
+            if m.msg_type == MSG_EVENT and m.payload.get("event_type") == "complete"
+        ]
+        assert len(complete_events) == 1
+        complete_payload = complete_events[0].payload
+        assert complete_payload["transfer_id"] == "snap-test-001"
+        assert complete_payload["filename"] == "test/repo"
+        assert complete_payload["percentage"] == 100.0
+
+    @patch("huggingface_hub.snapshot_download")
+    def test_snapshot_worker_result_includes_snapshot_stats(self, mock_snapshot_dl):
+        """Worker result payload includes bytes_completed, total_bytes, files_completed, total_files."""
+        mock_snapshot_dl.return_value = "/tmp/test_repo"
+
+        ctx = mp.get_context("spawn")
+        mp_queue = ctx.Queue()
+        cancel_event = ctx.Event()
+
+        _snapshot_worker(self._make_params(), mp_queue, cancel_event)
+
+        messages = self._drain_messages(mp_queue)
+        result_msg = self._find_message(messages, MSG_RESULT)
+        assert result_msg is not None
+        # Result should include snapshot-level stats
+        assert "bytes_completed" in result_msg.payload
+        assert "total_bytes" in result_msg.payload
+        assert "files_completed" in result_msg.payload
+        assert "total_files" in result_msg.payload
 
     @patch("huggingface_hub.snapshot_download")
     def test_snapshot_worker_respects_cancel_event(self, mock_snapshot_dl):
@@ -519,14 +572,15 @@ class TestSnapshotWorker:
         ctx = mp.get_context("spawn")
         mp_queue = ctx.Queue()
         cancel_event = ctx.Event()
-        cancel_event.set()  # Pre-set the cancel event
+        cancel_event.set() # Pre-set the cancel event
 
         _snapshot_worker(self._make_params(), mp_queue, cancel_event)
 
         # Worker should still complete (snapshot_download doesn't check cancel_event
         # directly — it's checked by the is_cancelled hook in the tqdm class)
-        msg = mp_queue.get(timeout=5)
-        assert msg.msg_type == MSG_RESULT
+        messages = self._drain_messages(mp_queue)
+        result_msg = self._find_message(messages, MSG_RESULT)
+        assert result_msg is not None
 
 
 # ── Module-Level Import Safety ───────────────────────────────────

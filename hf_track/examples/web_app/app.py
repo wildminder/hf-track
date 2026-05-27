@@ -108,9 +108,6 @@ def _event_router_loop() -> None:
             tid = event.transfer_id
             if tid in _transfer_events:
                 _transfer_events[tid].append(event)
-            # If the transfer_id is not in _transfer_events, the event
-            # is for a transfer we don't track (e.g. from a different
-            # consumer). Drop it silently.
 
 
 _event_router_thread = threading.Thread(

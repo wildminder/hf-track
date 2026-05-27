@@ -16,7 +16,7 @@ from hf_track.callbacks import (
     XetProgressCallback,
     tqdm_upload_patcher,
 )
-from hf_track.types import EventType, ProgressPhase, TransferDirection
+from hf_track.types import EventType, ProgressEvent, ProgressPhase, TransferDirection
 
 
 class TestXetProgressCallbackEstimation:
@@ -769,6 +769,177 @@ class TestDownloadProgressTqdm:
         assert stats["bytes_completed"] == 250
         assert stats["total_bytes"] == 1000
         bar.close()
+
+    def test_file_count_bar_emits_progress_event(self):
+        """File-count bars (is_bytes_bar=False) now emit PROGRESS events.
+
+        This is critical for snapshot downloads where the file-count bar
+        is the primary progress indicator. Previously, file-count bar
+        updates were silently dropped, causing the web app to show no
+        progress during xet snapshot downloads.
+        """
+        q = queue.Queue()
+        bar = DownloadProgressTqdm(
+            total=5,
+            unit="files",
+            event_queue=q,
+            transfer_id="test-file-count",
+            filename="test/repo",
+        )
+        assert not bar.is_bytes_bar
+
+        bar.update(1)
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+
+        # Should have emitted a PROGRESS event
+        assert len(events) == 1
+        event = events[0]
+        assert event.event_type == EventType.PROGRESS
+        assert event.transfer_id == "test-file-count"
+        assert event.filename == "test/repo"
+        # File-count bars report file progress as percentage
+        assert event.file_index == 1  # 1 file completed
+        assert event.total_files == 5  # 5 total files
+        bar.close()
+
+    def test_file_count_bar_progress_uses_state_manager_bytes(self):
+        """File-count bar PROGRESS events include byte stats from state_manager."""
+        from hf_track.callbacks import state_manager
+
+        q = queue.Queue()
+        # Create a byte bar first to seed state_manager with byte data
+        byte_bar = DownloadProgressTqdm(
+            total=1000, unit="B", unit_scale=True,
+            event_queue=q, transfer_id="test-mixed",
+            filename="test/repo",
+        )
+        byte_bar.update(500)
+        # Drain byte bar events
+        while not q.empty():
+            q.get_nowait()
+
+        # Now create a file-count bar with the same transfer_id
+        file_bar = DownloadProgressTqdm(
+            total=3, unit="files",
+            event_queue=q, transfer_id="test-mixed",
+            filename="test/repo",
+        )
+        file_bar.update(1)
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+
+        assert len(events) == 1
+        event = events[0]
+        assert event.event_type == EventType.PROGRESS
+        # Should include byte stats from state_manager
+        assert event.bytes_completed == 500
+        assert event.total_bytes == 1000
+        file_bar.close()
+        byte_bar.close()
+        state_manager.clear_state("test-mixed")
+
+    def test_file_count_bar_no_event_without_queue(self):
+        """File-count bar with no event_queue doesn't emit events (base _emit_event drops silently)."""
+        bar = DownloadProgressTqdm(
+            total=5,
+            unit="files",
+            event_queue=None,
+            transfer_id="test-no-q",
+            filename="test/repo",
+        )
+        # Should not raise — base _emit_event returns early when queue is None
+        bar.update(1)
+        bar.close()
+
+    def test_emit_event_with_none_queue_does_not_crash(self):
+        """Base _emit_event gracefully handles None event_queue."""
+        bar = DownloadProgressTqdm(
+            total=100,
+            unit="B",
+            event_queue=None,
+            transfer_id="test-emit-none",
+            filename="test/file.bin",
+        )
+        event = ProgressEvent(
+            event_type=EventType.PROGRESS,
+            transfer_id="test-emit-none",
+            direction=TransferDirection.DOWNLOAD,
+            filename="test/file.bin",
+            phase=ProgressPhase.DOWNLOADING,
+            bytes_completed=50,
+            total_bytes=100,
+            percentage=50.0,
+            speed=0,
+        )
+        # Calling _emit_event directly with None queue should not raise
+        bar._emit_event(event)
+        bar.close()
+
+    def test_subclass_emit_event_called_with_none_queue(self):
+        """When _emit_event is overridden (subprocess pattern), events flow
+        even though event_queue is None.
+
+        This is the critical fix: update() no longer short-circuits on
+        ``self._event_queue is None``, so overridden _emit_event methods
+        (like _SubprocessDownloadTqdm in _xet_worker.py) are actually
+        reached during download progress updates.
+        """
+        captured: list[ProgressEvent] = []
+
+        class CapturingTqdm(DownloadProgressTqdm):
+            """Subclass that captures events instead of putting them in a queue."""
+            def _emit_event(self, event):
+                captured.append(event)
+
+        BoundCapturing = CapturingTqdm.bind(
+            event_queue=None,  # None — just like _snapshot_worker does
+            transfer_id="test-subproc",
+            filename="test/repo",
+            report_interval=0.0,
+        )
+
+        bar = BoundCapturing(total=3, unit="files")
+        bar.update(1)
+        bar.update(1)
+        bar.update(1)
+        bar.close()
+
+        # With the fix, _emit_event IS called even though event_queue is None
+        progress_events = [e for e in captured if e.event_type == EventType.PROGRESS]
+        assert len(progress_events) >= 3, (
+            f"Expected >=3 PROGRESS events from file-count bar with None queue, "
+            f"got {len(progress_events)}"
+        )
+
+    def test_byte_bar_subclass_emit_event_called_with_none_queue(self):
+        """Byte-bar subclass with overridden _emit_event also works with None queue."""
+        captured: list[ProgressEvent] = []
+
+        class CapturingTqdm(DownloadProgressTqdm):
+            def _emit_event(self, event):
+                captured.append(event)
+
+        BoundCapturing = CapturingTqdm.bind(
+            event_queue=None,
+            transfer_id="test-subproc-bytes",
+            filename="test/file.bin",
+            report_interval=0.0,
+        )
+
+        bar = BoundCapturing(total=1000, unit="B", unit_scale=True)
+        bar.update(500)
+        bar.update(500)
+        bar.close()
+
+        progress_events = [e for e in captured if e.event_type == EventType.PROGRESS]
+        assert len(progress_events) >= 2, (
+            f"Expected >=2 PROGRESS events from byte bar with None queue, "
+            f"got {len(progress_events)}"
+        )
+
 
 class TestTqdmUploadPatcher:
     """Tests for tqdm_upload_patcher context manager."""

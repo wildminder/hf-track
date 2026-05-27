@@ -255,11 +255,11 @@ class DownloadProgressTqdm(base_tqdm):
         self._is_cancelled = kwargs.pop("is_cancelled", None)
         self._start_time = time.time()
         self._closed = False
-        
+
         self.is_bytes_bar = (kwargs.get("unit", "it") in ("B", "iB"))
         kwargs.pop("name", None)
         super().__init__(*args, **kwargs)
-        
+
         if not self._filename:
             self._filename = getattr(self, "desc", "unknown") or "unknown"
         
@@ -273,11 +273,35 @@ class DownloadProgressTqdm(base_tqdm):
 
         result = super().update(n)
 
-        if self._event_queue is None or n == 0:
+        if n == 0:
             return result
 
         if not getattr(self, "is_bytes_bar", False):
             state_manager.update_download_files(self._transfer_id, getattr(self, "n", 0), getattr(self, "total", 0) or 0)
+            # Emit a PROGRESS event for file-count bars so consumers
+            # (web app, subprocess relay) receive per-file progress.
+            # Without this, snapshot downloads show no progress updates
+            # because only byte bars emitted events previously.
+            state = state_manager.get_state(self._transfer_id)
+            files_completed = state.get("files_completed", 0)
+            total_files = state.get("total_files", 0)
+            bytes_completed = state.get("bytes_completed", 0)
+            total_bytes = state.get("total_bytes", 0)
+            file_pct = ((files_completed / total_files * 100) if total_files > 0 else 0)
+            event = ProgressEvent(
+                event_type=EventType.PROGRESS,
+                transfer_id=self._transfer_id,
+                direction=TransferDirection.DOWNLOAD,
+                filename=self._filename,
+                phase=ProgressPhase.DOWNLOADING,
+                bytes_completed=bytes_completed,
+                total_bytes=total_bytes,
+                percentage=file_pct,
+                speed=0,
+                file_index=files_completed,
+                total_files=total_files,
+            )
+            self._emit_event(event)
             return result
 
         now = time.time()
@@ -318,7 +342,11 @@ class DownloadProgressTqdm(base_tqdm):
         Override this method in subclasses to route events through
         alternative channels (e.g. ``mp.Queue`` in subprocess workers).
         The default implementation puts events into ``self._event_queue``.
+        If ``self._event_queue`` is ``None``, the event is silently dropped
+        (useful when a subclass overrides this method to route elsewhere).
         """
+        if self._event_queue is None:
+            return
         try:
             self._event_queue.put_nowait(event)
         except queue.Full:
