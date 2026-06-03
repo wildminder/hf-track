@@ -1029,44 +1029,63 @@ class TestRequirements:
 # ── Endpoint Xet Env Var Tests ────────────────────────────────────
 
 
-class TestEndpointXetEnvVar:
-    """Tests for the endpoint handler setting HF_HUB_DISABLE_XET."""
+class TestEndpointXetToggle:
+    """Tests for the use_xet parameter being passed through correctly.
 
-    def test_endpoint_sets_xet_disabled(self, client):
-        """POST with use_xet=false sets HF_HUB_DISABLE_XET=1."""
+    The endpoint no longer sets HF_HUB_DISABLE_XET in the main process
+    because huggingface_hub caches that env var at import time. Instead,
+    the use_xet flag is passed through to the tracker/subprocess worker,
+    which sets the env var in the child process BEFORE importing
+    huggingface_hub.
+    """
+
+    def test_endpoint_does_not_set_xet_env_var(self, client):
+        """POST with use_xet=false does NOT set HF_HUB_DISABLE_XET
+        in the main process — that's now handled by the subprocess worker."""
         os.environ.pop("HF_HUB_DISABLE_XET", None)
         resp = client.post(
             "/hf-track/download",
             params={"repo_id": "test/repo", "filename": "file.bin", "use_xet": "false"},
         )
         assert resp.status_code == 200
-        assert os.environ.get("HF_HUB_DISABLE_XET") == "1"
+        # The env var should NOT be set in the main process
+        assert os.environ.get("HF_HUB_DISABLE_XET") is None
         # Cleanup
         os.environ.pop("HF_HUB_DISABLE_XET", None)
 
-    def test_endpoint_clears_xet_enabled(self, client):
-        """POST with use_xet=true clears HF_HUB_DISABLE_XET."""
+    def test_endpoint_does_not_clear_xet_env_var(self, client):
+        """POST with use_xet=true does NOT clear HF_HUB_DISABLE_XET
+        from the main process — that's now handled by the subprocess worker."""
         os.environ["HF_HUB_DISABLE_XET"] = "1"
         resp = client.post(
             "/hf-track/download",
             params={"repo_id": "test/repo", "filename": "file.bin", "use_xet": "true"},
         )
         assert resp.status_code == 200
-        assert "HF_HUB_DISABLE_XET" not in os.environ
+        # The env var should still be set (endpoint doesn't touch it)
+        assert os.environ.get("HF_HUB_DISABLE_XET") == "1"
         # Cleanup
         os.environ.pop("HF_HUB_DISABLE_XET", None)
 
-    def test_endpoint_sets_xet_for_snapshot(self, client):
-        """POST snapshot with use_xet=false sets HF_HUB_DISABLE_XET=1."""
-        os.environ.pop("HF_HUB_DISABLE_XET", None)
+    def test_use_xet_false_in_response(self, client):
+        """POST with use_xet=false returns use_xet=false in response."""
         resp = client.post(
             "/hf-track/download",
             params={"repo_id": "test/repo", "use_xet": "false"},
         )
         assert resp.status_code == 200
-        assert os.environ.get("HF_HUB_DISABLE_XET") == "1"
-        # Cleanup
-        os.environ.pop("HF_HUB_DISABLE_XET", None)
+        data = resp.json()
+        assert data.get("use_xet") is False
+
+    def test_use_xet_true_in_response(self, client):
+        """POST with use_xet=true returns use_xet=true in response."""
+        resp = client.post(
+            "/hf-track/download",
+            params={"repo_id": "test/repo", "use_xet": "true"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data.get("use_xet") is True
 
 
 # ── Force Download Tests ──────────────────────────────────────────

@@ -731,3 +731,62 @@ class TestDownloadSnapshotWithXet:
 
         # Falls back to local_dir or repo_id
         assert result == "test/repo"
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_passes_use_xet_in_params(self, MockRunner, _mock_xet_avail):
+        """use_xet parameter is included in the params dict passed to the subprocess worker."""
+        from hf_track.xet_download import download_snapshot_with_xet
+
+        mock_runner = MagicMock()
+        mock_runner.wait.return_value = {
+            "status": "success",
+            "destination_path": "/tmp/ok",
+            "transfer_id": "snap-use-xet",
+        }
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        download_snapshot_with_xet(
+            repo_id="test/repo",
+            token="test-token",
+            event_queue=event_queue,
+            transfer_id="snap-use-xet",
+            use_xet=False,
+        )
+
+        mock_runner.start.assert_called_once()
+        call_kwargs = mock_runner.start.call_args
+        params = call_kwargs.kwargs["params"]
+        assert params["use_xet"] is False
+
+    @patch("hf_track.xet_download.is_xet_available", return_value=True)
+    @patch("hf_track.xet_download.XetSubprocessRunner")
+    def test_use_xet_default_is_true(self, MockRunner, _mock_xet_avail):
+        """Default use_xet is True when not specified."""
+        from hf_track.xet_download import download_snapshot_with_xet
+
+        mock_runner = MagicMock()
+        mock_runner.wait.return_value = {
+            "status": "success",
+            "destination_path": "/tmp/ok",
+            "transfer_id": "snap-default-xet",
+        }
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        event_queue = queue.Queue()
+
+        download_snapshot_with_xet(
+            repo_id="test/repo",
+            token="test-token",
+            event_queue=event_queue,
+            transfer_id="snap-default-xet",
+        )
+
+        mock_runner.start.assert_called_once()
+        call_kwargs = mock_runner.start.call_args
+        params = call_kwargs.kwargs["params"]
+        assert params["use_xet"] is True

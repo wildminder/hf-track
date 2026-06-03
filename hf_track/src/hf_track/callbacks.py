@@ -36,6 +36,13 @@ class TransferStateManager:
                     "total_files": 0,
                     "bytes_completed": 0,
                     "total_bytes": 0,
+                    # Accumulation tracking for sequential byte bars:
+                    # Each byte bar only knows its own file's total, so we
+                    # track the current bar's total and the sum of all
+                    # previously completed bars' totals to compute the
+                    # aggregate total_bytes across the entire snapshot.
+                    "_current_bar_total": 0,
+                    "_committed_bytes": 0,
                 }
 
     def init_upload(self, transfer_id: str, filename: str, total_bytes: int, event_queue: queue.Queue):
@@ -57,11 +64,86 @@ class TransferStateManager:
                 if total_files > 0:
                     self._states[transfer_id]["total_files"] = total_files
 
+    def reset_byte_bar_state(self, transfer_id: str):
+        """Reset the per-byte-bar state for a NEW byte bar.
+
+        Called by ``DownloadProgressTqdm.__init__`` when a new byte bar is
+        created. This is how we distinguish:
+
+        - **HTTP per-file byte bars**: each file gets its own
+          ``DownloadProgressTqdm`` instance, so ``__init__`` is called
+          once per file. Committing the previous bar's total here ensures
+          aggregate ``total_bytes`` reflects all files.
+
+        - **xet shared byte bar**: ``huggingface_hub.snapshot_download``
+          creates ONE shared byte bar (via ``bytes_progress`` +
+          ``_AggregatedTqdm``). ``__init__`` is called only once. The bar
+          reports growing totals (cumulative) as files are discovered.
+          No commit is needed during its lifetime.
+
+        The function commits the previous bar's total to ``_committed_bytes``
+        if there was one, then resets the per-bar state. ``total_bytes``
+        is updated to reflect the committed amount.
+        """
+        with self._lock:
+            if transfer_id not in self._states:
+                return
+            state = self._states[transfer_id]
+            prev_bar_total = state["_current_bar_total"]
+            if prev_bar_total > 0:
+                state["_committed_bytes"] += prev_bar_total
+            state["_current_bar_total"] = 0
+            state["bytes_completed"] = state["_committed_bytes"]
+            state["total_bytes"] = state["_committed_bytes"]
+
     def update_download_bytes(self, transfer_id: str, bytes_completed: int, total_bytes: int):
         with self._lock:
-            if transfer_id in self._states:
-                self._states[transfer_id]["bytes_completed"] = bytes_completed
-                self._states[transfer_id]["total_bytes"] = total_bytes
+            if transfer_id not in self._states:
+                return
+            state = self._states[transfer_id]
+
+            # Detect bar switch within a single bar's lifetime.
+            # Three patterns are observed:
+            #   1. **xet shared bar** (snapshot_download): same bar, total
+            #      GROWS as files are discovered. ``update(n)`` is the
+            #      per-file increment. NOT a bar switch.
+            #   2. **HTTP per-file bar**: detected via ``reset_byte_bar_state``
+            #      in ``__init__`` (commits previous bar before reset).
+            #      During the bar's life, total is constant.
+            #   3. **HTTP fallback / edge case**: if a new bar's ``__init__``
+            #      was not called (e.g., bound class not properly hooked),
+            #      we fall back to the legacy heuristic: total changed AND
+            #      bytes_completed dropped.
+            prev_bar_total = state["_current_bar_total"]
+            prev_bar_bytes = state["bytes_completed"] - state["_committed_bytes"]
+
+            # If total GREW, it's the xet-style "more files discovered"
+            # pattern — same bar, do NOT commit.
+            if total_bytes > prev_bar_total:
+                bar_switched = False
+            elif total_bytes < prev_bar_total:
+                # Total shrank — likely a new bar with smaller per-file size.
+                bar_switched = True
+            else:
+                # Same total. Check if bytes_completed dropped significantly.
+                if prev_bar_total > 0 and bytes_completed < (prev_bar_bytes * 0.5):
+                    bar_switched = True
+                else:
+                    bar_switched = False
+
+            if bar_switched and prev_bar_total > 0:
+                state["_committed_bytes"] += prev_bar_total
+            if bar_switched:
+                state["_current_bar_total"] = total_bytes
+            elif prev_bar_total == 0 and total_bytes > 0:
+                # First non-zero total for this bar.
+                state["_current_bar_total"] = total_bytes
+
+            # Aggregate bytes_completed = committed from previous files
+            # + current bar's progress. Aggregate total_bytes = committed
+            # + current bar's total.
+            state["bytes_completed"] = state["_committed_bytes"] + bytes_completed
+            state["total_bytes"] = state["_committed_bytes"] + total_bytes
 
     def add_upload_bytes(self, transfer_id: str, byte_increment: int) -> dict:
         """Accumulates bytes for multipart uploads and returns the current state."""
@@ -255,6 +337,15 @@ class DownloadProgressTqdm(base_tqdm):
         self._is_cancelled = kwargs.pop("is_cancelled", None)
         self._start_time = time.time()
         self._closed = False
+        # Throttling state: avoid flooding the event queue (and IPC
+        # mp.Queue in subprocess mode) with per-chunk progress events.
+        self._last_emit_time: float = 0.0
+        self._last_emit_bytes: int = 0
+        self._first_event_emitted: bool = False
+        # Track the previous self.n value to detect when update(n)
+        # is called with an absolute position (xet) vs an increment
+        # (standard HTTP). See update() for details.
+        self._prev_n: int = 0
 
         self.is_bytes_bar = (kwargs.get("unit", "it") in ("B", "iB"))
         kwargs.pop("name", None)
@@ -262,19 +353,138 @@ class DownloadProgressTqdm(base_tqdm):
 
         if not self._filename:
             self._filename = getattr(self, "desc", "unknown") or "unknown"
-        
+
         state_manager.init_download(self._transfer_id)
-        if not self.is_bytes_bar:
+        if self.is_bytes_bar:
+            state_manager.reset_byte_bar_state(self._transfer_id)
+        else:
             state_manager.update_download_files(self._transfer_id, 0, getattr(self, "total", 0) or 0)
 
+        # ── DIAG: temporary instrumentation (Phase 0.1) ──────────────
+        import os as _os
+        if _os.environ.get("HF_TRACK_DEBUG_XET"):
+            try:
+                import threading as _thr
+                logger.debug(
+                    "[DIAG-INIT] pid=%d tid=%s id=%s total=%s unit=%s desc=%s "
+                    "is_bytes_bar=%s event_queue_is_none=%s has_cancel_hook=%s",
+                    _os.getpid(),
+                    _thr.get_ident(),
+                    id(self),
+                    getattr(self, "total", None),
+                    getattr(self, "unit", None),
+                    getattr(self, "desc", None),
+                    self.is_bytes_bar,
+                    self._event_queue is None,
+                    self._is_cancelled is not None,
+                )
+            except Exception as _e:
+                logger.debug("[DIAG-INIT] failed to log: %s", _e)
+        # ── END DIAG ─────────────────────────────────────────────────
+
+    def _should_throttle(self, agg_bytes_completed: int, agg_total_bytes: int, now: float) -> bool:
+        """Return True if this PROGRESS event should be dropped to reduce flooding.
+
+        Throttling rules:
+        - Never throttle the very first event (ensures immediate feedback).
+        - Never throttle if the transfer appears complete (bytes >= total).
+        - Throttle if less than ``_report_interval`` seconds have elapsed
+          AND the byte delta since last emit is less than 1% of total
+          (or less than 1 KiB for small/unknown totals).
+        """
+        if not self._first_event_emitted:
+            return False
+        if agg_total_bytes > 0 and agg_bytes_completed >= agg_total_bytes:
+            return False
+
+        time_delta = now - self._last_emit_time
+        if time_delta >= self._report_interval:
+            return False
+
+        bytes_delta = abs(agg_bytes_completed - self._last_emit_bytes)
+        if agg_total_bytes > 0:
+            min_delta = max(agg_total_bytes // 100, 1024)
+        else:
+            min_delta = 1024
+        return bytes_delta < min_delta
+
     def update(self, n=1):
+        # ── DIAG: temporary instrumentation (Phase 0.2) ──────────────
+        import os as _os
+        _diag = _os.environ.get("HF_TRACK_DEBUG_XET")
+        if _diag:
+            try:
+                import threading as _thr
+                _total_pre = getattr(self, "total", 0) or 0
+                _n_pre = getattr(self, "n", 0)
+                logger.debug(
+                    "[DIAG-UPDATE-ENTRY] pid=%d tid=%s id=%s n=%s prev_n=%s "
+                    "n_pre=%s total=%s is_bytes_bar=%s is_cancelled_hook=%s",
+                    _os.getpid(), _thr.get_ident(), id(self),
+                    n, self._prev_n, _n_pre, _total_pre,
+                    getattr(self, "is_bytes_bar", False),
+                    bool(self._is_cancelled and self._is_cancelled()),
+                )
+            except Exception:
+                pass
+        # ── END DIAG (entry) ─────────────────────────────────────────
+
         if self._is_cancelled is not None and self._is_cancelled():
             raise TransferCancelledError("Transfer cancelled by user")
 
+        # ── Xet absolute-position fix ──────────────────────────────
+        # huggingface_hub.xet_get() calls progress.update(progress_bytes)
+        # where progress_bytes is the TOTAL bytes completed so far (not
+        # an increment). But tqdm.update(n) expects n to be an INCREMENT
+        # that gets ADDED to self.n. This causes self.n to grow far
+        # beyond the actual total, breaking progress tracking.
+        #
+        # Detection: after super().update(n), if self.n > total AND
+        # n > remaining (total - prev_n), then n was likely an absolute
+        # position. We correct self.n to the absolute value.
+        prev_n = self._prev_n
         result = super().update(n)
+
+        # ── DIAG: post-super().update() ─────────────────────────────
+        if _diag:
+            try:
+                logger.debug(
+                    "[DIAG-UPDATE-POST-SUPER] pid=%d n=%s self.n=%s total=%s",
+                    _os.getpid(), n, getattr(self, "n", 0), getattr(self, "total", 0),
+                )
+            except Exception:
+                pass
+        # ── END DIAG ─────────────────────────────────────────────────
 
         if n == 0:
             return result
+
+        # For byte bars: detect and correct xet's absolute-position calls
+        if getattr(self, "is_bytes_bar", False):
+            total_val = getattr(self, "total", 0) or 0
+            current_n = getattr(self, "n", 0)
+            remaining = total_val - prev_n
+
+            # If n exceeds remaining AND current_n exceeds total,
+            # this was an absolute position call from xet_get().
+            # Correct: self.n was (prev_n + n), should be just n.
+            if total_val > 0 and n > remaining and current_n > total_val:
+                # ── DIAG: absolute correction fired ───────────────────
+                if _diag:
+                    try:
+                        logger.debug(
+                            "[DIAG-ABS-CORRECTION] pid=%s n=%s prev_n=%s "
+                            "old_self_n=%s new_self_n=%s total=%s remaining=%s",
+                            _os.getpid(), n, prev_n, current_n, n, total_val, remaining,
+                        )
+                    except Exception:
+                        pass
+                # ── END DIAG ─────────────────────────────────────────
+                # Reset to the absolute position
+                setattr(self, "n", n)
+                current_n = n
+
+        self._prev_n = getattr(self, "n", 0)
 
         if not getattr(self, "is_bytes_bar", False):
             state_manager.update_download_files(self._transfer_id, getattr(self, "n", 0), getattr(self, "total", 0) or 0)
@@ -305,20 +515,40 @@ class DownloadProgressTqdm(base_tqdm):
             return result
 
         now = time.time()
-        bytes_completed = getattr(self, "n", 0)
-        total_bytes = getattr(self, "total", 0) or 0
-        percentage = ((bytes_completed / total_bytes * 100) if total_bytes > 0 else 0)
+        bar_bytes_completed = getattr(self, "n", 0)
+        bar_total_bytes = getattr(self, "total", 0) or 0
 
-        state_manager.update_download_bytes(self._transfer_id, bytes_completed, total_bytes)
+        # Update state_manager (accumulates across sequential byte bars)
+        state_manager.update_download_bytes(self._transfer_id, bar_bytes_completed, bar_total_bytes)
 
-        speed = getattr(self, "format_dict", {}).get("rate") or 0
-        if not speed and bytes_completed > 0:
-            elapsed = now - self._start_time
-            speed = bytes_completed / elapsed if elapsed > 0 else 0
-
+        # Read aggregate values from state_manager for the event
         state = state_manager.get_state(self._transfer_id)
+        agg_bytes_completed = state.get("bytes_completed", 0)
+        agg_total_bytes = state.get("total_bytes", 0)
         files_completed = state.get("files_completed", 0)
         total_files = state.get("total_files", 0)
+        percentage = ((agg_bytes_completed / agg_total_bytes * 100) if agg_total_bytes > 0 else 0)
+
+        # Throttle: skip emitting if too soon and too little change
+        if self._should_throttle(agg_bytes_completed, agg_total_bytes, now):
+            # ── DIAG: throttled ──────────────────────────────────────
+            if _diag:
+                try:
+                    logger.debug(
+                        "[DIAG-THROTTLED] pid=%s agg_bytes=%s agg_total=%s "
+                        "first_emitted=%s",
+                        _os.getpid(), agg_bytes_completed, agg_total_bytes,
+                        self._first_event_emitted,
+                    )
+                except Exception:
+                    pass
+            # ── END DIAG ─────────────────────────────────────────────
+            return result
+
+        speed = getattr(self, "format_dict", {}).get("rate") or 0
+        if not speed and bar_bytes_completed > 0:
+            elapsed = now - self._start_time
+            speed = bar_bytes_completed / elapsed if elapsed > 0 else 0
 
         event = ProgressEvent(
             event_type=EventType.PROGRESS,
@@ -326,14 +556,28 @@ class DownloadProgressTqdm(base_tqdm):
             direction=TransferDirection.DOWNLOAD,
             filename=self._filename,
             phase=ProgressPhase.DOWNLOADING,
-            bytes_completed=bytes_completed,
-            total_bytes=total_bytes,
+            bytes_completed=agg_bytes_completed,
+            total_bytes=agg_total_bytes,
             percentage=percentage,
             speed=speed or 0,
             file_index=files_completed,
             total_files=total_files,
         )
         self._emit_event(event)
+        self._last_emit_time = now
+        self._last_emit_bytes = agg_bytes_completed
+        self._first_event_emitted = True
+
+        # ── DIAG: emit-success ─────────────────────────────────────
+        if _diag:
+            try:
+                logger.debug(
+                    "[DIAG-EMIT] pid=%s event_type=PROGRESS bytes=%s total=%s pct=%.2f",
+                    _os.getpid(), agg_bytes_completed, agg_total_bytes, percentage,
+                )
+            except Exception:
+                pass
+        # ── END DIAG ───────────────────────────────────────────────
         return result
 
     def _emit_event(self, event: ProgressEvent) -> None:
@@ -345,14 +589,88 @@ class DownloadProgressTqdm(base_tqdm):
         If ``self._event_queue`` is ``None``, the event is silently dropped
         (useful when a subclass overrides this method to route elsewhere).
         """
+        # ── DIAG: temporary instrumentation (Phase 0.3) ──────────────
+        import os as _os
+        _diag = _os.environ.get("HF_TRACK_DEBUG_XET")
+        if _diag:
+            try:
+                import threading as _thr
+                _d_size = -1
+                try:
+                    _d = event.to_dict()
+                    _d_size = len(_d)
+                except Exception as _td:
+                    _d_size = -1
+                    logger.debug(
+                        "[DIAG-EMIT-EVENT-DICT-FAIL] pid=%s tid=%s err=%s",
+                        _os.getpid(), _thr.get_ident(), _td,
+                    )
+                logger.debug(
+                    "[DIAG-EMIT-EVENT] pid=%s tid=%s event_type=%s "
+                    "bytes=%s total=%s dict_size=%s queue_is_none=%s",
+                    _os.getpid(), _thr.get_ident(),
+                    event.event_type.value, event.bytes_completed,
+                    event.total_bytes, _d_size,
+                    self._event_queue is None,
+                )
+            except Exception as _e:
+                logger.debug("[DIAG-EMIT-EVENT] log failed: %s", _e)
+        # ── END DIAG ─────────────────────────────────────────────────
+
         if self._event_queue is None:
             return
+
+        # ── DIAG: capture put_nowait outcome ────────────────────────
+        if _diag:
+            try:
+                self._event_queue.put_nowait(event)
+                logger.debug(
+                    "[DIAG-EMIT-PUT-OK] pid=%s event_type=%s",
+                    _os.getpid(), event.event_type.value,
+                )
+            except queue.Full:
+                logger.debug(
+                    "[DIAG-EMIT-PUT-FULL] pid=%s event_type=%s",
+                    _os.getpid(), event.event_type.value,
+                )
+                logger.warning(
+                    "Download progress event queue full — dropping %s event",
+                    event.event_type.value,
+                )
+            except BaseException as _put_err:  # DIAG: catch ALL
+                logger.debug(
+                    "[DIAG-EMIT-PUT-ERR] pid=%s err_type=%s err=%s",
+                    _os.getpid(), type(_put_err).__name__, _put_err,
+                )
+                # Re-raise so we can see if the in-process path propagates
+                raise
+            return
+        # ── END DIAG (with put) ──────────────────────────────────────
+
+        # Non-DIAG path: original behavior
         try:
             self._event_queue.put_nowait(event)
         except queue.Full:
             logger.warning("Download progress event queue full — dropping %s event", event.event_type.value)
 
     def close(self):
+        # ── DIAG: temporary instrumentation (Phase 0.4) ──────────────
+        import os as _os
+        _diag = _os.environ.get("HF_TRACK_DEBUG_XET")
+        if _diag:
+            try:
+                logger.debug(
+                    "[DIAG-CLOSE-ENTRY] pid=%s id=%s n=%s total=%s "
+                    "is_bytes_bar=%s event_queue_is_none=%s closed=%s",
+                    _os.getpid(), id(self),
+                    getattr(self, "n", 0), getattr(self, "total", 0),
+                    getattr(self, "is_bytes_bar", False),
+                    self._event_queue is None, self._closed,
+                )
+            except Exception:
+                pass
+        # ── END DIAG ─────────────────────────────────────────────────
+
         if self._closed:
             super().close()
             return
@@ -365,11 +683,36 @@ class DownloadProgressTqdm(base_tqdm):
             is_complete = n_val >= total_val
             is_xet_cached = n_val == 0 and total_val > 0
 
+            # ── DIAG: branch decision ────────────────────────────────
+            if _diag:
+                try:
+                    logger.debug(
+                        "[DIAG-CLOSE-BRANCH] pid=%s is_complete=%s "
+                        "is_xet_cached=%s n_val=%s total_val=%s",
+                        _os.getpid(), is_complete, is_xet_cached, n_val, total_val,
+                    )
+                except Exception:
+                    pass
+            # ── END DIAG ─────────────────────────────────────────────
+
             if is_complete or is_xet_cached:
                 final_bytes = total_val if is_xet_cached else n_val
                 state = state_manager.get_state(self._transfer_id)
                 total_files = state.get("total_files", 0)
                 files_completed = total_files if total_files > 0 else state.get("files_completed", 0)
+
+                # ── DIAG: synthesize COMPLETE ──────────────────────────
+                if _diag:
+                    try:
+                        logger.debug(
+                            "[DIAG-CLOSE-SYNTH-COMPLETE] pid=%s final_bytes=%s "
+                            "total_bytes=%s files_completed=%s total_files=%s",
+                            _os.getpid(), final_bytes, total_val,
+                            files_completed, total_files,
+                        )
+                    except Exception:
+                        pass
+                # ── END DIAG ─────────────────────────────────────────
 
                 event = ProgressEvent(
                     event_type=EventType.COMPLETE,

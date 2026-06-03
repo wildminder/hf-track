@@ -30,7 +30,7 @@ try:
         try:
             getattr(huggingface_hub, _attr)
         except (AttributeError, ImportError):
-            logger.debug("huggingface_hub.%s not available — skipping", _attr)
+            logger.debug("huggingface_hub.%s not available", _attr)
 
 except ImportError:
-    logger.debug("huggingface_hub not installed — skipping eager import")
+    logger.debug("huggingface_hub not installed")

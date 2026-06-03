@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hf-track"
-version = "0.2.1"
+version = "0.2.4"
 description = "Plug-and-play progress tracking for HuggingFace Hub uploads and downloads"
 readme = "README.md"
 license = "MIT"

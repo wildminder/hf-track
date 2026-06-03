@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Download a HuggingFace repository with custom progress bar",
     )
-    parser.add_argument("--repo", default="openbmb/VoxCPM-0.5B", help="HuggingFace repository ID")
+    parser.add_argument("--repo", default="hf-internal-testing/tiny-random-VoxtralRealtimeForConditionalGeneration", help="HuggingFace repository ID")
     parser.add_argument("--output", default=None, help="Local directory to download to")
     parser.add_argument("--token", default=None, help="HuggingFace API token")
     parser.add_argument("--repo-type", default="model", choices=["model", "dataset", "space"])

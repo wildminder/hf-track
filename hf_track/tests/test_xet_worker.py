@@ -605,3 +605,102 @@ class TestWorkerModuleSafety:
             pickled = pickle.dumps(func)
             unpickled = pickle.loads(pickled)
             assert unpickled is func
+
+
+class TestSnapshotWorkerUseXet:
+    """Tests for _snapshot_worker use_xet parameter and env var handling.
+
+    The _snapshot_worker sets HF_HUB_DISABLE_XET in the child process
+    BEFORE importing huggingface_hub, so the cached constant reflects
+    the correct value. This is critical for runtime xet toggling.
+    """
+
+    def _make_params(self, **overrides):
+        params = {
+            "repo_id": "test/repo",
+            "token": "hf_test",
+            "repo_type": "model",
+            "revision": None,
+            "local_dir": "/tmp/test_repo",
+            "allow_patterns": None,
+            "ignore_patterns": None,
+            "endpoint": None,
+            "transfer_id": "snap-use-xet-001",
+            "report_interval": 0.1,
+            "force_download": False,
+            "use_xet": True,
+        }
+        params.update(overrides)
+        return params
+
+    @patch("huggingface_hub.snapshot_download")
+    def test_use_xet_false_sets_env_var(self, mock_snapshot_dl):
+        """use_xet=False → worker sets HF_HUB_DISABLE_XET=1 before
+        huggingface_hub imports occur."""
+        mock_snapshot_dl.return_value = "/tmp/test_repo"
+        ctx = mp.get_context("spawn")
+        mp_queue = ctx.Queue()
+        cancel_event = ctx.Event()
+        params = self._make_params(use_xet=False)
+
+        # Clean env before test
+        old_val = os.environ.pop("HF_HUB_DISABLE_XET", None)
+        try:
+            _snapshot_worker(params, mp_queue, cancel_event)
+
+            # After the worker runs, the env var should be set
+            assert os.environ.get("HF_HUB_DISABLE_XET") == "1"
+        finally:
+            # Restore env
+            if old_val is not None:
+                os.environ["HF_HUB_DISABLE_XET"] = old_val
+            else:
+                os.environ.pop("HF_HUB_DISABLE_XET", None)
+
+    @patch("huggingface_hub.snapshot_download")
+    def test_use_xet_true_clears_env_var(self, mock_snapshot_dl):
+        """use_xet=True → worker clears HF_HUB_DISABLE_XET before
+        huggingface_hub imports occur."""
+        mock_snapshot_dl.return_value = "/tmp/test_repo"
+        ctx = mp.get_context("spawn")
+        mp_queue = ctx.Queue()
+        cancel_event = ctx.Event()
+        params = self._make_params(use_xet=True)
+
+        # Set env var before test to verify it gets cleared
+        old_val = os.environ.get("HF_HUB_DISABLE_XET")
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+        try:
+            _snapshot_worker(params, mp_queue, cancel_event)
+
+            # After the worker runs, the env var should be cleared
+            assert "HF_HUB_DISABLE_XET" not in os.environ
+        finally:
+            # Restore env
+            if old_val is not None:
+                os.environ["HF_HUB_DISABLE_XET"] = old_val
+            else:
+                os.environ.pop("HF_HUB_DISABLE_XET", None)
+
+    @patch("huggingface_hub.snapshot_download")
+    def test_use_xet_default_is_true(self, mock_snapshot_dl):
+        """Default use_xet (not in params) is True."""
+        mock_snapshot_dl.return_value = "/tmp/test_repo"
+        ctx = mp.get_context("spawn")
+        mp_queue = ctx.Queue()
+        cancel_event = ctx.Event()
+        params = self._make_params()
+        del params["use_xet"]  # Remove to test default
+
+        old_val = os.environ.get("HF_HUB_DISABLE_XET")
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+        try:
+            _snapshot_worker(params, mp_queue, cancel_event)
+
+            # Default is True → env var should be cleared
+            assert "HF_HUB_DISABLE_XET" not in os.environ
+        finally:
+            if old_val is not None:
+                os.environ["HF_HUB_DISABLE_XET"] = old_val
+            else:
+                os.environ.pop("HF_HUB_DISABLE_XET", None)

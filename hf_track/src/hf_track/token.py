@@ -234,4 +234,9 @@ def is_xet_available() -> bool:
     if disable_xet in ("1", "true", "yes"):
         return False
 
-    return importlib.util.find_spec("hf_xet") is not None
+    try:
+        return importlib.util.find_spec("hf_xet") is not None
+    except (ValueError, ImportError):
+        # ValueError: hf_xet is in sys.modules but lacks __spec__
+        # (e.g. a test injected a MagicMock). Treat as unavailable.
+        return False

@@ -22,8 +22,13 @@ logger = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download a single HuggingFace file")
+    #parser.add_argument("--repo", default="hf-internal-testing/tiny-random-VoxtralRealtimeForConditionalGeneration")
+    #parser.add_argument("--file", default="model.safetensors")
+    
     parser.add_argument("--repo", default="openbmb/VoxCPM-0.5B")
     parser.add_argument("--file", default="audiovae.pth")
+    
+    
     parser.add_argument("--output", default=None)
     parser.add_argument("--token", default=None)
     parser.add_argument("--repo-type", default="model", choices=["model", "dataset", "space"])

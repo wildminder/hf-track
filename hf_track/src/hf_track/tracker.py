@@ -77,12 +77,13 @@ class HfTracker:
         revision: Optional[str] = None,
         local_dir: Optional[str] = None,
         transfer_id: Optional[str] = None,
+        use_xet: bool = True,
         **kwargs,
     ) -> str:
         transfer_id, is_cancelled_hook = self._prepare_transfer(transfer_id)
 
         try:
-            if is_xet_available():
+            if is_xet_available() and use_xet:
                 try:
                     return self._download_file_xet(
                         repo_id=repo_id,
@@ -132,6 +133,7 @@ class HfTracker:
         local_dir: Optional[str] = None,
         transfer_id: Optional[str] = None,
         force_download: bool = False,
+        use_xet: bool = True,
         **kwargs,
     ) -> str:
         from .standard_download import download_snapshot as _download_snapshot
@@ -140,6 +142,11 @@ class HfTracker:
 
         try:
             if is_xet_available():
+                # Always use subprocess when xet is installed (for safe
+                # cancellation). The worker handles xet disabling internally
+                # via the use_xet param — it sets HF_HUB_DISABLE_XET in
+                # the child process BEFORE huggingface_hub is imported,
+                # so the cached constant reflects the correct value.
                 try:
                     return self._download_snapshot_xet(
                         repo_id=repo_id,
@@ -151,15 +158,20 @@ class HfTracker:
                         transfer_id=transfer_id,
                         is_cancelled=is_cancelled_hook,
                         force_download=force_download,
+                        use_xet=use_xet,
                     )
                 except TransferCancelledError:
-                    raise  # Never fallback on cancellation
+                    raise # Never fallback on cancellation
                 except Exception as xet_err:
-                    logger.warning(
-                        "Xet snapshot download failed for %s, "
-                        "falling back to standard: %s",
-                        repo_id, xet_err,
-                    )
+                    if not use_xet:
+                        # User explicitly disabled xet — don't warn
+                        pass
+                    else:
+                        logger.warning(
+                            "Xet snapshot download failed for %s, "
+                            "falling back to standard: %s",
+                            repo_id, xet_err,
+                        )
 
             return _download_snapshot(
                 repo_id=repo_id,
@@ -384,6 +396,7 @@ class HfTracker:
     ) -> str:
         from huggingface_hub import HfApi, hf_hub_url
         from .xet_download import download_file_with_xet
+        from .xet_download import download_file_with_xet_session
 
         api = HfApi(endpoint=self._endpoint, token=self._token)
         url = hf_hub_url(
@@ -411,41 +424,62 @@ class HfTracker:
         headers = api._build_hf_headers()
         xet_headers = {k: v for k, v in headers.items() if k != "authorization"}
 
-        result = download_file_with_xet(
-            file_hash=xet_file_data.file_hash,
-            file_size=file_size,
-            dest_path=dest_path,
-            xet_file_data=xet_file_data,
-            token=self._token,
-            event_queue=self.event_queue,
-            endpoint=api.endpoint,
-            transfer_id=transfer_id,
-            report_interval=self._report_interval,
-            request_headers=xet_headers,
-            is_cancelled=is_cancelled,
-        )
+        # Prefer the new XetSession API for smooth per-chunk progress.
+        # Fall back to the old download_files API if XetSession is not
+        # available (e.g. hf_xet < 1.5.0) or if it raises during init.
+        try:
+            result = download_file_with_xet_session(
+                file_hash=xet_file_data.file_hash,
+                file_size=file_size,
+                dest_path=dest_path,
+                xet_file_data=xet_file_data,
+                token=self._token,
+                event_queue=self.event_queue,
+                endpoint=api.endpoint,
+                transfer_id=transfer_id,
+                report_interval=self._report_interval,
+                request_headers=xet_headers,
+                is_cancelled=is_cancelled,
+            )
+        except ImportError:
+            result = download_file_with_xet(
+                file_hash=xet_file_data.file_hash,
+                file_size=file_size,
+                dest_path=dest_path,
+                xet_file_data=xet_file_data,
+                token=self._token,
+                event_queue=self.event_queue,
+                endpoint=api.endpoint,
+                transfer_id=transfer_id,
+                report_interval=self._report_interval,
+                request_headers=xet_headers,
+                is_cancelled=is_cancelled,
+            )
 
         return result.destination_path
 
     def _download_snapshot_xet(
         self,
         repo_id: str,
-        allow_patterns: Optional[list],
-        ignore_patterns: Optional[list],
+        allow_patterns: Optional[List[str]],
+        ignore_patterns: Optional[List[str]],
         repo_type: str,
         revision: Optional[str],
         local_dir: Optional[str],
         transfer_id: str,
         is_cancelled: Callable[[], bool],
         force_download: bool = False,
+        use_xet: bool = True,
     ) -> str:
         """Download repo snapshot via Xet in an isolated subprocess.
 
-        Delegates to ``download_snapshot_with_xet()`` which spawns a child
-        process via ``XetSubprocessRunner``. Inside the child,
-        ``huggingface_hub.snapshot_download()`` runs and internally decides
-        whether to use xet or HTTP for each file. Either way, ``hf_xet``
-        is loaded only in the child process — safe to terminate.
+        Uses the NEW ``hf_xet.XetSession`` API (since v1.5.0) for smooth
+        per-chunk progress reporting. Falls back to the old
+        ``download_snapshot_with_xet`` if XetSession is not available.
+
+        The new API provides a ``progress_callback`` that fires every 100ms
+        with actual per-chunk byte progress, replacing the broken 1-arg
+        ``progress_updater`` callback that only fires at file completion.
 
         Args:
             repo_id: HuggingFace repository ID.
@@ -457,6 +491,11 @@ class HfTracker:
             transfer_id: Pre-existing transfer ID.
             is_cancelled: Cancellation hook checked by the subprocess runner.
             force_download: Whether to force re-download even if files exist.
+            use_xet: If False, the subprocess worker sets
+                ``HF_HUB_DISABLE_XET=1`` before importing
+                ``huggingface_hub``, forcing HTTP download inside
+                the child. This allows runtime xet toggling without
+                restarting the app.
 
         Returns:
             Path to the local directory containing downloaded files.
@@ -465,8 +504,32 @@ class HfTracker:
             TransferCancelledError: If the transfer is cancelled.
             TransferProgressError: If the download fails.
         """
-        from .xet_download import download_snapshot_with_xet
+        from .xet_download import download_snapshot_with_xet, download_snapshot_with_xet_session
+        from .token import is_xet_available
 
+        # Try the new XetSession API first for smooth per-chunk progress
+        if use_xet and is_xet_available():
+            try:
+                import hf_xet
+                if hasattr(hf_xet, "XetSession"):
+                    return download_snapshot_with_xet_session(
+                        repo_id=repo_id,
+                        token=self._token,
+                        event_queue=self.event_queue,
+                        allow_patterns=allow_patterns,
+                        ignore_patterns=ignore_patterns,
+                        repo_type=repo_type,
+                        revision=revision,
+                        endpoint=self._endpoint,
+                        local_dir=local_dir,
+                        transfer_id=transfer_id,
+                        report_interval=self._report_interval,
+                        is_cancelled=is_cancelled,
+                    )
+            except ImportError:
+                pass  # Fall through to old API
+
+        # Fallback to old API
         return download_snapshot_with_xet(
             repo_id=repo_id,
             token=self._token,
@@ -481,6 +544,7 @@ class HfTracker:
             report_interval=self._report_interval,
             is_cancelled=is_cancelled,
             force_download=force_download,
+            use_xet=use_xet,
         )
 
     # ── Internal: Xet Upload Methods ──────────────────────────────

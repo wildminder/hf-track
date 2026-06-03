@@ -131,17 +131,45 @@ def _make_progress_callback(
     direction: str = "download",
     file_index: int = 0,
     total_files: int = 1,
+    report_interval: float = 0.1,
 ) -> Any:
     """Create a progress callback suitable for ``hf_xet`` detailed mode.
 
     The returned callable has the signature ``callback(total_update, item_updates)``
     which matches what the Rust runtime detects via ``inspect.signature()``.
+
+    Events are throttled by ``report_interval`` (seconds) and a minimum
+    byte delta (1% of total or 1 KiB, whichever is larger) to prevent
+    flooding the IPC queue and deadlocking the Rust runtime's background
+    feeder thread.
     """
     from .types import EventType, ProgressPhase, TransferDirection
 
     _start_time = time.time()
+    _last_emit_time: float = 0.0
+    _last_emit_bytes: int = 0
+    _first_event_emitted: bool = False
+
+    def _should_throttle(display_completed: int, total: int, now: float) -> bool:
+        """Return True if this event should be dropped to reduce IPC flooding."""
+        nonlocal _first_event_emitted, _last_emit_time, _last_emit_bytes
+        if not _first_event_emitted:
+            return False
+        if total > 0 and display_completed >= total:
+            return False
+        time_delta = now - _last_emit_time
+        if time_delta >= report_interval:
+            return False
+        bytes_delta = abs(display_completed - _last_emit_bytes)
+        if total > 0:
+            min_delta = max(total // 100, 1024)
+        else:
+            min_delta = 1024
+        return bytes_delta < min_delta
 
     def progress_updater(total_update, item_updates):
+        nonlocal _last_emit_time, _last_emit_bytes, _first_event_emitted
+
         # Check cancellation
         if cancel_event.is_set():
             from .types import TransferCancelledError
@@ -183,6 +211,11 @@ def _make_progress_callback(
                 estimated = min(estimated, int(total * 0.99))
             display_completed = estimated
 
+        # Throttle: skip IPC if too soon and too little change
+        now = time.time()
+        if _should_throttle(display_completed, total, now):
+            return
+
         percentage = ((display_completed / total * 100) if total > 0 else 0)
 
         event_dict = {
@@ -204,7 +237,11 @@ def _make_progress_callback(
         try:
             mp_queue.put_nowait(SubprocessMessage.event(event_dict))
         except BaseException:
-            pass  # Drop event if queue is full or closed
+            pass # Drop event if queue is full or closed
+
+        _last_emit_time = now
+        _last_emit_bytes = display_completed
+        _first_event_emitted = True
 
     return progress_updater
 
@@ -274,6 +311,7 @@ def _download_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: m
         mp_queue=mp_queue,
         cancel_event=cancel_event,
         direction="download",
+        report_interval=params.get("report_interval", 0.1),
     )
 
     try:
@@ -363,6 +401,7 @@ def _download_batch_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_ev
                 direction="download",
                 file_index=i,
                 total_files=total_files,
+                report_interval=params.get("report_interval", 0.1),
             )
         )
 
@@ -410,11 +449,25 @@ def _snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: m
     Args:
         params: Dict with keys: repo_id, token, repo_type, revision,
             local_dir, allow_patterns, ignore_patterns, endpoint,
-            transfer_id, report_interval, force_download.
+            transfer_id, report_interval, force_download, use_xet.
         mp_queue: Queue for sending SubprocessMessage back to main process.
         cancel_event: Event set by main process to signal cancellation.
     """
     _init_worker()
+
+    # ── Set xet env var BEFORE any huggingface_hub imports ──────────
+    # In a spawned child process, huggingface_hub.constants hasn't been
+    # imported yet, so the module-level constant HF_HUB_DISABLE_XET
+    # will be cached with the correct value when we import it below.
+    # This is critical: the main process cannot toggle this env var at
+    # runtime because huggingface_hub caches it at import time. But in
+    # a fresh child process, we can set it before the first import.
+    use_xet = params.get("use_xet", True)
+    if not use_xet:
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+    else:
+        os.environ.pop("HF_HUB_DISABLE_XET", None)
+
     from .types import EventType, ProgressPhase, TransferCancelledError, TransferDirection
     from .callbacks import DownloadProgressTqdm, _dummy_file, state_manager
     from .subprocess_messages import SubprocessMessage
@@ -513,6 +566,505 @@ def _snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: m
 
     except (KeyboardInterrupt, Exception) as e:
         _handle_worker_exception(mp_queue, e)
+    finally:
+        state_manager.clear_state(transfer_id)
+
+
+# ── New XetSession-based Snapshot Worker (Phase 2.J) ─────────────
+
+def _xet_session_snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: mp.Event) -> None:
+    """Snapshot download worker using the NEW ``hf_xet.XetSession`` API.
+
+    This replaces the broken ``huggingface_hub.snapshot_download()`` flow
+    (which uses a 1-arg ``progress_updater`` callback that only fires at
+    file completion) with the new ``XetSession`` API that has a
+    ``progress_callback`` firing every 100ms with actual per-chunk progress.
+
+    Key differences from ``_snapshot_worker``:
+    - Uses ``hf_xet.XetSession.new_file_download_group(progress_callback=...)``
+      instead of ``huggingface_hub.snapshot_download(tqdm_class=...)``.
+    - The progress callback receives ``(GroupProgressReport, dict[UniqueID, ItemProgressReport])``
+      and computes the increment from ``total_transfer_bytes_completed``.
+    - Smooth per-chunk progress: bar advances every ~100ms during file downloads.
+
+    Args:
+        params: Dict with keys: files (list of {filename, xet_hash, size, refresh_route}),
+            transfer_id, report_interval.
+        mp_queue: Queue for sending SubprocessMessage back to main process.
+        cancel_event: Event set by main process to signal cancellation.
+    """
+    _init_worker()
+
+    from .types import EventType, ProgressPhase, TransferCancelledError, TransferDirection
+    from .subprocess_messages import SubprocessMessage
+
+    transfer_id = params["transfer_id"]
+    files = params["files"]  # list of {"filename", "xet_hash", "size", "refresh_route"}
+    report_interval_ms = int(params.get("report_interval", 0.1) * 1000)
+    repo_id = params.get("repo_id", "snapshot")
+
+    try:
+        import hf_xet
+    except ImportError as e:
+        _safe_put(mp_queue, SubprocessMessage.error(
+            message=str(e), error_type="ImportError", retryable=False,
+        ))
+        return
+
+    if not hasattr(hf_xet, "XetSession"):
+        _safe_put(mp_queue, SubprocessMessage.error(
+            message="hf_xet.XetSession not available (requires hf_xet>=1.5.0).",
+            error_type="ImportError",
+            retryable=False,
+        ))
+        return
+
+    # State tracking
+    _start_time = time.time()
+    _last_transfer_completed = 0
+    _files_completed = 0
+    _total_transfer_bytes = 0
+    _total_logical_bytes = sum(f.get("size", 0) for f in files)
+    _last_logical_completed = 0
+
+    def _is_cancelled() -> bool:
+        return cancel_event.is_set()
+
+    def on_progress(group_report, item_reports):
+        """Progress callback for the new XetSession API.
+
+        Receives (GroupProgressReport, dict[UniqueID, ItemProgressReport]).
+        Computes the increment from total_transfer_bytes_completed and
+        emits a PROGRESS event via mp_queue.
+        """
+        nonlocal _last_transfer_completed, _files_completed, _total_transfer_bytes
+        nonlocal _last_logical_completed
+
+        if _is_cancelled():
+            return
+
+        current_transfer_completed = group_report.total_transfer_bytes_completed
+        current_logical_completed = group_report.total_bytes_completed
+        increment = current_transfer_completed - _last_transfer_completed
+        _last_transfer_completed = current_transfer_completed
+        _total_transfer_bytes = group_report.total_transfer_bytes
+
+        # Count files completed from item_reports
+        for uid, item in item_reports.items():
+            if item.bytes_completed >= item.total_bytes and item.total_bytes > 0:
+                # File just completed - will be counted in _check_file_completion
+                pass
+
+        # Use logical bytes for display so the percentage matches what the
+        # user expects ("I downloaded N% of the file"). Logical bytes advance
+        # in larger jumps at file boundaries but are more meaningful.
+        # Transfer bytes advance smoothly but are smaller than logical due
+        # to dedup — using them for percentage would make the bar never
+        # reach 100% for heavily-deduplicated files.
+        #
+        # However, we ALSO need smooth progress between file completions.
+        # Solution: use max(logical, transfer) as display value so we
+        # always show the user's view of progress.
+        if _total_logical_bytes > 0 and _total_transfer_bytes > 0:
+            # Estimate: how much logical content has been "transferred"?
+            # Ratio of logical to transfer (close to 1 for unique content).
+            logical_per_transfer = _total_logical_bytes / _total_transfer_bytes
+            estimated_logical_done = int(current_transfer_completed * logical_per_transfer)
+            display_completed = max(current_logical_completed, estimated_logical_done)
+        else:
+            display_completed = current_transfer_completed
+        display_total = _total_logical_bytes or _total_transfer_bytes
+
+        # Compute percentage
+        if display_total > 0:
+            display_percentage = (display_completed / display_total) * 100.0
+        else:
+            display_percentage = 0.0
+
+        # Skip if nothing meaningful changed (no new bytes in either domain)
+        bytes_change = (
+            (current_logical_completed - _last_logical_completed) +
+            (current_transfer_completed - _last_transfer_completed)
+        )
+        _last_logical_completed = current_logical_completed
+        if bytes_change <= 0 and not hasattr(on_progress, "_last_emit"):
+            return
+        if bytes_change <= 0 and on_progress._last_emit > 0:
+            return
+
+        # Emit PROGRESS event
+        # Throttle: skip if last emit was very recent
+        now = time.time()
+        if not hasattr(on_progress, "_last_emit"):
+            on_progress._last_emit = 0.0
+        if now - on_progress._last_emit < (report_interval_ms / 1000.0) * 0.5:
+            return
+        on_progress._last_emit = now
+
+        try:
+            event_dict = {
+                "event_type": EventType.PROGRESS.value,
+                "transfer_id": transfer_id,
+                "direction": TransferDirection.DOWNLOAD.value,
+                "filename": repo_id,
+                "phase": ProgressPhase.DOWNLOADING.value,
+                "bytes_completed": display_completed,
+                "total_bytes": display_total,
+                "percentage": display_percentage,
+                "speed": int(group_report.total_transfer_bytes_completion_rate or 0),
+                "file_index": _files_completed,
+                "total_files": len(files),
+            }
+            _safe_put(mp_queue, SubprocessMessage.event(event_dict))
+        except Exception:
+            pass
+
+    try:
+        session = hf_xet.XetSession()
+
+        # Use the refresh_route from the first file (they should all be the same repo)
+        first_file = files[0] if files else {}
+        refresh_route = first_file.get("refresh_route", "")
+
+        if not refresh_route:
+            _safe_put(mp_queue, SubprocessMessage.error(
+                message="No refresh_route provided for xet session",
+                error_type="ValueError",
+            ))
+            return
+
+        # Get xet connection info
+        try:
+            from huggingface_hub.utils._xet import refresh_xet_connection_info
+        except ImportError:
+            # Fallback: fetch directly
+            import httpx
+            token_resp = httpx.get(refresh_route)
+            token_data = token_resp.json()
+            cas_url = token_data["casUrl"]
+            token = token_data["accessToken"]
+            exp = token_data["exp"]
+        else:
+            # Use the high-level API
+            class _FileDataProxy:
+                __slots__ = ("file_hash", "refresh_route")
+                def __init__(self, fh, rr):
+                    self.file_hash = fh
+                    self.refresh_route = rr
+            proxy = _FileDataProxy(first_file.get("xet_hash", ""), refresh_route)
+            conn_info = refresh_xet_connection_info(file_data=proxy, headers={})
+            cas_url = conn_info.endpoint
+            token = conn_info.access_token
+            exp = conn_info.expiration_unix_epoch
+
+        # Create the download group with progress callback
+        group = session.new_file_download_group(
+            endpoint=cas_url,
+            token=token,
+            token_expiry_unix_secs=exp,
+            token_refresh_url=refresh_route,
+            token_refresh_headers={},
+            custom_headers={},
+            progress_callback=on_progress,
+            progress_interval_ms=report_interval_ms,
+        )
+
+        # Start downloads for all files
+        for f in files:
+            if _is_cancelled():
+                break
+            xet_hash = f.get("xet_hash")
+            size = f.get("size", 0)
+            dest_path = f.get("dest_path", "")
+            if not xet_hash or not dest_path:
+                continue
+            file_info = hf_xet.XetFileInfo(xet_hash, size)
+            group.start_download_file(file_info, dest_path)
+
+        # Wait for completion (or cancellation)
+        if not _is_cancelled():
+            report = group.wait_to_finish()
+        else:
+            try:
+                group.abort()
+            except Exception:
+                pass
+            raise TransferCancelledError("Download cancelled by user")
+
+        # Count completed files
+        _files_completed = len(files)
+
+        # Emit COMPLETE event
+        complete_bytes = _total_logical_bytes or _total_transfer_bytes
+        complete_event_dict = {
+            "event_type": EventType.COMPLETE.value,
+            "transfer_id": transfer_id,
+            "direction": TransferDirection.DOWNLOAD.value,
+            "filename": repo_id,
+            "phase": ProgressPhase.COMPLETE.value,
+            "bytes_completed": complete_bytes,
+            "total_bytes": complete_bytes,
+            "percentage": 100.0,
+            "speed": 0,
+            "file_index": _files_completed,
+            "total_files": len(files),
+        }
+        _safe_put(mp_queue, SubprocessMessage.event(complete_event_dict))
+
+        # Send result message
+        _safe_put(mp_queue, SubprocessMessage.result(
+            filename=repo_id,
+            destination_path=params.get("local_dir", ""),
+            transfer_id=transfer_id,
+            direction="download",
+            file_size=_total_logical_bytes,
+            bytes_completed=_total_logical_bytes,
+            total_bytes=_total_logical_bytes,
+            files_completed=_files_completed,
+            total_files=len(files),
+        ))
+
+    except (KeyboardInterrupt, Exception) as e:
+        _handle_worker_exception(mp_queue, e)
+
+
+# ── New XetSession-based Single File Worker (Phase 2.K) ─────────
+
+def _xet_session_download_worker(
+    params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: mp.Event
+) -> None:
+    """Single-file Xet download worker using the NEW ``hf_xet.XetSession`` API.
+
+    Replaces the broken ``hf_xet.download_files()`` flow (which only supports
+    a 1-arg ``progress_updater`` callback that fires at file completion in
+    hf_xet >= 1.0) with the new ``XetSession`` API that has a
+    ``progress_callback`` firing every 100ms with actual per-chunk progress.
+
+    Args:
+        params: Dict with keys: file_hash, file_size, dest_path, xet_file_data
+            (dict), token, endpoint, transfer_id, report_interval,
+            request_headers.
+        mp_queue: Queue for sending SubprocessMessage back to main process.
+        cancel_event: Event set by main process to signal cancellation.
+    """
+    _init_worker()
+
+    from .types import EventType, ProgressPhase, TransferCancelledError, TransferDirection
+    from .subprocess_messages import SubprocessMessage
+
+    transfer_id = params["transfer_id"]
+    filename = os.path.basename(params["dest_path"])
+    file_size = params["file_size"]
+    file_hash = params["file_hash"]
+    dest_path = params["dest_path"]
+
+    try:
+        import hf_xet
+    except ImportError as e:
+        _safe_put(mp_queue, SubprocessMessage.error(
+            message=str(e), error_type="ImportError", retryable=False,
+        ))
+        return
+
+    if not hasattr(hf_xet, "XetSession"):
+        # Fall back to old detailed-callback worker
+        kwargs = dict(
+            params,
+            filename=filename,
+            direction="download",
+        )
+        _download_worker(kwargs, mp_queue, cancel_event)
+        return
+
+    # Reconstruct XetFileData-like proxy for token refresh
+    xet_file_data_dict = params.get("xet_file_data", {})
+
+    def _is_cancelled() -> bool:
+        return cancel_event.is_set()
+
+    # State tracking
+    _start_time = time.time()
+    _last_transfer_completed = 0
+    _last_logical_completed = 0
+    _total_transfer_bytes = 0
+    _last_emit_time = 0.0
+    _first_event_emitted = False
+    report_interval_s = params.get("report_interval", 0.1)
+
+    def on_progress(group_report, item_reports):
+        """Progress callback for the new XetSession API."""
+        nonlocal _last_transfer_completed, _last_logical_completed
+        nonlocal _total_transfer_bytes, _last_emit_time, _first_event_emitted
+
+        if _is_cancelled():
+            return
+
+        current_transfer_completed = group_report.total_transfer_bytes_completed
+        current_logical_completed = group_report.total_bytes_completed
+        _total_transfer_bytes = group_report.total_transfer_bytes
+
+        # Decide which bytes to display. We want smooth progress (use
+        # transfer bytes) but the user expects the bar to reach 100% when
+        # the file is fully downloaded. Logical bytes reach the file size
+        # at completion; transfer bytes may be smaller due to dedup.
+        #
+        # Strategy: use logical bytes if they've advanced, otherwise use
+        # the transfer bytes * ratio estimate to give a smooth view.
+        if current_logical_completed > 0:
+            display_completed = current_logical_completed
+        else:
+            # Estimate logical from transfer rate
+            if _total_transfer_bytes > 0 and file_size > 0:
+                ratio = file_size / _total_transfer_bytes
+                display_completed = min(int(current_transfer_completed * ratio), file_size)
+            else:
+                display_completed = current_transfer_completed
+
+        display_total = file_size or _total_transfer_bytes
+        if display_total > 0:
+            display_percentage = (display_completed / display_total) * 100.0
+        else:
+            display_percentage = 0.0
+
+        # Always emit the first event, then throttle by time.
+        now = time.time()
+        bytes_change = (
+            (current_logical_completed - _last_logical_completed) +
+            (current_transfer_completed - _last_transfer_completed)
+        )
+        if not _first_event_emitted:
+            pass  # Always emit first
+        elif bytes_change <= 0:
+            return
+        elif now - _last_emit_time < report_interval_s:
+            return
+
+        _last_transfer_completed = current_transfer_completed
+        _last_logical_completed = current_logical_completed
+        _last_emit_time = now
+        _first_event_emitted = True
+
+        try:
+            event_dict = {
+                "event_type": EventType.PROGRESS.value,
+                "transfer_id": transfer_id,
+                "direction": TransferDirection.DOWNLOAD.value,
+                "filename": filename,
+                "phase": ProgressPhase.DOWNLOADING.value,
+                "bytes_completed": display_completed,
+                "total_bytes": display_total,
+                "percentage": display_percentage,
+                "speed": int(group_report.total_transfer_bytes_completion_rate or 0),
+                "file_index": 0,
+                "total_files": 1,
+                "transfer_bytes_completed": current_transfer_completed,
+                "transfer_bytes_total": _total_transfer_bytes,
+                "transfer_speed": int(group_report.total_transfer_bytes_completion_rate or 0),
+            }
+            _safe_put(mp_queue, SubprocessMessage.event(event_dict))
+        except Exception:
+            pass
+
+    try:
+        session = hf_xet.XetSession()
+
+        # Get xet connection info via huggingface_hub's helper
+        # (handles the proper URL/token flow)
+        try:
+            from huggingface_hub.utils._xet import (
+                XetFileData,
+                refresh_xet_connection_info,
+            )
+
+            # Use the refresh_route from the original XetFileData, or
+            # construct from the file's URL as a fallback.
+            xet_file_data = XetFileData(
+                file_hash=xet_file_data_dict.get("file_hash", file_hash),
+                refresh_route=xet_file_data_dict.get("refresh_route", ""),
+            )
+            ci = refresh_xet_connection_info(file_data=xet_file_data, headers={})
+            cas_url = ci.endpoint
+            token = ci.access_token
+            exp = ci.expiration_unix_epoch
+            refresh_route = xet_file_data.refresh_route
+        except Exception as e:
+            _safe_put(mp_queue, SubprocessMessage.error(
+                message=f"Failed to get xet credentials: {e}",
+                error_type=type(e).__name__,
+            ))
+            return
+
+        # Create the download group with progress callback
+        try:
+            group = session.new_file_download_group(
+                endpoint=cas_url,
+                token=token,
+                token_expiry_unix_secs=exp,
+                token_refresh_url=refresh_route,
+                token_refresh_headers={},
+                custom_headers={},
+                progress_callback=on_progress,
+                progress_interval_ms=int(report_interval_s * 1000),
+            )
+        except Exception as e:
+            # Some hf_xet versions may have different arg names; fall back
+            # to the old detailed-callback worker.
+            _safe_put(mp_queue, SubprocessMessage.error(
+                message=f"XetSession.new_file_download_group failed: {e}; "
+                f"falling back to old API",
+                error_type=type(e).__name__,
+            ))
+            kwargs = dict(params, filename=filename, direction="download")
+            _download_worker(kwargs, mp_queue, cancel_event)
+            return
+
+        # Start the file download
+        try:
+            file_info = hf_xet.XetFileInfo(file_hash, file_size)
+            group.start_download_file(file_info, dest_path)
+        except Exception as e:
+            _safe_put(mp_queue, SubprocessMessage.error(
+                message=f"Failed to start download: {e}",
+                error_type=type(e).__name__,
+            ))
+            return
+
+        # Wait for completion
+        if not _is_cancelled():
+            report = group.wait_to_finish()
+        else:
+            try:
+                group.abort()
+            except Exception:
+                pass
+            raise TransferCancelledError("Download cancelled by user")
+
+        # Emit COMPLETE event
+        complete_event_dict = {
+            "event_type": EventType.COMPLETE.value,
+            "transfer_id": transfer_id,
+            "direction": TransferDirection.DOWNLOAD.value,
+            "filename": filename,
+            "phase": ProgressPhase.COMPLETE.value,
+            "bytes_completed": file_size,
+            "total_bytes": file_size,
+            "percentage": 100.0,
+            "speed": 0,
+            "file_index": 0,
+            "total_files": 1,
+        }
+        _safe_put(mp_queue, SubprocessMessage.event(complete_event_dict))
+
+        # Send result message
+        _safe_put(mp_queue, SubprocessMessage.result(
+            filename=filename,
+            destination_path=dest_path,
+            file_size=file_size,
+            transfer_id=transfer_id,
+        ))
+
+    except (KeyboardInterrupt, Exception) as e:
+        _handle_worker_exception(mp_queue, e)
 
 
 # ── Upload Workers ────────────────────────────────────────────────
@@ -593,6 +1145,7 @@ def _upload_file_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event
         mp_queue=mp_queue,
         cancel_event=cancel_event,
         direction="upload",
+        report_interval=params.get("report_interval", 0.1),
     )
 
     try:
@@ -705,6 +1258,7 @@ def _upload_bytes_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_even
         mp_queue=mp_queue,
         cancel_event=cancel_event,
         direction="upload",
+        report_interval=params.get("report_interval", 0.1),
     )
 
     try:

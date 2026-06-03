@@ -86,6 +86,25 @@ class TestIsXetAvailable:
         is_xet_available()
         mock_find_spec.assert_not_called()
 
+    @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "0"})
+    def test_returns_false_when_hf_xet_in_sys_modules_without_spec(self):
+        """Returns False if hf_xet was injected into sys.modules without __spec__.
+
+        Regression for test pollution: some tests (e.g. test_sse.py web app
+        tests) import the web app which loads hf_xet. Other tests inject
+        MagicMock placeholders into sys.modules["hf_xet"] for mocking.
+        find_spec raises ValueError when __spec__ is missing; we must
+        treat this as "not available" rather than crashing.
+        """
+        # Use a plain object with no __spec__ attribute to simulate a
+        # module entry that lacks a valid import spec.
+        class _Placeholder:
+            pass
+
+        placeholder = _Placeholder()
+        with patch.dict("sys.modules", {"hf_xet": placeholder}):
+            assert is_xet_available() is False
+
 
 class TestXetCredentials:
     """Tests for XetCredentials dataclass."""

@@ -19,21 +19,18 @@ Endpoints:
 
 Xet toggle:
 The ``use_xet`` parameter controls whether Xet storage is used.
-When disabled, ``HF_HUB_DISABLE_XET=1`` is set in the endpoint
-handler (before the download thread is spawned) so that
-``is_xet_available()`` returns False and downloads route through
-standard HTTP. When enabled, the env var is cleared so Xet is
-available (with subprocess isolation via ``XetSubprocessRunner``).
+When disabled, the flag is passed through to the tracker methods,
+which forward it to the subprocess worker. The worker sets
+``HF_HUB_DISABLE_XET=1`` in the child process BEFORE importing
+``huggingface_hub``, so the library's cached constant reflects the
+correct value. This approach avoids the problem of the main process's
+``huggingface_hub.constants.HF_HUB_DISABLE_XET`` being cached at
+import time and ignoring runtime env var changes.
 
 Force re-download:
 The ``force_download`` parameter controls whether files are
 re-downloaded even if they already exist locally. When True,
 the tracker re-downloads all files regardless of cached copies.
-
-.. note:: ``HF_HUB_DISABLE_XET`` is a process-wide environment
-variable. Concurrent downloads with different ``use_xet`` settings
-may interfere. For a production app, use separate processes or
-a queue-based architecture.
 """
 from __future__ import annotations
 
@@ -130,14 +127,14 @@ def _do_download(
 ) -> None:
     """Download a single file — runs in a daemon thread.
 
-    The ``HF_HUB_DISABLE_XET`` env var is set by the endpoint handler
-    (before this thread is spawned), so the worker does not need to
-    modify it.
+    The ``use_xet`` flag is passed directly to the tracker method.
+    We do NOT set ``HF_HUB_DISABLE_XET`` in the main process because
+    ``huggingface_hub`` caches that env var at import time.
     """
     from hf_track.token import is_xet_available
     logger.info(
-        "file worker: use_xet=%s, is_xet_available=%s, HF_HUB_DISABLE_XET=%s",
-        use_xet, is_xet_available(), os.environ.get("HF_HUB_DISABLE_XET", "NOT SET"),
+        "file worker: use_xet=%s, is_xet_available=%s",
+        use_xet, is_xet_available(),
     )
 
     try:
@@ -147,6 +144,7 @@ def _do_download(
             repo_type=repo_type,
             local_dir=local_dir,
             transfer_id=transfer_id,
+            use_xet=use_xet,
             force_download=force_download,
         )
         if transfer_id in _active_transfers:
@@ -178,14 +176,14 @@ def _do_download_snapshot(
 ) -> None:
     """Download an entire repo (or filtered subset) — runs in a daemon thread.
 
-    The ``HF_HUB_DISABLE_XET`` env var is set by the endpoint handler
-    (before this thread is spawned), so the worker does not need to
-    modify it.
+    The ``use_xet`` flag is passed directly to the tracker method.
+    We do NOT set ``HF_HUB_DISABLE_XET`` in the main process because
+    ``huggingface_hub`` caches that env var at import time.
     """
     from hf_track.token import is_xet_available
     logger.info(
-        "snapshot worker: use_xet=%s, is_xet_available=%s, HF_HUB_DISABLE_XET=%s",
-        use_xet, is_xet_available(), os.environ.get("HF_HUB_DISABLE_XET", "NOT SET"),
+        "snapshot worker: use_xet=%s, is_xet_available=%s",
+        use_xet, is_xet_available(),
     )
 
     try:
@@ -196,6 +194,7 @@ def _do_download_snapshot(
             repo_type=repo_type,
             local_dir=local_dir,
             transfer_id=transfer_id,
+            use_xet=use_xet,
             force_download=force_download,
         )
         if transfer_id in _active_transfers:
@@ -237,6 +236,14 @@ async def start_download(
     If *use_xet* is False, forces standard HTTP download (no Xet).
     If *allow_patterns* is provided (snapshot only), only matching files are downloaded.
     If *force_download* is True, re-downloads files even if they already exist locally.
+
+    .. note:: The ``use_xet`` flag is passed directly to the tracker
+        methods. We do NOT set ``HF_HUB_DISABLE_XET`` in the main
+        process because ``huggingface_hub`` caches that env var at
+        import time — changing it at runtime has no effect on the
+        library's internal xet routing. Instead, the flag is forwarded
+        to the subprocess worker which sets the env var BEFORE
+        importing ``huggingface_hub`` in the child process.
     """
     transfer_id = str(uuid.uuid4())
     display_name = filename or f"{repo_id} (full repo)"
@@ -255,13 +262,12 @@ async def start_download(
     with _events_lock:
         _transfer_events[transfer_id] = []
 
-    # Set xet env var BEFORE spawning the download thread.
-    # This ensures is_xet_available() returns the correct value
-    # when tracker.download_snapshot() or tracker.download_file() checks it.
-    if not use_xet:
-        os.environ["HF_HUB_DISABLE_XET"] = "1"
-    else:
-        os.environ.pop("HF_HUB_DISABLE_XET", None)
+    # NOTE: We do NOT set HF_HUB_DISABLE_XET here. That env var is
+    # cached at import time by huggingface_hub.constants, so changing
+    # it in the main process has no effect on huggingface_hub's
+    # internal xet routing. Instead, the use_xet flag is passed
+    # through to the subprocess worker, which sets the env var
+    # BEFORE importing huggingface_hub in the child process.
 
     _cleanup_expired_transfers()
 
@@ -295,22 +301,24 @@ async def stream_events(transfer_id: str, request: Request):
 
     async def event_stream():
         cursor = 0
+        poll_count = 0
         while True:
             if await request.is_disconnected():
                 return
             # Read new events from the per-transfer buffer
             with _events_lock:
                 events = list(_transfer_events.get(transfer_id, []))
-            new_events = events[cursor:]
-            for event in new_events:
-                cursor += 1
-                yield {"data": json.dumps(event.to_dict())}
-                if event.event_type in (
-                    EventType.COMPLETE,
-                    EventType.ERROR,
-                    EventType.CANCELLED,
-                ):
-                    return
+                new_events = events[cursor:]
+            if new_events:
+                for event in new_events:
+                    cursor += 1
+                    yield {"data": json.dumps(event.to_dict())}
+                    if event.event_type in (
+                        EventType.COMPLETE,
+                        EventType.ERROR,
+                        EventType.CANCELLED,
+                    ):
+                        return
             # If the transfer is no longer running and we've sent all
             # its events, close the stream.
             transfer = _active_transfers.get(transfer_id, {})
@@ -319,6 +327,7 @@ async def stream_events(transfer_id: str, request: Request):
                 and not new_events
             ):
                 return
+            poll_count += 1
             await asyncio.sleep(0.1)
 
     return EventSourceResponse(event_stream())
