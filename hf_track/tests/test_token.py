@@ -6,7 +6,7 @@ import os
 import pytest
 from unittest.mock import MagicMock, patch
 
-from hf_track.token import XetCredentials, XetTokenManager, is_xet_available
+from hf_track.token import XetCredentials, XetTokenManager, is_xet_available, has_xet_session
 
 
 class TestIsXetAvailable:
@@ -237,3 +237,72 @@ class TestXetTokenManager:
                     file_data=mock_file_data,
                     headers={"Authorization": "Bearer hf_test"},
                 )
+
+
+class TestHasXetSession:
+    """Tests for has_xet_session function.
+
+    The ``has_xet_session`` helper detects whether the new
+    ``hf_xet.XetSession`` API is available (requires hf_xet >= 1.5.0).
+    This is the ONLY API that gives smooth per-chunk progress on
+    snapshot downloads. The old ``hf_xet.download_files`` API only
+    fires its progress callback at file completion.
+    """
+
+    @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "1"})
+    def test_returns_false_when_xet_is_disabled_by_env(self):
+        """Should return False if HF_HUB_DISABLE_XET is set."""
+        assert has_xet_session() is False
+
+    @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "0"})
+    @patch("importlib.util.find_spec")
+    def test_returns_false_when_hf_xet_not_installed(self, mock_find_spec):
+        """Should return False if hf_xet is not findable."""
+        mock_find_spec.return_value = None
+        assert has_xet_session() is False
+
+    @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "0"})
+    @patch("importlib.util.find_spec")
+    def test_returns_true_when_hf_xet_with_xetsession(self, mock_find_spec):
+        """Should return True when hf_xet.XetSession is available."""
+        # Mock the find_spec result for hf_xet (package spec)
+        mock_spec = MagicMock()
+        mock_spec.submodule_search_locations = ["some/path"]
+        mock_find_spec.return_value = mock_spec
+        # Mock hf_xet module to have XetSession attribute
+        mock_hf_xet = MagicMock()
+        mock_hf_xet.XetSession = MagicMock()
+        with patch.dict("sys.modules", {"hf_xet": mock_hf_xet}):
+            assert has_xet_session() is True
+
+    @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "0"})
+    @patch("importlib.util.find_spec")
+    def test_returns_false_when_hf_xet_without_xetsession(self, mock_find_spec):
+        """Should return False when hf_xet is installed but XetSession is missing."""
+        # Mock find_spec result for hf_xet
+        mock_spec = MagicMock()
+        mock_spec.submodule_search_locations = ["some/path"]
+        mock_find_spec.return_value = mock_spec
+        # Mock hf_xet module WITHOUT XetSession attribute (old version)
+        mock_hf_xet = MagicMock(spec=[])  # no attributes
+        del mock_hf_xet.XetSession  # ensure attribute doesn't exist
+        with patch.dict("sys.modules", {"hf_xet": mock_hf_xet}):
+            assert has_xet_session() is False
+
+    @patch.dict(os.environ, {"HF_HUB_DISABLE_XET": "0"})
+    @patch("importlib.util.find_spec")
+    def test_returns_false_when_import_raises(self, mock_find_spec):
+        """Should return False (not crash) if importing hf_xet raises."""
+        # find_spec returns a spec, but actual import fails
+        mock_spec = MagicMock()
+        mock_spec.submodule_search_locations = ["some/path"]
+        mock_find_spec.return_value = mock_spec
+
+        # Make `import hf_xet` fail by injecting a bad module
+        class _BrokenModule:
+            def __getattr__(self, name):
+                raise ImportError("simulated import failure")
+
+        with patch.dict("sys.modules", {"hf_xet": _BrokenModule()}):
+            # Even if XetSession attribute access fails, function should return False
+            assert has_xet_session() is False

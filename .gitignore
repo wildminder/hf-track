@@ -32,5 +32,10 @@ Thumbs.db
 _backup/
 tmp/
 
+# Downloaded model files (output from examples)
+downloads/
+hf_track/examples/downloads/
+
 # desloppify local state
 .desloppify/
+downloads/

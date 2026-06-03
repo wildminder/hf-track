@@ -687,19 +687,40 @@ def download_snapshot_with_xet_session(
     report_interval: float = 0.1,
     is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> str:
-    """Download a repository snapshot using the NEW ``hf_xet.XetSession`` API.
+    """Download a repository snapshot — DEPRECATED: delegates to ``download_snapshot_with_xet``.
 
-    This replaces the broken ``huggingface_hub.snapshot_download()`` flow
-    (which uses a 1-arg ``progress_updater`` callback that only fires at
-    file completion) with the new ``XetSession`` API that has a
-    ``progress_callback`` firing every 100ms with actual per-chunk progress.
+    .. deprecated::
+        This function used to implement a snapshot downloader on top of
+        the new ``hf_xet.XetSession`` API. That implementation was found
+        to have three critical correctness bugs (2026-06-03):
 
-    Key differences from ``download_snapshot_with_xet``:
-    - Uses ``hf_xet.XetSession.new_file_download_group(progress_callback=...)``
-      instead of ``huggingface_hub.snapshot_download(tqdm_class=...)``.
-    - The progress callback receives ``(GroupProgressReport, dict[UniqueID, ItemProgressReport])``
-      and computes the increment from ``total_transfer_bytes_completed``.
-    - Smooth per-chunk progress: bar advances every ~100ms during file downloads.
+        1. Nested folder layout (``local_dir/VoxCPM-0.5B/<files>`` instead
+           of ``local_dir/<files>``) caused by incorrect path parsing of
+           ``HfFileSystem.ls()`` output.
+        2. Missing files: only 2 of 13 files were downloaded because
+           (a) ``fs.ls()`` is non-recursive by default (misses
+           subdirectories like ``assets/``) and (b) files without
+           ``xet_hash`` (regular LFS files like ``config.json``,
+           ``tokenizer.json``) were explicitly skipped.
+        3. Zero-length files on disk after cancel because the new
+           API does not pre-cleanup or use atomic tmp-file + rename
+           semantics.
+
+        The new ``XetSession`` API is fundamentally a single-session,
+        single-batch primitive that does not provide the mixed
+        xet/non-xet routing, subdirectory traversal, or cache-aware
+        resume that snapshot downloads require. Re-implementing
+        ``huggingface_hub.snapshot_download`` from scratch to work
+        around these limitations would duplicate hundreds of lines
+        of complex, battle-tested code and introduce more bugs.
+
+        This function now delegates to ``download_snapshot_with_xet``,
+        which uses ``huggingface_hub.snapshot_download()`` in an
+        isolated subprocess (so ``hf_xet`` is still loaded only in
+        the child for safe termination). The progress is per-file
+        rather than per-chunk, which is the trade-off for correctness.
+
+        See: ``docs/plans/2026-06-03-revert-broken-snapshot-xetsession-path.md``
 
     Args:
         repo_id: HuggingFace repository ID.
@@ -719,192 +740,30 @@ def download_snapshot_with_xet_session(
         Path to the local directory containing downloaded files.
 
     Raises:
-        ImportError: If hf_xet is not installed or XetSession not available.
+        ImportError: If hf_xet is not installed.
         TransferCancelledError: If the transfer is cancelled.
         TransferProgressError: If the download fails.
     """
-    if not is_xet_available():
-        raise ImportError("hf_xet is not installed.")
-
-    # Check if XetSession is available (requires hf_xet >= 1.5.0)
-    try:
-        import hf_xet
-        if not hasattr(hf_xet, "XetSession"):
-            raise ImportError("hf_xet.XetSession not available (requires hf_xet>=1.5.0)")
-    except ImportError as e:
-        raise ImportError(f"hf_xet.XetSession not available: {e}")
-
-    transfer_id = transfer_id or generate_transfer_id()
-
-    # Get the list of files with xet hashes from the repo
-    from huggingface_hub import HfFileSystem
-    fs = HfFileSystem()
-
-    # Build the repo path
-    if repo_type == "model":
-        prefix = f"models/{repo_id}"
-    elif repo_type == "dataset":
-        prefix = f"datasets/{repo_id}"
-    elif repo_type == "space":
-        prefix = f"spaces/{repo_id}"
-    else:
-        prefix = f"{repo_type}s/{repo_id}"
-
-    if revision:
-        prefix = f"{prefix}@{revision}"
-
-    # List all files
-    try:
-        all_files = fs.ls(prefix, detail=True)
-    except Exception as e:
-        raise TransferProgressError(f"Failed to list files in {repo_id}: {e}")
-
-    # Filter by patterns
-    import fnmatch
-    def matches_patterns(name: str) -> bool:
-        if allow_patterns:
-            if not any(fnmatch.fnmatch(name, p) for p in allow_patterns):
-                return False
-        if ignore_patterns:
-            if any(fnmatch.fnmatch(name, p) for p in ignore_patterns):
-                return False
-        return True
-
-    # Filter to files only (not directories) and apply patterns
-    xet_files = []
-    for f in all_files:
-        if f.get("type") != "file":
-            continue
-        # Get relative path
-        full_name = f.get("name", "")
-        if "/" in full_name.replace("\\", "/"):
-            rel_name = full_name.split("/", 1)[1] if "/" in full_name else full_name
-            # Handle @revision in path
-            if "@" in rel_name:
-                rel_name = rel_name.split("@", 1)[0]
-        else:
-            rel_name = full_name
-        if not matches_patterns(rel_name):
-            continue
-        xet_hash = f.get("xet_hash")
-        if not xet_hash:
-            continue  # Skip non-xet files for now
-        size = f.get("size", 0)
-        # Build destination path
-        if local_dir:
-            dest = os.path.join(local_dir, rel_name)
-        else:
-            dest = os.path.join(os.getcwd(), rel_name)
-        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
-        xet_files.append({
-            "filename": rel_name,
-            "xet_hash": xet_hash,
-            "size": size,
-            "dest_path": dest,
-            "refresh_route": f"https://huggingface.co/api/{repo_type}s/{repo_id}/xet-read-token/{revision or 'main'}",
-        })
-
-    if not xet_files:
-        # No xet files found, fall back to old method
-        return download_snapshot_with_xet(
-            repo_id=repo_id,
-            token=token,
-            event_queue=event_queue,
-            allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-            repo_type=repo_type,
-            revision=revision,
-            endpoint=endpoint,
-            local_dir=local_dir,
-            transfer_id=transfer_id,
-            report_interval=report_interval,
-            is_cancelled=is_cancelled,
-            use_xet=True,
-        )
-
-    # Emit START event from main process
-    event_queue.put(
-        ProgressEvent(
-            event_type=EventType.START,
-            transfer_id=transfer_id,
-            direction=TransferDirection.DOWNLOAD,
-            filename=repo_id,
-            phase=ProgressPhase.DOWNLOADING,
-            total_bytes=sum(f["size"] for f in xet_files),
-        )
-    )
-
-    params = {
-        "files": xet_files,
-        "transfer_id": transfer_id,
-        "report_interval": report_interval,
-        "repo_id": repo_id,
-        "local_dir": local_dir or "",
-    }
-
-    runner = XetSubprocessRunner()
-    runner.start(
-        worker_func=_xet_session_snapshot_worker,
-        params=params,
+    # Delegate to the proven path that uses
+    # ``huggingface_hub.snapshot_download`` in an isolated subprocess.
+    # This correctly handles:
+    # - Mixed xet/non-xet files (huggingface_hub routes per-file)
+    # - Subdirectories (huggingface_hub.snapshot_download walks them)
+    # - Cache-aware resume (etag-based, tmp-file + rename atomic)
+    # - Subprocess isolation (xet is loaded only in the child)
+    # - Cancellation (terminate the child process)
+    return download_snapshot_with_xet(
+        repo_id=repo_id,
+        token=token,
         event_queue=event_queue,
+        allow_patterns=allow_patterns,
+        ignore_patterns=ignore_patterns,
+        repo_type=repo_type,
+        revision=revision,
+        endpoint=endpoint,
+        local_dir=local_dir,
+        transfer_id=transfer_id,
+        report_interval=report_interval,
+        is_cancelled=is_cancelled,
+        use_xet=True,
     )
-
-    try:
-        while True:
-            result = runner.wait(timeout=1.0)
-            if result is not None:
-                break
-            if is_cancelled is not None and is_cancelled():
-                runner.terminate()
-                event_queue.put(
-                    ProgressEvent.cancelled_event(
-                        transfer_id=transfer_id,
-                        direction=TransferDirection.DOWNLOAD,
-                        filename=repo_id,
-                    )
-                )
-                raise TransferCancelledError("Snapshot download cancelled by user")
-
-        if result.get("status") == "success":
-            return result.get("destination_path", local_dir or repo_id)
-        elif (
-            result.get("status") == "cancelled"
-            or result.get("error_type") == "TransferCancelledError"
-            or "cancelled" in result.get("message", "").lower()
-            or "interrupted" in result.get("message", "").lower()
-        ):
-            raise TransferCancelledError(result.get("message", "Snapshot download cancelled by user"))
-        else:
-            error_msg = result.get("message", "Snapshot download failed")
-            raise TransferProgressError(error_msg)
-
-    except KeyboardInterrupt:
-        runner.terminate()
-        event_queue.put(
-            ProgressEvent.cancelled_event(
-                transfer_id=transfer_id,
-                direction=TransferDirection.DOWNLOAD,
-                filename=repo_id,
-            )
-        )
-        raise TransferCancelledError("Snapshot download interrupted by user (Ctrl+C)")
-    except TransferCancelledError:
-        raise
-    except TransferProgressError:
-        raise
-    except Exception as e:
-        runner.terminate()
-        event_queue.put(
-            ProgressEvent(
-                event_type=EventType.ERROR,
-                transfer_id=transfer_id,
-                direction=TransferDirection.DOWNLOAD,
-                filename=repo_id,
-                phase=ProgressPhase.ERROR,
-                error=TransferError(message=str(e), error_type=type(e).__name__),
-            )
-        )
-        raise
-    finally:
-        runner.terminate()
-        state_manager.clear_state(transfer_id)

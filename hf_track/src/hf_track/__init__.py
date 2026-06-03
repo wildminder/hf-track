@@ -68,7 +68,7 @@ from .callbacks import (
 )
 
 # Token management
-from .token import XetCredentials, XetTokenManager, is_xet_available
+from .token import XetCredentials, XetTokenManager, is_xet_available, has_xet_session
 
 # Subprocess isolation
 from .subprocess_runner import XetSubprocessRunner
@@ -99,6 +99,7 @@ __all__ = [
     "XetCredentials",
     "XetTokenManager",
     "is_xet_available",
+    "has_xet_session",
     # Subprocess isolation
     "XetSubprocessRunner",
     "SubprocessMessage",

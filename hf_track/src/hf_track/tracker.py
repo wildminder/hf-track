@@ -504,32 +504,28 @@ class HfTracker:
             TransferCancelledError: If the transfer is cancelled.
             TransferProgressError: If the download fails.
         """
-        from .xet_download import download_snapshot_with_xet, download_snapshot_with_xet_session
-        from .token import is_xet_available
+        from .xet_download import download_snapshot_with_xet
 
-        # Try the new XetSession API first for smooth per-chunk progress
-        if use_xet and is_xet_available():
-            try:
-                import hf_xet
-                if hasattr(hf_xet, "XetSession"):
-                    return download_snapshot_with_xet_session(
-                        repo_id=repo_id,
-                        token=self._token,
-                        event_queue=self.event_queue,
-                        allow_patterns=allow_patterns,
-                        ignore_patterns=ignore_patterns,
-                        repo_type=repo_type,
-                        revision=revision,
-                        endpoint=self._endpoint,
-                        local_dir=local_dir,
-                        transfer_id=transfer_id,
-                        report_interval=self._report_interval,
-                        is_cancelled=is_cancelled,
-                    )
-            except ImportError:
-                pass  # Fall through to old API
-
-        # Fallback to old API
+        # Use the proven path: ``huggingface_hub.snapshot_download``
+        # running in an isolated subprocess (so ``hf_xet`` is loaded
+        # only in the child for safe termination).
+        #
+        # The new ``hf_xet.XetSession`` API was tried (see plan
+        # ``2026-06-03-migrate-snapshot-to-xetsession-api.md``) but
+        # had three critical correctness bugs:
+        #   1. Nested folder layout in destination path
+        #   2. Missing files (non-xet files and subdirectory contents)
+        #   3. Zero-length partial files on cancel
+        # The new API is fundamentally a single-batch primitive that
+        # does not provide the mixed xet/non-xet routing, subdirectory
+        # traversal, or cache-aware resume that snapshot downloads
+        # require. See plan
+        # ``2026-06-03-revert-broken-snapshot-xetsession-path.md``.
+        #
+        # ``use_xet`` is passed through so the child subprocess can
+        # set ``HF_HUB_DISABLE_XET=1`` to force HTTP downloads for
+        # the no-xet case (allows runtime xet toggling without
+        # restarting the app).
         return download_snapshot_with_xet(
             repo_id=repo_id,
             token=self._token,

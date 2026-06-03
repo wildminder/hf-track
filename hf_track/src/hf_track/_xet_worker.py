@@ -81,6 +81,95 @@ def _handle_worker_exception(mp_queue: mp.Queue, e: BaseException) -> None:
         pass
 
 
+# ── Progress Throttler (shared by all xet workers) ───────────────
+
+
+class _ProgressThrottler:
+    """Time + byte-delta based throttling for progress events.
+
+    Used by both the legacy ``_make_progress_callback`` (2-arg mode) and
+    the new ``XetSession`` API callback (``_xet_session_snapshot_worker``
+    and ``_xet_session_download_worker``).
+
+    Behavior:
+        - The first event is always emitted (regardless of value).
+        - Subsequent events are throttled by:
+            * Time elapsed since last emit (``report_interval`` seconds)
+            * OR byte delta since last emit (1% of total or 1 KiB,
+              whichever is larger)
+        - The completion event (display >= total) is always emitted,
+            so the user always sees 100% at the end.
+        - ``record_emit()`` must be called after each successful emit
+            to update internal state.
+
+    .. note::
+
+        Previous throttling used function-attribute hacks
+        (``on_progress._last_emit``) which had a subtle bug: the first
+        call with no byte change would be silently dropped, and the
+        first call with a non-zero byte change would have
+        ``_last_emit = 0.0`` set, then any subsequent call with
+        ``bytes_change <= 0`` would also be dropped. This caused the
+        progress bar to never update.
+
+        See: 2026-06-03 plan "migrate-snapshot-to-xetsession-api".
+
+    Args:
+        report_interval: Minimum seconds between consecutive emits.
+        min_bytes_delta: Minimum byte delta to bypass time throttling
+            (default: 1% of total or 1 KiB, whichever is larger — set
+            in ``should_emit``).
+    """
+
+    def __init__(self, report_interval: float = 0.1):
+        self._report_interval = max(0.0, report_interval)
+        self._last_emit_time: float = 0.0
+        self._last_emit_value: int = 0
+        self._first_event_emitted: bool = False
+
+    def should_emit(self, current_value: int, total: int, now: float) -> bool:
+        """Return True if a progress event should be emitted.
+
+        Args:
+            current_value: Current bytes_completed (or display value).
+            total: Total bytes expected.
+            now: Current time (typically ``time.time()``).
+        """
+        # First event: always emit
+        if not self._first_event_emitted:
+            return True
+        # Completion: always emit (so user sees 100%)
+        if total > 0 and current_value >= total:
+            return True
+        # Time throttle
+        time_delta = now - self._last_emit_time
+        if time_delta >= self._report_interval:
+            return True
+        # Byte delta throttle
+        bytes_delta = abs(current_value - self._last_emit_value)
+        min_bytes_delta = max(total // 100, 1024) if total > 0 else 1024
+        if bytes_delta >= min_bytes_delta:
+            return True
+        # Both throttled — skip
+        return False
+
+    def record_emit(self, current_value: int, now: float) -> None:
+        """Record that an event was emitted.
+
+        Updates internal state so subsequent ``should_emit`` calls
+        correctly throttle.
+        """
+        self._last_emit_time = now
+        self._last_emit_value = current_value
+        self._first_event_emitted = True
+
+    def reset(self) -> None:
+        """Reset throttler state (for reuse in new transfers)."""
+        self._last_emit_time = 0.0
+        self._last_emit_value = 0
+        self._first_event_emitted = False
+
+
 # ── Serialization Helpers ────────────────────────────────────────
 
 def _serialize_xet_file_data(xet_file_data: Any) -> Dict[str, Any]:
@@ -570,22 +659,52 @@ def _snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: m
         state_manager.clear_state(transfer_id)
 
 
-# ── New XetSession-based Snapshot Worker (Phase 2.J) ─────────────
+# ── New XetSession-based Snapshot Worker (DEPRECATED 2026-06-03) ──
+
 
 def _xet_session_snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: mp.Event) -> None:
     """Snapshot download worker using the NEW ``hf_xet.XetSession`` API.
 
-    This replaces the broken ``huggingface_hub.snapshot_download()`` flow
-    (which uses a 1-arg ``progress_updater`` callback that only fires at
-    file completion) with the new ``XetSession`` API that has a
-    ``progress_callback`` firing every 100ms with actual per-chunk progress.
+    .. deprecated::
+        This worker is **deprecated** as of 2026-06-03. It is no longer
+        used by the public ``download_snapshot_with_xet_session`` API
+        (which now delegates to the proven ``_snapshot_worker``).
 
-    Key differences from ``_snapshot_worker``:
-    - Uses ``hf_xet.XetSession.new_file_download_group(progress_callback=...)``
-      instead of ``huggingface_hub.snapshot_download(tqdm_class=...)``.
-    - The progress callback receives ``(GroupProgressReport, dict[UniqueID, ItemProgressReport])``
-      and computes the increment from ``total_transfer_bytes_completed``.
-    - Smooth per-chunk progress: bar advances every ~100ms during file downloads.
+        The worker had three critical correctness bugs:
+
+        1. **Nested folder layout**: ``HfFileSystem.ls()`` returns
+           names like ``openbmb/VoxCPM-0.5B/README.md`` (no ``models/``
+           prefix). The original path parsing did
+           ``full_name.split("/", 1)[1]`` which only stripped one
+           segment, leaving ``VoxCPM-0.5B/README.md`` in the relative
+           path. Result: every file written to
+           ``<local_dir>/VoxCPM-0.5B/<file>`` instead of
+           ``<local_dir>/<file>``.
+
+        2. **Missing files**: ``fs.ls(...)`` was non-recursive (so
+           files in subdirectories like ``assets/`` were missed), and
+           files without ``xet_hash`` (regular LFS files like
+           ``config.json``, ``tokenizer.json``) were explicitly
+           skipped.
+
+        3. **Zero-length files on cancel**: ``group.start_download_file()``
+           creates the destination file with no pre-cleanup, and the
+           xet runtime does not use atomic tmp-file + rename. Cancelling
+           leaves 0-byte files on disk; the next run sees the file
+           "exists" and skips re-downloading.
+
+        The new ``XetSession`` API is fundamentally a single-session,
+        single-batch primitive that does not provide the mixed
+        xet/non-xet routing, subdirectory traversal, or cache-aware
+        resume that snapshot downloads require.
+
+        Use ``_snapshot_worker`` instead. See plan
+        ``docs/plans/2026-06-03-revert-broken-snapshot-xetsession-path.md``.
+
+    Note:
+        Kept in the codebase to maintain backward compatibility for
+        any direct callers, and to allow future re-implementation if
+        a use case justifies the complexity.
 
     Args:
         params: Dict with keys: files (list of {filename, xet_hash, size, refresh_route}),
@@ -625,7 +744,12 @@ def _xet_session_snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, can
     _files_completed = 0
     _total_transfer_bytes = 0
     _total_logical_bytes = sum(f.get("size", 0) for f in files)
-    _last_logical_completed = 0
+    # Use the shared throttler (Phase 6) for cleaner, testable throttling.
+    # The new XetSession API fires the callback every progress_interval_ms,
+    # but we only forward to mp_queue at the requested rate.
+    _throttler = _ProgressThrottler(
+        report_interval=max(0.05, params.get("report_interval", 0.1) / 2.0),
+    )
 
     def _is_cancelled() -> bool:
         return cancel_event.is_set()
@@ -634,45 +758,46 @@ def _xet_session_snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, can
         """Progress callback for the new XetSession API.
 
         Receives (GroupProgressReport, dict[UniqueID, ItemProgressReport]).
-        Computes the increment from total_transfer_bytes_completed and
-        emits a PROGRESS event via mp_queue.
+        Computes the display value from total_transfer_bytes_completed
+        (smoother) and total_bytes_completed (more accurate, but jumps
+        at file boundaries) and emits a throttled PROGRESS event via
+        mp_queue.
+
+        Phase 5 (2026-06-03): Throttling logic rewritten to use the
+        ``_ProgressThrottler`` class. Previous implementation had a
+        subtle bug where the first event with no byte change was
+        silently dropped, and subsequent events with no byte change
+        were also dropped. This caused the progress bar to never
+        update. Now the first event is ALWAYS emitted, and subsequent
+        events are throttled by time and byte delta.
         """
-        nonlocal _last_transfer_completed, _files_completed, _total_transfer_bytes
-        nonlocal _last_logical_completed
+        nonlocal _last_transfer_completed, _files_completed
+        nonlocal _total_transfer_bytes
 
         if _is_cancelled():
             return
 
         current_transfer_completed = group_report.total_transfer_bytes_completed
         current_logical_completed = group_report.total_bytes_completed
-        increment = current_transfer_completed - _last_transfer_completed
         _last_transfer_completed = current_transfer_completed
         _total_transfer_bytes = group_report.total_transfer_bytes
 
-        # Count files completed from item_reports
-        for uid, item in item_reports.items():
-            if item.bytes_completed >= item.total_bytes and item.total_bytes > 0:
-                # File just completed - will be counted in _check_file_completion
-                pass
-
-        # Use logical bytes for display so the percentage matches what the
-        # user expects ("I downloaded N% of the file"). Logical bytes advance
-        # in larger jumps at file boundaries but are more meaningful.
-        # Transfer bytes advance smoothly but are smaller than logical due
-        # to dedup — using them for percentage would make the bar never
-        # reach 100% for heavily-deduplicated files.
-        #
-        # However, we ALSO need smooth progress between file completions.
-        # Solution: use max(logical, transfer) as display value so we
-        # always show the user's view of progress.
+        # Build the display value:
+        # - `total_bytes_completed` advances only at file boundaries (jumpy)
+        # - `total_transfer_bytes_completed` advances per-chunk (smooth)
+        #   but can be < total_logical_bytes due to dedup
+        # We want: smooth per-chunk + reach 100% at the end.
+        # Use max() of the two, which gives us the higher of the
+        # chunked/transfer view vs the file-boundary/logical view.
         if _total_logical_bytes > 0 and _total_transfer_bytes > 0:
             # Estimate: how much logical content has been "transferred"?
-            # Ratio of logical to transfer (close to 1 for unique content).
+            # Ratio of logical to transfer (close to 1 for unique content,
+            # > 1 for deduplicated content).
             logical_per_transfer = _total_logical_bytes / _total_transfer_bytes
             estimated_logical_done = int(current_transfer_completed * logical_per_transfer)
             display_completed = max(current_logical_completed, estimated_logical_done)
         else:
-            display_completed = current_transfer_completed
+            display_completed = max(current_logical_completed, current_transfer_completed)
         display_total = _total_logical_bytes or _total_transfer_bytes
 
         # Compute percentage
@@ -681,25 +806,19 @@ def _xet_session_snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, can
         else:
             display_percentage = 0.0
 
-        # Skip if nothing meaningful changed (no new bytes in either domain)
-        bytes_change = (
-            (current_logical_completed - _last_logical_completed) +
-            (current_transfer_completed - _last_transfer_completed)
-        )
-        _last_logical_completed = current_logical_completed
-        if bytes_change <= 0 and not hasattr(on_progress, "_last_emit"):
-            return
-        if bytes_change <= 0 and on_progress._last_emit > 0:
-            return
+        # Count files completed by counting items that reached their total.
+        files_done_now = 0
+        for uid, item in item_reports.items():
+            if item.total_bytes > 0 and item.bytes_completed >= item.total_bytes:
+                files_done_now += 1
+        if files_done_now > _files_completed:
+            _files_completed = files_done_now
 
-        # Emit PROGRESS event
-        # Throttle: skip if last emit was very recent
+        # Throttle: always emit first event, then by time/byte delta.
         now = time.time()
-        if not hasattr(on_progress, "_last_emit"):
-            on_progress._last_emit = 0.0
-        if now - on_progress._last_emit < (report_interval_ms / 1000.0) * 0.5:
+        if not _throttler.should_emit(display_completed, display_total, now):
             return
-        on_progress._last_emit = now
+        _throttler.record_emit(display_completed, now)
 
         try:
             event_dict = {
@@ -714,6 +833,9 @@ def _xet_session_snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, can
                 "speed": int(group_report.total_transfer_bytes_completion_rate or 0),
                 "file_index": _files_completed,
                 "total_files": len(files),
+                "transfer_bytes_completed": current_transfer_completed,
+                "transfer_bytes_total": _total_transfer_bytes,
+                "transfer_speed": int(group_report.total_transfer_bytes_completion_rate or 0),
             }
             _safe_put(mp_queue, SubprocessMessage.event(event_dict))
         except Exception:
@@ -781,14 +903,52 @@ def _xet_session_snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, can
             file_info = hf_xet.XetFileInfo(xet_hash, size)
             group.start_download_file(file_info, dest_path)
 
-        # Wait for completion (or cancellation)
-        if not _is_cancelled():
-            report = group.wait_to_finish()
-        else:
-            try:
-                group.abort()
-            except Exception:
-                pass
+        # Wait for completion with cancellation polling.
+        # The new XetSession API has group.wait_to_finish() which blocks
+        # until all downloads complete. It does NOT support timeout or
+        # cancellation. We need to watch cancel_event in a side thread
+        # and call group.abort() if cancellation is requested.
+        # (Phase 5.4: cancellation poller for XetSession group.)
+        import threading as _threading
+        _abort_triggered = _threading.Event()
+
+        def _cancellation_watcher():
+            """Watch cancel_event; if set, call group.abort()."""
+            while not _abort_triggered.is_set():
+                if _is_cancelled():
+                    try:
+                        group.abort()
+                    except Exception:
+                        pass
+                    return
+                # Poll at ~10 Hz. cancel_event.is_set() is fast.
+                _abort_triggered.wait(timeout=0.1)
+                if _abort_triggered.is_set():
+                    return
+
+        watcher_thread = _threading.Thread(
+            target=_cancellation_watcher,
+            name=f"xet-session-cancel-watcher-{transfer_id[:8]}",
+            daemon=True,
+        )
+        watcher_thread.start()
+
+        try:
+            if not _is_cancelled():
+                # Block until all downloads complete or abort is called
+                report = group.wait_to_finish()
+            else:
+                try:
+                    group.abort()
+                except Exception:
+                    pass
+                raise TransferCancelledError("Download cancelled by user")
+        finally:
+            _abort_triggered.set()
+            watcher_thread.join(timeout=0.5)
+
+        # If cancellation was triggered, raise cleanly
+        if _is_cancelled():
             raise TransferCancelledError("Download cancelled by user")
 
         # Count completed files

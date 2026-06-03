@@ -14,6 +14,7 @@ from hf_track._xet_worker import (
     _download_batch_worker,
     _download_worker,
     _make_progress_callback,
+    _ProgressThrottler,
     _serialize_xet_file_data,
     _snapshot_worker,
     _upload_bytes_worker,
@@ -61,6 +62,94 @@ class TestXetFileDataSerialization:
         restored = _deserialize_xet_file_data(serialized)
         assert restored.file_hash == "xyz789"
         assert restored.refresh_route == "https://xet.example.com/refresh3"
+
+
+# ── Progress Throttler Tests ──────────────────────────────────────
+
+
+class TestProgressThrottler:
+    """Test _ProgressThrottler for shared throttling logic.
+
+    This is the throttler used by all Xet worker progress callbacks.
+    It ensures the first event is always emitted, subsequent events
+    are throttled by time and byte delta, and the completion event
+    (100%) is always emitted.
+    """
+
+    def test_first_event_always_emitted_even_with_no_change(self):
+        """First call to should_emit returns True regardless of value."""
+        t = _ProgressThrottler(report_interval=0.1)
+        # Even with value 0 and no time elapsed
+        assert t.should_emit(current_value=0, total=1000, now=0.0) is True
+        # And with any value
+        assert t.should_emit(current_value=500, total=1000, now=0.0) is True
+
+    def test_completion_always_emitted(self):
+        """Events at 100% bypass throttling."""
+        t = _ProgressThrottler(report_interval=1.0)  # 1s throttle
+        t.record_emit(500, now=0.0)
+        # Right after, value goes to 100% — should emit
+        assert t.should_emit(current_value=1000, total=1000, now=0.0) is True
+
+    def test_time_throttle_blocks_repeated_emits(self):
+        """Repeated emits within report_interval are throttled."""
+        t = _ProgressThrottler(report_interval=0.5)
+        t.record_emit(100, now=0.0)
+        # Same time, no change
+        assert t.should_emit(100, 1000, now=0.0) is False
+        # Slightly later, still within interval
+        assert t.should_emit(100, 1000, now=0.1) is False
+        # After interval elapsed
+        assert t.should_emit(100, 1000, now=0.6) is True
+
+    def test_byte_delta_throttle_blocks_small_changes(self):
+        """Tiny byte deltas are throttled when time hasn't elapsed."""
+        t = _ProgressThrottler(report_interval=10.0)  # long interval
+        t.record_emit(100, now=0.0)
+        # Small change (less than 1% of total = 10 bytes, but min 1024)
+        # so any change under 1024 bytes is throttled
+        assert t.should_emit(100 + 100, 1000, now=0.0) is False
+        # Large change (>= 1024 bytes) — emitted (byte delta bypasses time throttle)
+        assert t.should_emit(100 + 2000, 1000, now=0.0) is True
+
+    def test_min_bytes_delta_is_1_percent_of_total(self):
+        """Min bytes delta is 1% of total (when total > 102400)."""
+        t = _ProgressThrottler(report_interval=10.0)  # long interval
+        t.record_emit(0, now=0.0)
+        # Total = 100_000_000, 1% = 1_000_000
+        # Change of 500_000 < 1_000_000 — throttled (within time, byte delta too small)
+        assert t.should_emit(500_000, 100_000_000, now=0.0) is False
+        # Change of 2_000_000 >= 1_000_000 — emitted (byte delta bypasses)
+        assert t.should_emit(2_000_000, 100_000_000, now=0.0) is True
+
+    def test_record_emit_updates_state(self):
+        """record_emit properly updates internal state for next call."""
+        t = _ProgressThrottler(report_interval=0.5)
+        t.record_emit(1000, now=10.0)
+        # Immediately after, with same value, should be throttled
+        assert t.should_emit(1000, 10000, now=10.0) is False
+        # After interval
+        assert t.should_emit(1000, 10000, now=10.5) is True
+
+    def test_reset_clears_state(self):
+        """reset() allows the throttler to emit first-event again."""
+        t = _ProgressThrottler(report_interval=0.5)
+        t.record_emit(500, now=10.0)
+        # Throttled
+        assert t.should_emit(500, 1000, now=10.0) is False
+        # Reset
+        t.reset()
+        # First event again
+        assert t.should_emit(500, 1000, now=10.0) is True
+
+    def test_total_zero_uses_1kib_min_delta(self):
+        """When total is 0, the min bytes delta is 1024."""
+        t = _ProgressThrottler(report_interval=10.0)  # long interval
+        t.record_emit(0, now=0.0)
+        # Change of 100 bytes — throttled (min_delta = 1024)
+        assert t.should_emit(100, 0, now=0.0) is False
+        # Change of 2000 bytes — emitted
+        assert t.should_emit(2000, 0, now=0.0) is True
 
 
 # ── Progress Callback Tests ──────────────────────────────────────
