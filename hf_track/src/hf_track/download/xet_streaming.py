@@ -70,8 +70,15 @@ def download_snapshot_streaming(
         raise ImportError("hf_xet is not installed; cannot use streaming snapshot.")
 
     from huggingface_hub import HfApi
-    from ._xet_worker import _xet_streaming_download_worker
 
+    # _xet_streaming_download_worker is already imported at module level
+    # (line 30, ``from .._xet_worker import ...``). An older version of
+    # this file re-imported it here with a wrong relative path
+    # (``from ._xet_worker import ...``), which raised
+    # ``No module named 'hf_track.download._xet_worker'`` at function
+    # call time. The runner (``XetSubprocessRunner.spawn_streaming``)
+    # re-imports the worker itself when the subprocess starts, so we
+    # never need the local name here.
     transfer_id = transfer_id or generate_transfer_id()
 
     # Emit START event from main process

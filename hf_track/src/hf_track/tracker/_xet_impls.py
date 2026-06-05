@@ -56,7 +56,6 @@ class _TrackerXetImpls:
     ) -> str:
         from huggingface_hub import HfApi, hf_hub_url
         from ..download import download_file_with_xet
-        from ..download import download_file_with_xet_session
 
         api = HfApi(endpoint=self._endpoint, token=self._token)  # type: ignore[attr-defined]
         url = hf_hub_url(
@@ -84,37 +83,24 @@ class _TrackerXetImpls:
         headers = api._build_hf_headers()
         xet_headers = {k: v for k, v in headers.items() if k != "authorization"}
 
-        # Prefer the new XetSession API for smooth per-chunk progress.
-        # Fall back to the old download_files API if XetSession is not
-        # available (e.g. hf_xet < 1.5.0) or if it raises during init.
-        try:
-            result = download_file_with_xet_session(
-                file_hash=xet_file_data.file_hash,
-                file_size=file_size,
-                dest_path=dest_path,
-                xet_file_data=xet_file_data,
-                token=self._token,
-                event_queue=self.event_queue,  # type: ignore[attr-defined]
-                endpoint=api.endpoint,
-                transfer_id=transfer_id,
-                report_interval=self._report_interval,  # type: ignore[attr-defined]
-                request_headers=xet_headers,
-                is_cancelled=is_cancelled,
-            )
-        except ImportError:
-            result = download_file_with_xet(
-                file_hash=xet_file_data.file_hash,
-                file_size=file_size,
-                dest_path=dest_path,
-                xet_file_data=xet_file_data,
-                token=self._token,
-                event_queue=self.event_queue,
-                endpoint=api.endpoint,
-                transfer_id=transfer_id,
-                report_interval=self._report_interval,
-                request_headers=xet_headers,
-                is_cancelled=is_cancelled,
-            )
+        # Step 8.5 of the modular refactor (2026-06-05) removed the
+        # ``download_file_with_xet_session`` (XetSession API) variant
+        # because of three documented correctness bugs. The remaining
+        # path is ``download_file_with_xet``, which uses
+        # ``hf_xet.download_files()`` inside a subprocess worker.
+        result = download_file_with_xet(
+            file_hash=xet_file_data.file_hash,
+            file_size=file_size,
+            dest_path=dest_path,
+            xet_file_data=xet_file_data,
+            token=self._token,
+            event_queue=self.event_queue,  # type: ignore[attr-defined]
+            endpoint=api.endpoint,
+            transfer_id=transfer_id,
+            report_interval=self._report_interval,  # type: ignore[attr-defined]
+            request_headers=xet_headers,
+            is_cancelled=is_cancelled,
+        )
 
         return result.destination_path
 
@@ -133,13 +119,16 @@ class _TrackerXetImpls:
     ) -> str:
         """Download repo snapshot via Xet in an isolated subprocess.
 
-        Uses the NEW ``hf_xet.XetSession`` API (since v1.5.0) for smooth
-        per-chunk progress reporting. Falls back to the old
-        ``download_snapshot_with_xet`` if XetSession is not available.
+        Uses the proven ``download_snapshot_with_xet`` path, which
+        invokes ``huggingface_hub.snapshot_download`` inside an isolated
+        subprocess. The ``hf_xet`` C extension is therefore loaded
+        only in the child process, which makes the transfer safely
+        terminable without affecting the main process state.
 
-        The new API provides a ``progress_callback`` that fires every 100ms
-        with actual per-chunk byte progress, replacing the broken 1-arg
-        ``progress_updater`` callback that only fires at file completion.
+        Step 8.5 of the modular refactor (2026-06-05) removed the
+        earlier ``XetSession`` API variant of this function. See the
+        in-body comment below for the rationale and the historical
+        plan references.
 
         Args:
             repo_id: HuggingFace repository ID.
