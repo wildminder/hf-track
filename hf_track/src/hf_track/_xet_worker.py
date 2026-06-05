@@ -87,9 +87,9 @@ def _handle_worker_exception(mp_queue: mp.Queue, e: BaseException) -> None:
 class _ProgressThrottler:
     """Time + byte-delta based throttling for progress events.
 
-    Used by both the legacy ``_make_progress_callback`` (2-arg mode) and
-    the new ``XetSession`` API callback (``_xet_session_snapshot_worker``
-    and ``_xet_session_download_worker``).
+    Used by the active workers (``_download_worker``, ``_snapshot_worker``,
+    ``_streaming_download_worker``) and the legacy
+    ``_make_progress_callback`` (2-arg mode).
 
     Behavior:
         - The first event is always emitted (regardless of value).
@@ -1008,24 +1008,6 @@ def _snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: m
     finally:
         state_manager.clear_state(transfer_id)
 
-
-# ── Legacy XetSession-based Workers (DEPRECATED 2026-06-03) ─────
-#
-# These two workers (``_xet_session_snapshot_worker`` and
-# ``_xet_session_download_worker``) are deprecated as of 2026-06-03
-# due to three critical correctness bugs. They are kept here as
-# re-exports from ``_xet_worker_legacy`` for backward compatibility
-# with direct importers (e.g. ``from hf_track._xet_worker import
-# _xet_session_snapshot_worker``).
-#
-# New code should use ``_snapshot_worker`` and ``_download_worker``
-# instead. See :mod:`hf_track._xet_worker_legacy` for the
-# deprecation rationale.
-
-from ._xet_worker_legacy import (  # noqa: E402, F401
-    _xet_session_download_worker,
-    _xet_session_snapshot_worker,
-)
 
 # ── Upload Workers ────────────────────────────────────────────────
 

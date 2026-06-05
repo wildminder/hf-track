@@ -31,10 +31,8 @@ def test_public_api_exports():
     expected = {
         "XetDownloadResult",
         "download_file_with_xet",
-        "download_file_with_xet_session",
         "download_files_with_xet",
         "download_snapshot_with_xet",
-        "download_snapshot_with_xet_session",
         "download_snapshot_streaming",
         "download_file",
         "download_snapshot",
@@ -64,7 +62,6 @@ def test_xet_file_module():
 
     assert hasattr(xet_file, "XetDownloadResult")
     assert hasattr(xet_file, "download_file_with_xet")
-    assert hasattr(xet_file, "download_file_with_xet_session")
     # These names are bound at module level because the tests patch them
     # at hf_track.download.xet_file.<name>.
     assert hasattr(xet_file, "XetSubprocessRunner")
@@ -85,7 +82,6 @@ def test_xet_snapshot_module():
     from hf_track.download import xet_snapshot
 
     assert hasattr(xet_snapshot, "download_snapshot_with_xet")
-    assert hasattr(xet_snapshot, "download_snapshot_with_xet_session")
     assert hasattr(xet_snapshot, "XetSubprocessRunner")
     assert hasattr(xet_snapshot, "is_xet_available")
 

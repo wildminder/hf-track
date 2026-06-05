@@ -89,108 +89,31 @@ class TestSnapshotPathLayout:
             f"BUG 1: nested subdir path {dest!r} contains repo name"
         )
 
-    def test_download_snapshot_with_xet_session_path_construction(self):
-        """Direct test: the relative path extraction logic in
-        ``download_snapshot_with_xet_session`` must produce the
-        correct file names (no nesting).
-
-        This test directly exercises the path construction that
-        produced the bug.
-        """
-        # We test the path-construction logic in isolation. The buggy
-        # code does ``full_name.split("/", 1)[1]`` and the correct
-        # code strips the full prefix. We verify that *somewhere* in
-        # the snapshot download path, the correct prefix is used.
-        from hf_track.download import download_snapshot_with_xet_session
-        import inspect
-        source = inspect.getsource(download_snapshot_with_xet_session)
-
-        # The fix delegates to download_snapshot_with_xet, which uses
-        # huggingface_hub.snapshot_download to handle paths correctly.
-        # After the fix, the source should NOT contain
-        # ``.split("/", 1)[1]`` (the buggy path parsing).
-        assert '.split("/", 1)[1]' not in source, (
-            "BUG 1: download_snapshot_with_xet_session still uses "
-            "the buggy `split('/', 1)[1]` path parsing. "
-            "Should be replaced with full prefix stripping or "
-            "delegation to download_snapshot_with_xet."
-        )
-
 
 class TestSnapshotFileEnumeration:
     """Regression tests for the missing files bug (BUG 2)."""
 
-    def test_recursive_ls_is_used(self):
-        """``HfFileSystem.ls()`` is non-recursive by default. To find
-        files in subdirectories (e.g. ``assets/``), ``recursive=True``
-        MUST be passed. The buggy code did NOT pass it.
+    def test_snapshot_worker_uses_snapshot_download(self):
+        """The proven path (``_snapshot_worker``) must use
+        ``huggingface_hub.snapshot_download`` for correct file
+        enumeration, subdirectory traversal, and resume safety.
 
-        After the fix, ``download_snapshot_with_xet_session`` should
-        delegate to ``download_snapshot_with_xet`` (which uses
-        ``huggingface_hub.snapshot_download`` and correctly handles
-        subdirectories). The custom ``fs.ls(...)`` call block must
-        be gone.
+        This is the regression assertion for the 2026-06-03 missing
+        files bug: the old XetSession path used a custom
+        ``HfFileSystem.ls(prefix, detail=True)`` (non-recursive,
+        dropped non-xet files), which was removed.
         """
-        from hf_track.download import download_snapshot_with_xet_session
-        import inspect
-        import re
-        import textwrap
-        source = inspect.getsource(download_snapshot_with_xet_session)
-        # Dedent the source so we can do exact-line matching.
-        source = textwrap.dedent(source)
-
-        # Strip the docstring (which is the FIRST triple-quoted
-        # string in the function). The docstring may legitimately
-        # mention ``fs.ls()`` to describe the bug — we only want
-        # to check the code body. The docstring may NOT be at the
-        # very start of the string (function signature comes first
-        # in inspect.getsource output), so don't anchor to ^.
-        stripped = re.sub(r'"""[\s\S]*?"""', '', source, count=1)
-
-        # The buggy code had ``all_files = fs.ls(prefix, detail=True)``
-        # (without recursive=True). The fix removes the entire custom
-        # enumeration block.
-        assert "fs.ls(" not in stripped, (
-            "BUG 2: download_snapshot_with_xet_session still has the "
-            "custom `fs.ls(...)` block (in code, not docstring) that "
-            "drops non-xet files and doesn't recurse into subdirectories. "
-            "Should be removed in favor of delegating to "
-            "download_snapshot_with_xet (which uses "
-            "huggingface_hub.snapshot_download)."
-        )
-
-    def test_non_xet_files_handled_by_delegation(self):
-        """The fixed ``download_snapshot_with_xet_session`` should
-        delegate to ``download_snapshot_with_xet`` (which uses
-        ``huggingface_hub.snapshot_download``) so non-xet files are
-        handled correctly.
-        """
-        from hf_track.download import (
-            download_snapshot_with_xet,
-            download_snapshot_with_xet_session,
-        )
-        import inspect
-        # The fix should make download_snapshot_with_xet_session
-        # a thin wrapper around download_snapshot_with_xet.
-        source = inspect.getsource(download_snapshot_with_xet_session)
-        assert "download_snapshot_with_xet" in source, (
-            "After the fix, download_snapshot_with_xet_session must "
-            "delegate to download_snapshot_with_xet to handle non-xet "
-            "files and subdirectories correctly."
-        )
-
-        # The underlying download_snapshot_with_xet must use
-        # huggingface_hub.snapshot_download (the correct implementation).
-        worker_source = inspect.getsource(download_snapshot_with_xet)
-        # The function itself doesn't call snapshot_download directly,
-        # it spawns _snapshot_worker in a subprocess. Verify that
-        # _snapshot_worker uses huggingface_hub.snapshot_download.
         from hf_track._xet_worker import _snapshot_worker
-        worker_func_source = inspect.getsource(_snapshot_worker)
-        assert "snapshot_download" in worker_func_source, (
+        import inspect
+        source = inspect.getsource(_snapshot_worker)
+        assert "snapshot_download" in source, (
             "The proven path (_snapshot_worker) must use "
             "huggingface_hub.snapshot_download for correct file "
             "enumeration, subdirectory traversal, and resume safety."
+        )
+        assert "from huggingface_hub import snapshot_download" in source, (
+            "_snapshot_worker must import "
+            "huggingface_hub.snapshot_download"
         )
 
 
@@ -223,21 +146,6 @@ class TestSnapshotResumeSafety:
             "huggingface_hub.snapshot_download"
         )
 
-    def test_xetsession_path_is_removed_from_snapshot(self):
-        """After the fix, the buggy ``_xet_session_snapshot_worker``
-        (which is responsible for the 0-byte file bug) is no longer
-        called from the public download_snapshot_with_xet_session API.
-        """
-        from hf_track.download import download_snapshot_with_xet_session
-        import inspect
-        source = inspect.getsource(download_snapshot_with_xet_session)
-        assert "_xet_session_snapshot_worker" not in source, (
-            "BUG 3: download_snapshot_with_xet_session must NOT call "
-            "the broken _xet_session_snapshot_worker (which is "
-            "responsible for the zero-length files bug). "
-            "It should delegate to download_snapshot_with_xet."
-        )
-
     def test_uses_subprocess_for_xet_isolation(self):
         """The snapshot path must spawn a subprocess so the xet
         Rust extension is loaded only in the child. This is the
@@ -261,18 +169,16 @@ class TestDispatcherRouting:
     """Tests that the tracker dispatches to the correct snapshot path."""
 
     def test_tracker_dispatches_to_proven_snapshot_path(self):
-        """``HfTracker._download_snapshot_xet`` should NOT call the
-        broken ``download_snapshot_with_xet_session`` as its primary
-        path. The fix removes the new xetsession path from the
-        primary dispatch.
+        """``HfTracker._download_snapshot_xet`` must delegate to
+        ``download_snapshot_with_xet`` (the proven path that uses
+        ``huggingface_hub.snapshot_download`` in an isolated subprocess).
         """
         from hf_track import tracker as tracker_module
         import inspect
         source = inspect.getsource(tracker_module.HfTracker._download_snapshot_xet)
-        assert "download_snapshot_with_xet_session" not in source, (
-            "After the fix, _download_snapshot_xet should NOT call "
-            "the broken download_snapshot_with_xet_session function. "
-            "It should call download_snapshot_with_xet (the working one)."
+        assert "download_snapshot_with_xet" in source, (
+            "_download_snapshot_xet must delegate to "
+            "download_snapshot_with_xet (the working path)."
         )
 
 
@@ -311,21 +217,4 @@ class TestSnapshotResultIsDirectory:
             f"Snapshot should return local_dir '/tmp/dl', got {result!r}. "
             "BUG 1: nested folder bug — the result includes the repo name "
             "in the path."
-        )
-
-
-class TestXetSessionSnapshotWorkerIsDeprecated:
-    """The new xetsession snapshot worker should be marked as deprecated
-    and not called from the public API.
-    """
-
-    def test_xet_session_snapshot_worker_marked_deprecated(self):
-        """After the fix, the new xetsession snapshot worker is no
-        longer used by the public API. It should be marked as
-        deprecated in its docstring.
-        """
-        from hf_track._xet_worker import _xet_session_snapshot_worker
-        assert "deprecated" in _xet_session_snapshot_worker.__doc__.lower(), (
-            "After the fix, _xet_session_snapshot_worker docstring must "
-            "contain 'deprecated' to warn future maintainers."
         )

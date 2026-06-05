@@ -164,13 +164,11 @@ class TestBackwardCompatPatches:
     def test_inspect_getsource_finds_method_implementation(self):
         """``inspect.getsource(HfTracker._download_snapshot_xet)`` must
         return the source code (used by test_snapshot_regressions.py
-        to assert it does NOT call the broken xetsession path)."""
+        to assert it delegates to the proven path)."""
         from hf_track.tracker import HfTracker
         source = inspect.getsource(HfTracker._download_snapshot_xet)
-        # The fix delegates to download_snapshot_with_xet (the proven path),
-        # not to download_snapshot_with_xet_session (the broken path).
+        # Must delegate to download_snapshot_with_xet (the proven path).
         assert "download_snapshot_with_xet" in source
-        assert "download_snapshot_with_xet_session" not in source
 
     def test_inspect_signature_on_public_method(self):
         """``inspect.signature(HfTracker.download_snapshot_streaming)`` must

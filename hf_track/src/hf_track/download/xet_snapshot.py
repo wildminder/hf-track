@@ -1,9 +1,9 @@
 """Repository snapshot Xet downloads via the isolated subprocess runner.
 
-Groups the legacy ``download_snapshot_with_xet`` and the deprecated
-``download_snapshot_with_xet_session`` (which now delegates to the
-legacy path) because they are two implementations of the SAME
-snapshot operation. Both are intentionally kept together for review.
+The XetSession-API variant was removed in 2026-06-05 (had three
+critical correctness bugs documented in
+docs/plans/2026-06-03-revert-broken-snapshot-xetsession-path.md).
+Only the proven ``_snapshot_worker`` subprocess path remains.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from ..types import (
 )
 from ..subprocess import XetSubprocessRunner
 from ..token import is_xet_available
-from .._xet_worker import _snapshot_worker, _xet_session_snapshot_worker
+from .._xet_worker import _snapshot_worker
 
 def download_snapshot_with_xet(
     repo_id: str,
@@ -176,101 +176,4 @@ def download_snapshot_with_xet(
         raise
     finally:
         runner.terminate()
-
-
-
-def download_snapshot_with_xet_session(
-    repo_id: str,
-    token: Optional[str],
-    event_queue: queue.Queue,
-    allow_patterns=None,
-    ignore_patterns=None,
-    repo_type: str = "model",
-    revision: Optional[str] = None,
-    endpoint: Optional[str] = None,
-    local_dir: Optional[str] = None,
-    transfer_id: Optional[str] = None,
-    report_interval: float = 0.1,
-    is_cancelled: Optional[Callable[[], bool]] = None,
-) -> str:
-    """Download a repository snapshot — DEPRECATED: delegates to ``download_snapshot_with_xet``.
-
-    .. deprecated::
-        This function used to implement a snapshot downloader on top of
-        the new ``hf_xet.XetSession`` API. That implementation was found
-        to have three critical correctness bugs (2026-06-03):
-
-        1. Nested folder layout (``local_dir/VoxCPM-0.5B/<files>`` instead
-           of ``local_dir/<files>``) caused by incorrect path parsing of
-           ``HfFileSystem.ls()`` output.
-        2. Missing files: only 2 of 13 files were downloaded because
-           (a) ``fs.ls()`` is non-recursive by default (misses
-           subdirectories like ``assets/``) and (b) files without
-           ``xet_hash`` (regular LFS files like ``config.json``,
-           ``tokenizer.json``) were explicitly skipped.
-        3. Zero-length files on disk after cancel because the new
-           API does not pre-cleanup or use atomic tmp-file + rename
-           semantics.
-
-        The new ``XetSession`` API is fundamentally a single-session,
-        single-batch primitive that does not provide the mixed
-        xet/non-xet routing, subdirectory traversal, or cache-aware
-        resume that snapshot downloads require. Re-implementing
-        ``huggingface_hub.snapshot_download`` from scratch to work
-        around these limitations would duplicate hundreds of lines
-        of complex, battle-tested code and introduce more bugs.
-
-        This function now delegates to ``download_snapshot_with_xet``,
-        which uses ``huggingface_hub.snapshot_download()`` in an
-        isolated subprocess (so ``hf_xet`` is still loaded only in
-        the child for safe termination). The progress is per-file
-        rather than per-chunk, which is the trade-off for correctness.
-
-        See: ``docs/plans/2026-06-03-revert-broken-snapshot-xetsession-path.md``
-
-    Args:
-        repo_id: HuggingFace repository ID.
-        token: HuggingFace API token.
-        event_queue: Queue for ProgressEvent objects.
-        allow_patterns: Optional list of glob patterns to include.
-        ignore_patterns: Optional list of glob patterns to exclude.
-        repo_type: Repository type (model/dataset/space).
-        revision: Optional git revision.
-        endpoint: Optional custom API endpoint.
-        local_dir: Local directory to download files to.
-        transfer_id: Optional pre-existing transfer ID.
-        report_interval: Event reporting interval (seconds).
-        is_cancelled: Optional cancellation hook (checked in main process).
-
-    Returns:
-        Path to the local directory containing downloaded files.
-
-    Raises:
-        ImportError: If hf_xet is not installed.
-        TransferCancelledError: If the transfer is cancelled.
-        TransferProgressError: If the download fails.
-    """
-    # Delegate to the proven path that uses
-    # ``huggingface_hub.snapshot_download`` in an isolated subprocess.
-    # This correctly handles:
-    # - Mixed xet/non-xet files (huggingface_hub routes per-file)
-    # - Subdirectories (huggingface_hub.snapshot_download walks them)
-    # - Cache-aware resume (etag-based, tmp-file + rename atomic)
-    # - Subprocess isolation (xet is loaded only in the child)
-    # - Cancellation (terminate the child process)
-    return download_snapshot_with_xet(
-        repo_id=repo_id,
-        token=token,
-        event_queue=event_queue,
-        allow_patterns=allow_patterns,
-        ignore_patterns=ignore_patterns,
-        repo_type=repo_type,
-        revision=revision,
-        endpoint=endpoint,
-        local_dir=local_dir,
-        transfer_id=transfer_id,
-        report_interval=report_interval,
-        is_cancelled=is_cancelled,
-        use_xet=True,
-    )
 
