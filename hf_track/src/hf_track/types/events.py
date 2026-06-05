@@ -1,16 +1,20 @@
-"""Data types for HuggingFace progress tracking.
+"""Event-related types for HuggingFace progress tracking.
 
-Provides structured, typed representations of progress events
-that can be consumed by any external application.
+This module groups all of the *event vocabulary* types: the enums
+describing phase / direction / event kind, and the ``ProgressEvent``
+dataclass that carries them. Kept as a single module because they form
+one cohesive concept -- "the shape of a progress event consumers can
+react to."
 """
 
 from __future__ import annotations
 
 import enum
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
+
+from .results import TransferError
 
 
 class ProgressPhase(str, enum.Enum):
@@ -39,32 +43,6 @@ class EventType(str, enum.Enum):
     COMPLETE = "complete"
     ERROR = "error"
     CANCELLED = "cancelled"
-
-
-@dataclass
-class TransferError:
-    """Structured error information for failed transfers."""
-    message: str
-    error_type: str = "Exception"
-    retryable: bool = False
-
-    def __str__(self) -> str:
-        return self.message
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "message": self.message,
-            "error_type": self.error_type,
-            "retryable": self.retryable,
-        }
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> TransferError:
-        return cls(
-            message=data.get("message", "Unknown error"),
-            error_type=data.get("error_type", "Exception"),
-            retryable=data.get("retryable", False),
-        )
 
 
 @dataclass
@@ -240,7 +218,7 @@ class ProgressEvent:
         # Infer default phase from direction if phase is missing
         direction = TransferDirection(data["direction"])
         default_phase = ProgressPhase.UPLOADING if direction == TransferDirection.UPLOAD else ProgressPhase.DOWNLOADING
-        
+
         error_obj = None
         if "error" in data:
             err_data = data["error"]
@@ -270,49 +248,3 @@ class ProgressEvent:
             timestamp=data.get("timestamp", time.time()),
             extra=data.get("extra", {}),
         )
-
-
-@dataclass
-class TransferResult:
-    """Result of a completed transfer operation.
-
-    Attributes:
-        success: Whether the transfer completed successfully.
-        transfer_id: Unique identifier for the transfer.
-        filename: Name of the transferred file.
-        url: URL of the uploaded/downloaded resource (if available).
-        hash: Content hash of the file (Xet uploads only).
-        file_size: Size of the file in bytes.
-        direction: Upload or download.
-        local_path: Local file path (for downloads).
-    """
-
-    success: bool
-    transfer_id: str
-    filename: str
-    url: Optional[str] = None
-    hash: Optional[str] = None
-    file_size: int = 0
-    direction: TransferDirection = TransferDirection.UPLOAD
-    local_path: Optional[str] = None
-
-
-def generate_transfer_id() -> str:
-    """Generate a unique transfer ID."""
-    return str(uuid.uuid4())
-
-
-class TransferCancelledError(Exception):
-    """Raised when a transfer is cancelled by the user.
-
-    Callers can catch this specific exception to distinguish
-    user-initiated cancellation from other runtime errors.
-    """
-
-
-class TransferProgressError(Exception):
-    """Raised when a transfer operation encounters a recoverable error."""
-
-
-class TokenError(Exception):
-    """Raised when token resolution or authentication fails."""

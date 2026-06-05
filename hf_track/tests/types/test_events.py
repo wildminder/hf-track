@@ -1,20 +1,19 @@
-"""Tests for hf_progress.types module."""
+"""Tests for ``hf_track.types.events`` -- event vocabulary and ProgressEvent.
+
+Imports go through the public ``hf_track.types`` re-exports to keep
+this test validating the shim layer as well as the underlying module.
+"""
 
 from __future__ import annotations
 
 import time
 
-import pytest
-
 from hf_track.types import (
     EventType,
     ProgressEvent,
     ProgressPhase,
-    TransferCancelledError,
     TransferDirection,
     TransferError,
-    TransferResult,
-    generate_transfer_id,
 )
 
 
@@ -52,29 +51,6 @@ class TestTransferDirection:
     def test_values(self):
         assert TransferDirection.UPLOAD.value == "upload"
         assert TransferDirection.DOWNLOAD.value == "download"
-
-
-class TestTransferError:
-    """Tests for TransferError dataclass."""
-    
-    def test_basic_creation(self):
-        err = TransferError(message="Network timeout", error_type="TimeoutError", retryable=True)
-        assert err.message == "Network timeout"
-        assert err.error_type == "TimeoutError"
-        assert err.retryable is True
-        assert str(err) == "Network timeout"
-        
-    def test_to_from_dict(self):
-        err = TransferError(message="Connection refused", error_type="ConnectionError", retryable=False)
-        d = err.to_dict()
-        assert d["message"] == "Connection refused"
-        assert d["error_type"] == "ConnectionError"
-        assert d["retryable"] is False
-        
-        restored = TransferError.from_dict(d)
-        assert restored.message == "Connection refused"
-        assert restored.error_type == "ConnectionError"
-        assert restored.retryable is False
 
 
 class TestProgressEvent:
@@ -239,7 +215,7 @@ class TestProgressEvent:
         assert restored.total_bytes == event.total_bytes
         assert restored.percentage == event.percentage
         assert restored.speed == event.speed
-        
+
     def test_from_dict_legacy_error_string(self):
         """Should parse older string-based error formats seamlessly into a TransferError object."""
         legacy_data = {
@@ -299,56 +275,3 @@ class TestProgressEvent:
         )
         after = time.time()
         assert before <= event.timestamp <= after
-
-
-class TestTransferCancelledError:
-    """Tests for TransferCancelledError exception."""
-
-    def test_is_exception(self):
-        with pytest.raises(TransferCancelledError):
-            raise TransferCancelledError("Transfer cancelled by user")
-
-    def test_message(self):
-        try:
-            raise TransferCancelledError("Transfer cancelled by user")
-        except TransferCancelledError as e:
-            assert str(e) == "Transfer cancelled by user"
-
-    def test_catch_specificity(self):
-        """TransferCancelledError should not catch generic RuntimeError."""
-        with pytest.raises(TransferCancelledError):
-            raise TransferCancelledError("cancelled")
-        # RuntimeError should NOT be caught as TransferCancelledError
-        with pytest.raises(RuntimeError):
-            raise RuntimeError("other error")
-
-
-class TestTransferResult:
-    """Tests for TransferResult dataclass."""
-
-    def test_basic_creation(self):
-        result = TransferResult(
-            success=True,
-            transfer_id="test-1",
-            filename="model.bin",
-            url="https://huggingface.co/user/model/resolve/main/model.bin",
-            hash="abc123",
-            file_size=1000,
-            direction=TransferDirection.UPLOAD,
-        )
-        assert result.success is True
-        assert result.url is not None
-        assert result.hash == "abc123"
-
-
-class TestGenerateTransferId:
-    """Tests for generate_transfer_id function."""
-
-    def test_unique(self):
-        ids = {generate_transfer_id() for _ in range(100)}
-        assert len(ids) == 100
-
-    def test_is_string(self):
-        tid = generate_transfer_id()
-        assert isinstance(tid, str)
-        assert len(tid) > 0
