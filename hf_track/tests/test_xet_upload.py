@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hf_track.types import EventType, TransferDirection, TransferError, TransferProgressError
-from hf_track.xet_upload import upload_file_with_xet, upload_bytes_with_xet
+from hf_track.upload import upload_file_with_xet, upload_bytes_with_xet
 
 
 @pytest.fixture
@@ -21,9 +21,9 @@ def event_queue():
 class TestUploadFileWithXet:
     """Tests for upload_file_with_xet function."""
 
-    @patch("hf_track.xet_upload.is_xet_available", return_value=False)
+    @patch("hf_track.upload.xet_file.is_xet_available", return_value=False)
     def test_raises_when_xet_not_available(self, mock_avail, event_queue):
-        from hf_track.xet_upload import upload_file_with_xet
+        from hf_track.upload import upload_file_with_xet
 
         with pytest.raises(ImportError, match="hf_xet is not installed"):
             upload_file_with_xet(
@@ -33,11 +33,11 @@ class TestUploadFileWithXet:
                 event_queue=event_queue,
             )
 
-    @patch("hf_track.xet_upload.is_xet_available", return_value=True)
-    @patch("hf_track.xet_upload.XetSubprocessRunner")
+    @patch("hf_track.upload.xet_file.is_xet_available", return_value=True)
+    @patch("hf_track.upload.xet_file.XetSubprocessRunner")
     def test_emits_start_and_complete_events(self, MockRunner, mock_avail, event_queue, tmp_path):
         """Should emit START event and return result on success."""
-        from hf_track.xet_upload import upload_file_with_xet
+        from hf_track.upload import upload_file_with_xet
 
         test_file = tmp_path / "test.bin"
         test_file.write_bytes(b"x" * 100)
@@ -77,11 +77,11 @@ class TestUploadFileWithXet:
         mock_runner.start.assert_called_once()
         mock_runner.terminate.assert_called()
 
-    @patch("hf_track.xet_upload.is_xet_available", return_value=True)
-    @patch("hf_track.xet_upload.XetSubprocessRunner")
+    @patch("hf_track.upload.xet_file.is_xet_available", return_value=True)
+    @patch("hf_track.upload.xet_file.XetSubprocessRunner")
     def test_emits_error_event_on_failure(self, MockRunner, mock_avail, event_queue, tmp_path):
         """Should raise TransferError when worker returns error."""
-        from hf_track.xet_upload import upload_file_with_xet
+        from hf_track.upload import upload_file_with_xet
 
         test_file = tmp_path / "test.bin"
         test_file.write_bytes(b"x" * 100)
@@ -110,9 +110,9 @@ class TestUploadFileWithXet:
 class TestUploadBytesWithXet:
     """Tests for upload_bytes_with_xet function."""
 
-    @patch("hf_track.xet_upload.is_xet_available", return_value=False)
+    @patch("hf_track.upload.xet_bytes.is_xet_available", return_value=False)
     def test_raises_when_xet_not_available(self, mock_avail, event_queue):
-        from hf_track.xet_upload import upload_bytes_with_xet
+        from hf_track.upload import upload_bytes_with_xet
 
         with pytest.raises(ImportError, match="hf_xet is not installed"):
             upload_bytes_with_xet(
@@ -123,11 +123,11 @@ class TestUploadBytesWithXet:
                 event_queue=event_queue,
             )
 
-    @patch("hf_track.xet_upload.is_xet_available", return_value=True)
-    @patch("hf_track.xet_upload.XetSubprocessRunner")
+    @patch("hf_track.upload.xet_bytes.is_xet_available", return_value=True)
+    @patch("hf_track.upload.xet_file.XetSubprocessRunner")
     def test_emits_start_and_complete_events(self, MockRunner, mock_avail, event_queue):
         """Should emit START event and return result on success."""
-        from hf_track.xet_upload import upload_bytes_with_xet
+        from hf_track.upload import upload_bytes_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -159,11 +159,12 @@ class TestUploadBytesWithXet:
         assert start_event.event_type == EventType.START
         assert start_event.direction == TransferDirection.UPLOAD
 
-    @patch("hf_track.xet_upload.is_xet_available", return_value=True)
-    @patch("hf_track.xet_upload.XetSubprocessRunner")
+    @patch("hf_track.upload.xet_bytes.is_xet_available", return_value=True)
+    @patch("hf_track.upload.xet_file.XetSubprocessRunner")
     def test_large_payload_uses_temp_file(self, MockRunner, mock_avail, event_queue):
         """Payloads >10MB should be written to temp file before subprocess."""
-        from hf_track.xet_upload import upload_bytes_with_xet, _LARGE_PAYLOAD_THRESHOLD
+        from hf_track.upload import upload_bytes_with_xet
+        from hf_track.upload.xet_bytes import _LARGE_PAYLOAD_THRESHOLD
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -200,7 +201,7 @@ class TestXetUploadResult:
     """Tests for XetUploadResult dataclass."""
 
     def test_default_values(self):
-        from hf_track.xet_upload import XetUploadResult
+        from hf_track.upload import XetUploadResult
 
         result = XetUploadResult(success=True, filename="test.bin")
         assert result.success is True
@@ -211,7 +212,7 @@ class TestXetUploadResult:
         assert result.url is None
 
     def test_all_fields(self):
-        from hf_track.xet_upload import XetUploadResult
+        from hf_track.upload import XetUploadResult
 
         result = XetUploadResult(
             success=True,

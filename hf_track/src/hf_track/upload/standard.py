@@ -1,4 +1,18 @@
-"""Standard (non-Xet) upload progress tracking via tqdm monkey-patching."""
+"""Standard (non-Xet) upload progress tracking via tqdm monkey-patching.
+
+Three public functions, all about *non-Xet* uploads that drive progress
+events through the :func:`tqdm_upload_patcher` context manager:
+
+  * :func:`upload_file` -- upload a single file on disk.
+  * :func:`upload_bytes` -- write bytes to a temp file and call
+    :func:`upload_file` (this is the "bytes-as-file" path).
+  * :func:`upload_folder` -- walk a folder and upload all files.
+
+All three share the same event-emission shape (START, byte progress via
+tqdm bars, COMPLETE) and the same error/cancellation pattern. They are
+grouped here because they form one cohesive concept: the standard
+``HfApi.upload_*`` calls instrumented by tqdm patching.
+"""
 
 from __future__ import annotations
 
@@ -8,8 +22,8 @@ import queue
 import tempfile
 from typing import Callable, Optional
 
-from .callbacks import tqdm_upload_patcher, state_manager
-from .types import (
+from ..callbacks import tqdm_upload_patcher, state_manager
+from ..types import (
     EventType,
     ProgressEvent,
     ProgressPhase,
@@ -83,7 +97,7 @@ def upload_file(
                 )
 
             return result
-    
+
     except KeyboardInterrupt:
         event_queue.put(
             ProgressEvent.cancelled_event(
@@ -181,7 +195,7 @@ def upload_folder(
     from huggingface_hub import HfApi
 
     transfer_id = transfer_id or generate_transfer_id()
-    
+
     # Pre-calculate approximate folder size for progress display
     total_bytes = 0
     for root, _, files in os.walk(folder_path):
@@ -229,7 +243,7 @@ def upload_folder(
                 )
 
             return getattr(result, "commit_url", str(result))
-    
+
     except KeyboardInterrupt:
         event_queue.put(
             ProgressEvent.cancelled_event(

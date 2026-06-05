@@ -359,7 +359,7 @@ class HfTracker:
         delete_patterns: Optional[list[str] | str] = None,
         transfer_id: Optional[str] = None,
     ) -> str:
-        from .standard_upload import upload_folder as _upload_folder
+        from .upload import upload_folder as _upload_folder
 
         transfer_id, is_cancelled_hook = self._prepare_transfer(transfer_id)
 
@@ -625,7 +625,7 @@ class HfTracker:
         filename: str,
         is_cancelled: Callable[[], bool],
     ) -> str:
-        from .xet_upload import upload_file_with_xet
+        from .upload import upload_file_with_xet
 
         try:
             result = upload_file_with_xet(
@@ -664,7 +664,7 @@ class HfTracker:
         transfer_id: str,
         is_cancelled: Callable[[], bool],
     ) -> str:
-        from .xet_upload import upload_bytes_with_xet
+        from .upload import upload_bytes_with_xet
 
         try:
             result = upload_bytes_with_xet(
@@ -706,7 +706,7 @@ class HfTracker:
         filename: str,
         is_cancelled: Callable[[], bool],
     ) -> str:
-        from .standard_upload import upload_file as _upload_file
+        from .upload import upload_file as _upload_file
 
         return _upload_file(
             file_path=file_path,
@@ -733,7 +733,7 @@ class HfTracker:
         transfer_id: str,
         is_cancelled: Callable[[], bool],
     ) -> str:
-        from .standard_upload import upload_bytes as _upload_bytes
+        from .upload import upload_bytes as _upload_bytes
 
         return _upload_bytes(
             file_content=file_content,

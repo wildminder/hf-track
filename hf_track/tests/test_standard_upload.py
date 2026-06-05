@@ -18,10 +18,10 @@ def event_queue():
 class TestUploadFile:
     """Tests for the upload_file function (standard HTTP upload)."""
 
-    @patch("hf_track.standard_upload.generate_transfer_id", return_value="tid-1")
+    @patch("hf_track.upload.standard.generate_transfer_id", return_value="tid-1")
     @patch("huggingface_hub.HfApi")
     def test_emits_complete_on_success(self, mock_api_cls, mock_tid, event_queue, tmp_path):
-        from hf_track.standard_upload import upload_file
+        from hf_track.upload import upload_file
 
         # Create a temp file to upload
         test_file = tmp_path / "test.bin"
@@ -52,10 +52,10 @@ class TestUploadFile:
         assert complete_events[0].bytes_completed == 100
         assert complete_events[0].filename == "test.bin"
 
-    @patch("hf_track.standard_upload.generate_transfer_id", return_value="tid-2")
+    @patch("hf_track.upload.standard.generate_transfer_id", return_value="tid-2")
     @patch("huggingface_hub.HfApi")
     def test_emits_error_on_failure(self, mock_api_cls, mock_tid, event_queue, tmp_path):
-        from hf_track.standard_upload import upload_file
+        from hf_track.upload import upload_file
 
         test_file = tmp_path / "test.bin"
         test_file.write_bytes(b"x" * 100)

@@ -38,7 +38,7 @@ class TestTrackerFallbackPaths:
 
         with patch("hf_track.tracker.is_xet_available", return_value=False):
             with patch(
-                "hf_track.standard_upload.upload_file",
+                "hf_track.upload.upload_file",
                 return_value="https://hf.co/user/repo/blob/main/model.bin",
             ) as mock_std:
                 result = tracker.upload_file(
@@ -56,7 +56,7 @@ class TestTrackerFallbackPaths:
 
         with patch("hf_track.tracker.is_xet_available", return_value=False):
             with patch(
-                "hf_track.standard_upload.upload_bytes",
+                "hf_track.upload.upload_bytes",
                 return_value="https://hf.co/user/repo/blob/main/test.bin",
             ) as mock_std:
                 result = tracker.upload_bytes(

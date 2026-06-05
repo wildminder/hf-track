@@ -1,22 +1,27 @@
-"""Xet direct upload functions with progress tracking via subprocess isolation.
+"""Xet file upload via the isolated subprocess runner.
 
-All ``hf_xet`` calls are executed in isolated child processes using
-``XetSubprocessRunner``, so they can be safely terminated without
-affecting the main process.
+Groups:
+  * :class:`XetUploadResult` -- the upload envelope (success/filename/
+    hash/file_size/transfer_id/url).
+  * :func:`_run_upload_in_subprocess` -- the shared polling/cancellation
+    loop used by both file and bytes Xet uploads. Kept here (not in a
+    shared module) because the entire Xet file-upload path lives in
+    one cohesive concept: a single file going up via hf_xet in a
+    subprocess.
+  * :func:`upload_file_with_xet` -- public entry point that uploads a
+    file on disk.
 """
 
 from __future__ import annotations
 
 import os
 import queue
-import tempfile
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from ._xet_worker import _upload_bytes_worker, _upload_file_worker
-from .subprocess import XetSubprocessRunner
-from .token import is_xet_available
-from .types import (
+from ..subprocess import XetSubprocessRunner
+from ..token import is_xet_available
+from ..types import (
     EventType,
     ProgressEvent,
     ProgressPhase,
@@ -26,9 +31,7 @@ from .types import (
     TransferProgressError,
     generate_transfer_id,
 )
-
-# Threshold for auto-writing bytes to temp file instead of pickling across processes
-_LARGE_PAYLOAD_THRESHOLD = 10 * 1024 * 1024  # 10 MB
+from .._xet_worker import _upload_file_worker
 
 
 @dataclass
@@ -235,164 +238,3 @@ def upload_file_with_xet(
         worker_func=_upload_file_worker,
         params=params,
     )
-
-
-def upload_bytes_with_xet(
-    file_content: bytes,
-    filename: str,
-    repo_id: str,
-    token: str,
-    event_queue: queue.Queue,
-    repo_type: str = "model",
-    revision: Optional[str] = None,
-    endpoint: Optional[str] = None,
-    transfer_id: Optional[str] = None,
-    report_interval: float = 0.1,
-    is_cancelled: Optional[Callable[[], bool]] = None,
-) -> XetUploadResult:
-    """Upload bytes via Xet in an isolated subprocess.
-
-    For payloads larger than 10MB, the bytes are automatically written
-    to a temporary file to avoid excessive pickle serialization cost
-    across the process boundary.
-
-    Args:
-        file_content: Raw bytes to upload.
-        filename: Name for the uploaded file.
-        repo_id: Target repository ID.
-        token: HuggingFace API token.
-        event_queue: Queue for progress events.
-        repo_type: Repository type.
-        revision: Optional git revision.
-        endpoint: Optional custom endpoint.
-        transfer_id: Optional pre-existing transfer ID.
-        report_interval: Event reporting interval.
-        is_cancelled: Optional cancellation hook.
-
-    Returns:
-        XetUploadResult on success.
-
-    Raises:
-        ImportError: If hf_xet is not installed.
-    """
-    if not is_xet_available():
-        raise ImportError("hf_xet is not installed.")
-
-    file_size = len(file_content)
-    temp_path = None
-
-    try:
-        if file_size > _LARGE_PAYLOAD_THRESHOLD:
-            # Write to temp file to avoid expensive pickle of large bytes
-            with tempfile.NamedTemporaryFile(
-                suffix=f"_{filename}", delete=False
-            ) as f:
-                f.write(file_content)
-                temp_path = f.name
-
-            params = {
-                "file_path": temp_path,
-                "filename": filename,
-                "repo_id": repo_id,
-                "token": token,
-                "repo_type": repo_type,
-                "revision": revision,
-                "endpoint": endpoint,
-                "transfer_id": transfer_id,
-                "report_interval": report_interval,
-                "direction": "upload",
-            }
-        else:
-            params = {
-                "file_content": file_content,
-                "filename": filename,
-                "repo_id": repo_id,
-                "token": token,
-                "repo_type": repo_type,
-                "revision": revision,
-                "endpoint": endpoint,
-                "transfer_id": transfer_id,
-                "report_interval": report_interval,
-                "direction": "upload",
-            }
-
-        return _run_upload_in_subprocess(
-            filename=filename,
-            file_size=file_size,
-            repo_id=repo_id,
-            token=token,
-            event_queue=event_queue,
-            repo_type=repo_type,
-            revision=revision,
-            endpoint=endpoint,
-            transfer_id=transfer_id,
-            report_interval=report_interval,
-            is_cancelled=is_cancelled,
-            worker_func=_upload_bytes_worker,
-            params=params,
-        )
-    finally:
-        if temp_path is not None:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-
-
-def upload_bytes_via_temp_file(
-    file_content: bytes,
-    filename: str,
-    repo_id: str,
-    token: str,
-    event_queue: queue.Queue,
-    repo_type: str = "model",
-    revision: Optional[str] = None,
-    endpoint: Optional[str] = None,
-    transfer_id: Optional[str] = None,
-    report_interval: float = 0.1,
-    is_cancelled: Optional[Callable[[], bool]] = None,
-) -> XetUploadResult:
-    """Upload bytes via temp file, choosing Xet or LFS based on availability.
-
-    This is a convenience wrapper that handles the Xet/LFS routing
-    for bytes uploads.
-    """
-    transfer_id = transfer_id or generate_transfer_id()
-
-    with tempfile.NamedTemporaryFile(
-        suffix=f"_{filename}", delete=False
-    ) as f:
-        f.write(file_content)
-        temp_path = f.name
-
-    try:
-        if is_xet_available():
-            return upload_file_with_xet(
-                file_path=temp_path,
-                repo_id=repo_id,
-                token=token,
-                event_queue=event_queue,
-                repo_type=repo_type,
-                revision=revision,
-                endpoint=endpoint,
-                transfer_id=transfer_id,
-                report_interval=report_interval,
-                is_cancelled=is_cancelled,
-            )
-        else:
-            from .standard_upload import upload_file as _upload_file
-            return _upload_file(
-                file_path=temp_path,
-                repo_id=repo_id,
-                token=token,
-                event_queue=event_queue,
-                path_in_repo=filename,
-                repo_type=repo_type,
-                revision=revision,
-                endpoint=endpoint,
-                transfer_id=transfer_id,
-                report_interval=report_interval,
-                is_cancelled=is_cancelled,
-            )
-    finally:
-        os.unlink(temp_path)
