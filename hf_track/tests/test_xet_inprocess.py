@@ -20,10 +20,9 @@ import pytest
 
 from hf_track.callbacks import (
     DownloadProgressTqdm,
-    EventType,
     state_manager,
 )
-from hf_track.types import ProgressPhase, TransferDirection
+from hf_track.types import EventType, ProgressPhase, TransferDirection
 
 
 @pytest.fixture(autouse=True)
