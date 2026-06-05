@@ -48,6 +48,7 @@ packages = ["src/hf_track"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+addopts = "--tb=short"
 markers = [
     "integration: marks tests requiring real HF credentials (deselect with '-m \"not integration\"')",
 ]
