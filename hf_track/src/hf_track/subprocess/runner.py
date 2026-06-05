@@ -25,12 +25,11 @@ import logging
 import multiprocessing as mp
 import queue
 import threading
-import time
 import warnings
 from typing import Any, Callable, Dict, Optional
 
-from .subprocess_messages import MSG_EVENT, SubprocessMessage
-from .types import EventType, ProgressEvent, TransferError
+from ..types import EventType, ProgressEvent, TransferError
+from .messages import MSG_EVENT, SubprocessMessage
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +77,7 @@ class XetSubprocessRunner:
         params: Dict[str, Any],
         event_queue: queue.Queue,
     ) -> None:
-        """Spawn child process and start event relay thread.
+        """Spawn child process with the given worker function and start event relay thread.
 
         Args:
             worker_func: A top-level function that runs in the child process.
@@ -122,6 +121,42 @@ class XetSubprocessRunner:
                 self._process.pid,
                 getattr(worker_func, "__name__", str(worker_func)),
             )
+
+    def spawn_streaming(
+        self,
+        params: Dict[str, Any],
+        event_queue: queue.Queue,
+    ) -> None:
+        """Spawn a streaming-download subprocess using the chunk-by-chunk worker.
+
+        Convenience wrapper that calls ``start()`` with the streaming
+        worker function ``_xet_streaming_download_worker``. The worker
+        uses ``XetSession().new_download_stream_group().download_stream()``
+        to write each file's chunks to disk incrementally — no in-memory
+        buffering of whole files.
+
+        Args:
+            params: Picklable dict of parameters for the worker. Must
+                include the keys required by ``_xet_streaming_download_worker``:
+                ``file_specs`` (list of dicts with ``hash``, ``file_size``,
+                ``dest_path``, ``xet_file_data``), ``token``, ``endpoint``,
+                ``transfer_id``, ``report_interval``, ``request_headers``,
+                ``fsync_interval`` (optional).
+            event_queue: Main-process queue to receive ``ProgressEvent`` objects.
+
+        Raises:
+            RuntimeError: If a process is already running.
+        """
+        # Local import to avoid a circular dependency at module load time
+        # (subprocess_runner is imported by _xet_worker, which is imported by
+        # subprocess_messages → runner → worker chain). The streaming worker
+        # itself doesn't import the runner.
+        from .._xet_worker import _xet_streaming_download_worker
+        self.start(
+            worker_func=_xet_streaming_download_worker,
+            params=params,
+            event_queue=event_queue,
+        )
 
     def _relay_events(self) -> None:
         """Background thread: mp.Queue → queue.Queue translation.
@@ -213,7 +248,7 @@ class XetSubprocessRunner:
         if self._event_queue is None:
             return
         try:
-            from .types import ProgressPhase, TransferDirection
+            from ..types import ProgressPhase, TransferDirection
             # Prefer explicit bytes_completed/total_bytes from snapshot
             # workers; fall back to file_size for single-file workers.
             bytes_completed = payload.get("bytes_completed", 0) or payload.get("file_size", 0)
@@ -239,7 +274,7 @@ class XetSubprocessRunner:
         if self._event_queue is None:
             return
         try:
-            from .types import ProgressPhase, TransferDirection
+            from ..types import ProgressPhase, TransferDirection
             event = ProgressEvent(
                 event_type=EventType.ERROR,
                 transfer_id=payload.get("transfer_id", ""),

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from ._xet_worker import _upload_bytes_worker, _upload_file_worker
-from .subprocess_runner import XetSubprocessRunner
+from .subprocess import XetSubprocessRunner
 from .token import is_xet_available
 from .types import (
     EventType,

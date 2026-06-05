@@ -27,7 +27,7 @@ import signal
 import time
 from typing import Any, Dict, List
 
-from .subprocess_messages import SubprocessMessage
+from .subprocess.messages import SubprocessMessage
 
 logger = logging.getLogger(__name__)
 
@@ -522,6 +522,356 @@ def _download_batch_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_ev
         _handle_worker_exception(mp_queue, e)
 
 
+# ── Streaming Xet Download Worker (NEW 2026-06-04) ────────────────
+#
+# This worker uses ``hf_xet.XetSession().new_download_stream_group()``
+# instead of ``hf_xet.download_files()`` to bypass the buffered API.
+# It writes each file's chunks to disk immediately via ``os.write`` on
+# a raw file descriptor (no userspace buffer) and calls ``os.fsync``
+# periodically so a SIGKILL preserves the in-flight data.
+#
+# See: docs/plans/2026-06-04-xet-streaming-subprocess.md for the
+# rationale and the test coverage matrix.
+
+
+# Default fsync cadence: commit the OS page cache to disk every N bytes.
+# 4 MiB is a good trade-off: cheap on SSD, fast enough on HDD, and
+# ensures no more than ~4 MiB of work is lost on SIGKILL.
+DEFAULT_FSYNC_INTERVAL = 4 * 1024 * 1024
+
+
+def _open_unbuffered(path: str) -> int:
+    """Open ``path`` for writing and return a raw file descriptor.
+
+    Unlike ``open(path, "wb")`` this skips Python's userspace buffer
+    (8 KiB by default) so each ``os.write()`` goes straight to the OS
+    page cache. Combined with periodic ``os.fsync()`` this guarantees
+    that a process killed mid-download leaves a non-empty file on disk.
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+
+
+def _xet_streaming_download_worker(
+    params: Dict[str, Any],
+    mp_queue: mp.Queue,
+    cancel_event: mp.Event,
+    session_factory: Any = None,
+) -> None:
+    """Worker function for multi-file Xet downloads via the STREAMING API.
+
+    Runs in a child process. Imports ``hf_xet`` locally.
+
+    Uses ``hf_xet.XetSession().new_download_stream_group().download_stream()``
+    to write each file's chunks to disk incrementally. Memory stays
+    bounded by chunk size (~4 MB) instead of file size. Each chunk is
+    written via ``os.write`` on a raw fd (no userspace buffer) and
+    ``os.fsync`` is called every ``fsync_interval`` bytes plus once at
+    the end in a ``finally`` block. This guarantees that a SIGKILL
+    at any point leaves a non-empty, non-truncated file on disk.
+
+    Args:
+        params: Dict with keys: file_specs (list of dicts with
+            ``hash``, ``file_size``, ``dest_path``, ``xet_file_data``),
+            token, endpoint, transfer_id, report_interval,
+            request_headers, fsync_interval (optional, default 4 MiB).
+        mp_queue: Queue for sending SubprocessMessage back to main process.
+        cancel_event: Event set by main process to signal cancellation.
+
+    Cancellation semantics:
+        - Cooperative: ``cancel_event.is_set()`` is checked between
+          chunks. If set, the worker's inner loop calls ``stream.cancel()``
+          (best-effort), breaks, and emits a CANCELLED message.
+        - Hard: the parent process can ``terminate()`` the child at any
+          point. The ``finally`` block ensures ``os.fsync`` + ``os.close``
+          run on the in-flight file before the OS reaps the process.
+    """
+    _init_worker()
+    from .types import (
+        EventType,
+        ProgressPhase,
+        TransferCancelledError,
+        TransferDirection,
+    )
+
+    transfer_id = params["transfer_id"]
+    file_specs: List[Dict[str, Any]] = params["file_specs"]
+    total_files = len(file_specs)
+    fsync_interval = params.get("fsync_interval", DEFAULT_FSYNC_INTERVAL)
+
+    try:
+        import hf_xet
+        from huggingface_hub.utils._xet import refresh_xet_connection_info
+    except ImportError as e:
+        _safe_put(mp_queue, SubprocessMessage.error(
+            message=str(e), error_type="ImportError", retryable=False,
+        ))
+        return
+
+    # Use first file's xet_file_data for credentials. We refresh the
+    # connection per file (see below) because the access token is scoped
+    # to a specific xet file's blocks; downloading a different file with
+    # another file's token would either fail or yield zero bytes (the
+    # symptom we hit when downloading all three xet files in a snapshot
+    # in one subprocess).
+    headers = params.get("request_headers", {})
+
+    # Build the XetSession once. The per-file DownloadStreamGroup is
+    # rebuilt on each iteration of the file loop, because the group
+    # binds to a single (endpoint, token) pair.
+    try:
+        session = hf_xet.XetSession()
+    except Exception as e:
+        _safe_put(mp_queue, SubprocessMessage.error(
+            message=f"Failed to build XetSession: {e}",
+            error_type=type(e).__name__,
+        ))
+        return
+
+    # Per-file group: we will re-create this in the loop below.
+    group = None
+
+    # Per-file throttler
+    throttler = _ProgressThrottler(report_interval=params.get("report_interval", 0.1))
+
+    # Track overall progress across all files
+    total_bytes_all = sum(spec["file_size"] for spec in file_specs)
+    bytes_completed_all = 0
+    start_time = time.time()
+    transfer_completed = 0
+    transfer_speed = 0.0
+
+    try:
+        for i, spec in enumerate(file_specs):
+            filename = os.path.basename(spec["dest_path"])
+            file_hash = spec["hash"]
+            file_size = spec["file_size"]
+            dest_path = spec["dest_path"]
+            import sys as _sys
+            print(f"[DBG] >>> file {i+1}/{total_files} START: {filename} (size={file_size})", file=_sys.stderr, flush=True)
+            _t0 = time.time()
+
+            # Cancellation check between files
+            if cancel_event.is_set():
+                from .types import TransferCancelledError
+                raise TransferCancelledError("Transfer cancelled by user")
+
+            # Empty file: create and emit COMPLETE.
+            # NOTE: we deliberately do NOT send a per-file SubprocessMessage.result()
+            # here. The relay thread treats ``result`` as the terminal message and
+            # breaks out of the loop on the first one it sees. If we emitted one
+            # per file, the relay would break after file 1 and lose all remaining
+            # progress events and the final result. Per-file completion is
+            # communicated via the COMPLETE event below; the final terminal
+            # ``result`` is sent once after the loop ends.
+            if file_size == 0:
+                fd = _open_unbuffered(dest_path)
+                os.close(fd)
+                _safe_put(mp_queue, SubprocessMessage.event({
+                    "event_type": EventType.COMPLETE.value,
+                    "transfer_id": transfer_id,
+                    "direction": TransferDirection.DOWNLOAD.value,
+                    "filename": filename,
+                    "phase": ProgressPhase.COMPLETE.value,
+                    "bytes_completed": 0,
+                    "total_bytes": 0,
+                    "percentage": 100.0,
+                    "speed": 0,
+                    "file_index": i,
+                    "total_files": total_files,
+                    "transfer_bytes_completed": transfer_completed,
+                    "transfer_bytes_total": total_bytes_all,
+                    "transfer_speed": transfer_speed,
+                }))
+                continue
+
+            # Open the stream
+            file_info = hf_xet.XetFileInfo(file_hash, file_size)
+
+            # Refresh the connection_info + group for this specific file.
+            # The Xet access token is scoped to a specific xet file's
+            # blocks; if we reuse the previous file's group/token, the
+            # stream will return 0 bytes for the new file (the symptom
+            # we hit when downloading 3 xet files in a single batch).
+            try:
+                this_xet_file_data = _deserialize_xet_file_data(
+                    spec.get("xet_file_data", {})
+                )
+                this_conn_info = refresh_xet_connection_info(
+                    file_data=this_xet_file_data, headers=headers,
+                )
+                # _XetFileDataProxy has __slots__, so use getattr
+                refresh_route = getattr(this_xet_file_data, "refresh_route", "")
+                group = session.new_download_stream_group(
+                    endpoint=this_conn_info.endpoint,
+                    token=this_conn_info.access_token,
+                    token_expiry_unix_secs=this_conn_info.expiration_unix_epoch,
+                    token_refresh_url=refresh_route,
+                    token_refresh_headers=headers,
+                )
+                print(f"[DBG]   group built in {time.time()-_t0:.2f}s", file=_sys.stderr, flush=True); _t0 = time.time()
+            except Exception as e:
+                _safe_put(mp_queue, SubprocessMessage.error(
+                    message=f"Failed to refresh credentials for {filename}: {e}",
+                    error_type=type(e).__name__,
+                ))
+                return
+
+            try:
+                stream = group.download_stream(file_info)
+                print(f"[DBG]   download_stream opened in {time.time()-_t0:.2f}s", file=_sys.stderr, flush=True); _t0 = time.time()
+            except Exception as e:
+                _safe_put(mp_queue, SubprocessMessage.error(
+                    message=f"Failed to open stream for {filename}: {e}",
+                    error_type=type(e).__name__,
+                ))
+                return
+
+            # Iterate chunks, write to disk, emit progress
+            fd = _open_unbuffered(dest_path)
+            bytes_completed = 0
+            bytes_since_fsync = 0
+            file_start_time = time.time()
+            cancelled = False
+            write_failed = False
+
+            try:
+                for chunk in stream:
+                    # Cooperative cancellation between chunks
+                    if cancel_event.is_set():
+                        if hasattr(stream, "cancel"):
+                            try:
+                                stream.cancel()
+                            except Exception:
+                                pass
+                        cancelled = True
+                        break
+                    if not chunk:
+                        continue
+                    try:
+                        os.write(fd, chunk)
+                    except OSError as e:
+                        _safe_put(mp_queue, SubprocessMessage.error(
+                            message=f"os.write failed for {filename}: {e}",
+                            error_type=type(e).__name__,
+                        ))
+                        write_failed = True
+                        break
+                    bytes_completed += len(chunk)
+                    bytes_since_fsync += len(chunk)
+                    if bytes_since_fsync >= fsync_interval:
+                        try:
+                            os.fsync(fd)
+                        except OSError:
+                            pass
+                        bytes_since_fsync = 0
+
+                    # Emit PROGRESS event (throttled)
+                    now = time.time()
+                    transfer_completed = bytes_completed_all + bytes_completed
+                    elapsed = now - start_time
+                    transfer_speed = (transfer_completed / elapsed) if elapsed > 0 else 0.0
+                    if throttler.should_emit(transfer_completed, total_bytes_all, now):
+                        _safe_put(mp_queue, SubprocessMessage.event({
+                            "event_type": EventType.PROGRESS.value,
+                            "transfer_id": transfer_id,
+                            "direction": TransferDirection.DOWNLOAD.value,
+                            "filename": filename,
+                            "phase": ProgressPhase.DOWNLOADING.value,
+                            "bytes_completed": bytes_completed,
+                            "total_bytes": file_size,
+                            "percentage": (bytes_completed / file_size * 100.0) if file_size else 0.0,
+                            "speed": transfer_speed,
+                            "file_index": i,
+                            "total_files": total_files,
+                            "transfer_bytes_completed": transfer_completed,
+                            "transfer_bytes_total": total_bytes_all,
+                            "transfer_speed": transfer_speed,
+                        }))
+                        throttler.record_emit(transfer_completed, now)
+            finally:
+                # Always fsync + close, even on cancel / error / success.
+                try:
+                    os.fsync(fd)
+                except OSError:
+                    pass
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+            if cancelled:
+                _safe_put(mp_queue, SubprocessMessage.cancelled(
+                    message=f"Cancelled mid-download of {filename} "
+                            f"({bytes_completed}/{file_size} bytes on disk)",
+                ))
+                return
+
+            if write_failed:
+                return
+
+            # Verify size match
+            if bytes_completed != file_size:
+                _safe_put(mp_queue, SubprocessMessage.error(
+                    message=f"Size mismatch for {filename}: got {bytes_completed} bytes, "
+                            f"expected {file_size}",
+                    error_type="SizeMismatch",
+                ))
+                return
+
+            bytes_completed_all += bytes_completed
+
+            # Emit COMPLETE event for this file.
+            # NOTE: we deliberately do NOT send a per-file SubprocessMessage.result()
+            # here (see empty-file branch above for the full rationale). The
+            # COMPLETE event above is what tells the parent "this file is done";
+            # the terminal ``result`` is sent once after the loop ends.
+            now = time.time()
+            elapsed = now - start_time
+            transfer_speed = (bytes_completed_all / elapsed) if elapsed > 0 else 0.0
+            _safe_put(mp_queue, SubprocessMessage.event({
+                "event_type": EventType.COMPLETE.value,
+                "transfer_id": transfer_id,
+                "direction": TransferDirection.DOWNLOAD.value,
+                "filename": filename,
+                "phase": ProgressPhase.COMPLETE.value,
+                "bytes_completed": bytes_completed,
+                "total_bytes": file_size,
+                "percentage": 100.0,
+                "speed": 0,
+                "file_index": i,
+                "total_files": total_files,
+                "transfer_bytes_completed": bytes_completed_all,
+                "transfer_bytes_total": total_bytes_all,
+                "transfer_speed": transfer_speed,
+            }))
+
+        # Emit ONE terminal ``result`` message after the loop ends.
+        # The relay thread treats this as the signal to stop and return
+        # the result to the parent. The payload summarizes the whole
+        # transfer (not a single file) so the parent can confirm
+        # ``status == "success"`` and look up the per-file dest paths
+        # via ``file_specs``.
+        _safe_put(mp_queue, SubprocessMessage.result(
+            filename=os.path.basename(file_specs[-1]["dest_path"]),
+            destination_path=os.path.commonpath(
+                [s["dest_path"] for s in file_specs]
+            ) if len({os.path.dirname(s["dest_path"]) for s in file_specs}) == 1
+            else file_specs[-1]["dest_path"],
+            file_size=bytes_completed_all,
+            transfer_id=transfer_id,
+            file_index=len(file_specs),
+            total_files=len(file_specs),
+            bytes_completed=bytes_completed_all,
+            total_bytes=total_bytes_all,
+        ))
+
+    except (KeyboardInterrupt, Exception) as e:
+        _handle_worker_exception(mp_queue, e)
+
+
 # ── Snapshot Download Worker ─────────────────────────────────────
 
 def _snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: mp.Event) -> None:
@@ -559,7 +909,7 @@ def _snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: m
 
     from .types import EventType, ProgressPhase, TransferCancelledError, TransferDirection
     from .callbacks import DownloadProgressTqdm, _dummy_file, state_manager
-    from .subprocess_messages import SubprocessMessage
+    from .subprocess.messages import SubprocessMessage
 
     transfer_id = params["transfer_id"]
     repo_id = params["repo_id"]
@@ -715,7 +1065,7 @@ def _xet_session_snapshot_worker(params: Dict[str, Any], mp_queue: mp.Queue, can
     _init_worker()
 
     from .types import EventType, ProgressPhase, TransferCancelledError, TransferDirection
-    from .subprocess_messages import SubprocessMessage
+    from .subprocess.messages import SubprocessMessage
 
     transfer_id = params["transfer_id"]
     files = params["files"]  # list of {"filename", "xet_hash", "size", "refresh_route"}
@@ -1010,7 +1360,7 @@ def _xet_session_download_worker(
     _init_worker()
 
     from .types import EventType, ProgressPhase, TransferCancelledError, TransferDirection
-    from .subprocess_messages import SubprocessMessage
+    from .subprocess.messages import SubprocessMessage
 
     transfer_id = params["transfer_id"]
     filename = os.path.basename(params["dest_path"])

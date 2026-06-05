@@ -71,8 +71,7 @@ from .callbacks import (
 from .token import XetCredentials, XetTokenManager, is_xet_available, has_xet_session
 
 # Subprocess isolation
-from .subprocess_runner import XetSubprocessRunner
-from .subprocess_messages import SubprocessMessage
+from .subprocess import SubprocessMessage, XetSubprocessRunner
 
 # High-level tracker
 from .tracker import HfTracker
