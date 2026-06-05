@@ -16,7 +16,20 @@ We must explicitly access each attribute that our tests patch, so that
 """
 import logging
 
+import pytest
+
 logger = logging.getLogger(__name__)
+
+# Register custom pytest marks used in the test suite. Pytest warns
+# about unknown marks otherwise. We register ``network`` (used by
+# ``test_xet_streaming_realworld.py``) so users can opt in via
+# ``-m network`` without a warning.
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "network: tests that require network access to huggingface.co "
+        "(skipped by default, opt in with `-m network`)",
+    )
 
 try:
     import huggingface_hub  # noqa: F401

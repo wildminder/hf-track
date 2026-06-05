@@ -52,17 +52,38 @@ class _TrackerCore:
         self.event_queue: queue.Queue[ProgressEvent] = queue.Queue(maxsize=10000)
         self._token_manager = XetTokenManager(token, endpoint)
         self._cancelled_transfers: set[str] = set()
+        # Plan 2026-06-05 step 3: registry of active
+        # ``XetSubprocessRunner`` instances keyed by transfer_id. Allows
+        # ``cancel(transfer_id)`` to forward the cancel signal to the
+        # child process immediately, without waiting for the parent's
+        # 1 s poll loop.
+        self._active_runners: dict[str, "XetSubprocessRunner"] = {}
         self._lock = threading.Lock()
 
     def cancel(self, transfer_id: str) -> None:
         """Cancel an active transfer by its transfer_id.
 
-        Marks the transfer for cancellation. The actual cancellation
-        is detected by the worker process via the ``is_cancelled`` hook
-        returned by :meth:`_prepare_transfer`.
+        Marks the transfer for cancellation and, if a runner is
+        currently registered for this transfer (i.e. a streaming or
+        subprocess-isolated download is in flight), forwards the
+        cancel to the child process immediately by calling
+        ``runner.request_cancel()``. The child breaks out of its
+        loop cooperatively on the next chunk boundary. If the child
+        is GIL-stalled, the caller is responsible for following up
+        with a hard ``runner.terminate(grace=2.0)`` after a short
+        grace period.
         """
         with self._lock:
             self._cancelled_transfers.add(transfer_id)
+            runner = self._active_runners.get(transfer_id)
+        if runner is not None:
+            try:
+                runner.request_cancel()
+            except Exception:
+                # Best-effort: if request_cancel raises, the parent
+                # poll loop will catch the cancel on the next iteration
+                # (within 1 s). Don't propagate the error.
+                pass
 
     def is_cancelled(self, transfer_id: str) -> bool:
         """Check if a transfer has been cancelled.

@@ -105,6 +105,7 @@ class _TrackerDownloads:
         transfer_id: Optional[str] = None,
         force_download: bool = False,
         fsync_interval: int = 4 * 1024 * 1024,
+        disable_fsync: bool = False,
     ) -> List[str]:
         """Download a repository snapshot using the streaming Xet API.
 
@@ -128,6 +129,11 @@ class _TrackerDownloads:
             transfer_id: Pre-existing transfer ID. Auto-generated if None.
             force_download: If True, re-download even if files exist.
             fsync_interval: Bytes between ``os.fsync`` calls in the worker.
+                Set to 0 to fsync after every chunk (slowest, safest).
+                Ignored when ``disable_fsync`` is True.
+            disable_fsync: If True, skip ``os.fsync`` entirely (fastest,
+                but a SIGKILL may leave zero-byte files on disk).
+                Defaults to False (fsync on at the configured interval).
 
         Returns:
             Sorted list of file paths that were downloaded.
@@ -138,6 +144,21 @@ class _TrackerDownloads:
             TransferProgressError: If a download fails.
         """
         transfer_id, is_cancelled_hook = self._prepare_transfer(transfer_id)  # type: ignore[attr-defined]
+
+        # Plan 2026-06-05 step 3: register a hook so that
+        # ``self.cancel(transfer_id)`` can forward the cancel to the
+        # child subprocess immediately (via the runner's
+        # ``request_cancel()``), without waiting for the parent's
+        # 1 s poll loop. The streaming download helper accepts an
+        # ``on_spawn`` callable that is called with the active
+        # ``XetSubprocessRunner`` as soon as it spawns the child.
+        def _on_spawn(runner: object) -> None:
+            with self._lock:  # type: ignore[attr-defined]
+                self._active_runners[transfer_id] = runner  # type: ignore[attr-defined]
+
+        def _on_finish() -> None:
+            with self._lock:  # type: ignore[attr-defined]
+                self._active_runners.pop(transfer_id, None)  # type: ignore[attr-defined]
 
         try:
             from ..download import download_snapshot_streaming as _download_snapshot_streaming
@@ -156,10 +177,15 @@ class _TrackerDownloads:
                 is_cancelled=is_cancelled_hook,
                 force_download=force_download,
                 fsync_interval=fsync_interval,
+                disable_fsync=disable_fsync,
+                on_spawn=_on_spawn,
+                on_finish=_on_finish,
             )
         except KeyboardInterrupt:
             raise TransferCancelledError("Download interrupted by user (Ctrl+C)")
         finally:
+            # Always clean up both the cancel set and the runner registry.
+            _on_finish()
             self.cleanup_transfer(transfer_id)  # type: ignore[attr-defined]
 
     def download_snapshot(

@@ -600,11 +600,32 @@ def _xet_streaming_download_worker(
     file_specs: List[Dict[str, Any]] = params["file_specs"]
     total_files = len(file_specs)
     fsync_interval = params.get("fsync_interval", DEFAULT_FSYNC_INTERVAL)
+    # Step 5 (plan §4 L1 / step 5): ``disable_fsync=True`` skips ALL
+    # ``os.fsync`` calls. Used by the ``--no-fsync`` example flag for
+    # max throughput (data loss on SIGKILL is acceptable). Default
+    # False preserves the existing safety semantics.
+    disable_fsync: bool = bool(params.get("disable_fsync", False))
+
+    # ── Diagnostic markers (stderr) ──────────────────────────────
+    # Each step writes to stderr so the user can see exactly where
+    # the worker hangs.  Uses sys.stderr.write (not logging) because
+    # the child process may not have logging configured and stderr
+    # is always available.  Remove after the streaming hang is fixed.
+    import sys as _sys
+    def _diag(marker: str) -> None:
+        _sys.stderr.write(f"[STREAM-WORKER] {marker}\n")
+        _sys.stderr.flush()
+
+    _diag(f"worker-start files={total_files} pid={os.getpid()}")
 
     try:
+        _diag("import-hf-xet-start")
         import hf_xet
+        _diag(f"import-hf-xet-ok version={getattr(hf_xet, '__version__', '?')}")
         from huggingface_hub.utils._xet import refresh_xet_connection_info
+        _diag("import-hf-hub-xet-ok")
     except ImportError as e:
+        _diag(f"import-failed: {e}")
         _safe_put(mp_queue, SubprocessMessage.error(
             message=str(e), error_type="ImportError", retryable=False,
         ))
@@ -622,8 +643,11 @@ def _xet_streaming_download_worker(
     # rebuilt on each iteration of the file loop, because the group
     # binds to a single (endpoint, token) pair.
     try:
+        _diag("xet-session-start")
         session = hf_xet.XetSession()
+        _diag("xet-session-ok")
     except Exception as e:
+        _diag(f"xet-session-failed: {e}")
         _safe_put(mp_queue, SubprocessMessage.error(
             message=f"Failed to build XetSession: {e}",
             error_type=type(e).__name__,
@@ -632,6 +656,9 @@ def _xet_streaming_download_worker(
 
     # Per-file group: we will re-create this in the loop below.
     group = None
+    # Per-file stream: tracked here so the outer finally (Step 2 of plan
+    # 2026-06-05) can call stream.cancel() on cleanup paths.
+    stream = None  # type: ignore[assignment]
 
     # Per-file throttler
     throttler = _ProgressThrottler(report_interval=params.get("report_interval", 0.1))
@@ -643,20 +670,28 @@ def _xet_streaming_download_worker(
     transfer_completed = 0
     transfer_speed = 0.0
 
+    # Outer finally (plan Step 2): release the in-flight ``stream`` and
+    # ``group`` on any exit path so the Rust runtime's background
+    # threads are not leaked. This is the cooperative counterpart to
+    # the parent's SIGTERM fallback in Step 4.
     try:
         for i, spec in enumerate(file_specs):
             filename = os.path.basename(spec["dest_path"])
             file_hash = spec["hash"]
             file_size = spec["file_size"]
             dest_path = spec["dest_path"]
-            import sys as _sys
-            print(f"[DBG] >>> file {i+1}/{total_files} START: {filename} (size={file_size})", file=_sys.stderr, flush=True)
-            _t0 = time.time()
 
             # Cancellation check between files
             if cancel_event.is_set():
                 from .types import TransferCancelledError
                 raise TransferCancelledError("Transfer cancelled by user")
+
+            # NOTE: The previous file's ``stream`` and ``group`` are left
+            # for the outer ``finally`` to clean up. Re-creating the group
+            # per-file gives us a fresh (endpoint, token) pair; the old
+            # group is closed there. The Rust runtime releases its
+            # background tasks as soon as the new stream starts producing
+            # data, so per-file leaks are bounded.
 
             # Empty file: create and emit COMPLETE.
             # NOTE: we deliberately do NOT send a per-file SubprocessMessage.result()
@@ -666,8 +701,16 @@ def _xet_streaming_download_worker(
             # progress events and the final result. Per-file completion is
             # communicated via the COMPLETE event below; the final terminal
             # ``result`` is sent once after the loop ends.
+            #
+            # Step 1 (plan D5): fsync the empty file before close so it
+            # is immediately visible on disk.
             if file_size == 0:
                 fd = _open_unbuffered(dest_path)
+                if not disable_fsync:
+                    try:
+                        os.fsync(fd)
+                    except OSError:
+                        pass
                 os.close(fd)
                 _safe_put(mp_queue, SubprocessMessage.event({
                     "event_type": EventType.COMPLETE.value,
@@ -689,21 +732,25 @@ def _xet_streaming_download_worker(
 
             # Open the stream
             file_info = hf_xet.XetFileInfo(file_hash, file_size)
-
+            _diag(f"file-{i}/{total_files} xet-info-built hash={file_hash[:12]}... size={file_size}")
+    
             # Refresh the connection_info + group for this specific file.
             # The Xet access token is scoped to a specific xet file's
             # blocks; if we reuse the previous file's group/token, the
             # stream will return 0 bytes for the new file (the symptom
             # we hit when downloading 3 xet files in a single batch).
             try:
+                _diag(f"file-{i} refresh-creds-start")
                 this_xet_file_data = _deserialize_xet_file_data(
                     spec.get("xet_file_data", {})
                 )
                 this_conn_info = refresh_xet_connection_info(
                     file_data=this_xet_file_data, headers=headers,
                 )
+                _diag(f"file-{i} refresh-creds-ok endpoint={this_conn_info.endpoint}")
                 # _XetFileDataProxy has __slots__, so use getattr
                 refresh_route = getattr(this_xet_file_data, "refresh_route", "")
+                _diag(f"file-{i} new-stream-group-start")
                 group = session.new_download_stream_group(
                     endpoint=this_conn_info.endpoint,
                     token=this_conn_info.access_token,
@@ -711,34 +758,43 @@ def _xet_streaming_download_worker(
                     token_refresh_url=refresh_route,
                     token_refresh_headers=headers,
                 )
-                print(f"[DBG]   group built in {time.time()-_t0:.2f}s", file=_sys.stderr, flush=True); _t0 = time.time()
+                _diag(f"file-{i} new-stream-group-ok")
             except Exception as e:
+                _diag(f"file-{i} refresh-creds-failed: {e}")
                 _safe_put(mp_queue, SubprocessMessage.error(
                     message=f"Failed to refresh credentials for {filename}: {e}",
                     error_type=type(e).__name__,
                 ))
                 return
-
+    
             try:
+                _diag(f"file-{i} download-stream-start (blocks until first chunk ready)")
                 stream = group.download_stream(file_info)
-                print(f"[DBG]   download_stream opened in {time.time()-_t0:.2f}s", file=_sys.stderr, flush=True); _t0 = time.time()
+                _diag(f"file-{i} download-stream-ok (iterator ready)")
             except Exception as e:
+                _diag(f"file-{i} download-stream-failed: {e}")
                 _safe_put(mp_queue, SubprocessMessage.error(
                     message=f"Failed to open stream for {filename}: {e}",
                     error_type=type(e).__name__,
                 ))
                 return
-
+    
             # Iterate chunks, write to disk, emit progress
             fd = _open_unbuffered(dest_path)
+            _diag(f"file-{i} fd-opened path={dest_path}")
             bytes_completed = 0
             bytes_since_fsync = 0
             file_start_time = time.time()
             cancelled = False
             write_failed = False
+            chunk_count = 0
 
             try:
+                _diag(f"file-{i} chunk-loop-start")
                 for chunk in stream:
+                    chunk_count += 1
+                    if chunk_count <= 3 or chunk_count % 10 == 0:
+                        _diag(f"file-{i} chunk-{chunk_count} len={len(chunk)}")
                     # Cooperative cancellation between chunks
                     if cancel_event.is_set():
                         if hasattr(stream, "cancel"):
@@ -761,7 +817,27 @@ def _xet_streaming_download_worker(
                         break
                     bytes_completed += len(chunk)
                     bytes_since_fsync += len(chunk)
-                    if bytes_since_fsync >= fsync_interval:
+                    if not disable_fsync and bytes_since_fsync >= fsync_interval:
+                        try:
+                            os.fsync(fd)
+                        except OSError:
+                            pass
+                        bytes_since_fsync = 0
+
+                    # Step 1 (plan D5): small-file early-fsync. If the
+                    # file is smaller than fsync_interval and we have
+                    # at least one chunk on disk, fsync immediately so
+                    # the partial file is visible to external observers
+                    # (e.g. ``watch ls -l``) before the next chunk
+                    # arrives. This fixes the "0-length during download"
+                    # symptom for small files like README.md, .gitignore,
+                    # config.json, etc.
+                    if (
+                        not disable_fsync
+                        and bytes_completed > 0
+                        and file_size <= fsync_interval
+                        and bytes_since_fsync > 0
+                    ):
                         try:
                             os.fsync(fd)
                         except OSError:
@@ -793,10 +869,11 @@ def _xet_streaming_download_worker(
                         throttler.record_emit(transfer_completed, now)
             finally:
                 # Always fsync + close, even on cancel / error / success.
-                try:
-                    os.fsync(fd)
-                except OSError:
-                    pass
+                if not disable_fsync:
+                    try:
+                        os.fsync(fd)
+                    except OSError:
+                        pass
                 try:
                     os.close(fd)
                 except OSError:
@@ -822,6 +899,7 @@ def _xet_streaming_download_worker(
                 return
 
             bytes_completed_all += bytes_completed
+            _diag(f"file-{i} done chunks={chunk_count} bytes={bytes_completed}")
 
             # Emit COMPLETE event for this file.
             # NOTE: we deliberately do NOT send a per-file SubprocessMessage.result()
@@ -854,6 +932,7 @@ def _xet_streaming_download_worker(
         # transfer (not a single file) so the parent can confirm
         # ``status == "success"`` and look up the per-file dest paths
         # via ``file_specs``.
+        _diag(f"all-files-done total_bytes={bytes_completed_all}")
         _safe_put(mp_queue, SubprocessMessage.result(
             filename=os.path.basename(file_specs[-1]["dest_path"]),
             destination_path=os.path.commonpath(
@@ -867,9 +946,32 @@ def _xet_streaming_download_worker(
             bytes_completed=bytes_completed_all,
             total_bytes=total_bytes_all,
         ))
-
+        _diag("result-sent-to-parent")
+    
     except (KeyboardInterrupt, Exception) as e:
+        _diag(f"exception: {type(e).__name__}: {e}")
         _handle_worker_exception(mp_queue, e)
+    finally:
+        # Step 2 (plan D4/D6/D10): release the in-flight stream and
+        # group on any exit path. Without this, a cancelled or
+        # errored download leaves the Rust runtime's background
+        # threads running until the OS reaps the process.
+        try:
+            if stream is not None and hasattr(stream, "cancel"):
+                try:
+                    stream.cancel()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if group is not None and hasattr(group, "close"):
+                try:
+                    group.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 # ── Snapshot Download Worker ─────────────────────────────────────

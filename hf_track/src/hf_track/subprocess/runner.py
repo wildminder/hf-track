@@ -176,6 +176,7 @@ class XetSubprocessRunner:
                 if self._process is not None and not self._process.is_alive():
                     # Drain any remaining messages before exiting
                     self._drain_queue()
+                    self._synthesize_result_if_missing()
                     break
                 continue
 
@@ -211,6 +212,57 @@ class XetSubprocessRunner:
                 # Emit CANCELLED event
                 self._emit_cancelled_from_payload(msg.payload)
                 break
+
+    def _synthesize_result_if_missing(self) -> None:
+        """If the worker process exited without sending a terminal message
+        (e.g. a segfault, OOM kill, or unhandled exception in the worker
+        function that bypassed ``_handle_worker_exception``), synthesize
+        an error result so the caller's ``wait()`` returns instead of
+        looping forever.
+
+        Without this, the parent thread in ``download_snapshot_streaming``
+        (or any other caller of ``runner.wait(timeout=...)``) would loop
+        indefinitely on ``result is None``, hiding the real failure
+        behind a "stuck" UI.
+        """
+        if self._result is not None:
+            return
+        exitcode = None
+        try:
+            if self._process is not None:
+                exitcode = self._process.exitcode
+        except Exception:
+            pass
+        # Negative exit codes indicate the process was killed by a signal
+        # (e.g. -9 for SIGKILL, -11 for SIGSEGV). 0 means clean exit but
+        # no result — should not normally happen, but treat as an error.
+        if exitcode is not None and exitcode < 0:
+            msg = (
+                f"Subprocess exited with signal {-exitcode} before sending "
+                f"a terminal message (likely killed externally, e.g. OOM "
+                f"or user SIGKILL)"
+            )
+        elif exitcode == 0:
+            msg = (
+                "Subprocess exited cleanly without sending a result message "
+                "(possible bug in the worker function)"
+            )
+        else:
+            msg = (
+                f"Subprocess exited with code {exitcode} before sending a "
+                f"terminal message"
+            )
+        logger.error(msg)
+        # Build a synthetic error payload and emit it through the same
+        # path that real errors take.
+        payload = {
+            "message": msg,
+            "error_type": "SubprocessDied",
+            "retryable": False,
+            "exitcode": exitcode,
+        }
+        self._result = payload
+        self._emit_error_from_payload(payload)
 
     def _drain_queue(self) -> None:
         """Drain any remaining messages from mp_queue after process exits."""
@@ -307,25 +359,90 @@ class XetSubprocessRunner:
         except Exception as e:
             logger.warning("Failed to emit CANCELLED event: %s", e)
 
-    def terminate(self) -> None:
-        """Terminate the child process: SIGTERM → join → SIGKILL → join.
+    def request_cancel(self) -> None:
+        """Set the cancel_event without terminating the process.
+
+        The child worker observes the event between chunks and breaks
+        out of the loop cooperatively. If the child is GIL-stalled
+        (e.g. blocked in ``XetDownloadStream.__next__``), the caller
+        should follow up with a hard ``terminate(grace=2.0)`` after a
+        short grace period.
+
+        See plan ``docs/plans/2026-06-05-xet-streaming-flush-reliability.md``
+        (Step 3, layer L3) for the full rationale.
 
         Always safe to call — no-op if no process is running.
-        Sets the cancel_event before terminating so the worker can
-        clean up gracefully if it checks the event.
         """
         with self._lock:
-            # Signal cancellation first
             if self._cancel_event is not None:
                 try:
                     self._cancel_event.set()
                 except Exception:
                     pass
 
-            # Stop the relay thread
+    def terminate(self, grace: Optional[float] = None) -> None:
+        """Terminate the child process.
+
+        Two-phase termination (plan 2026-06-05 step 4):
+
+        1. **Cooperative phase** (``grace`` > 0): set the cancel_event
+           and wait up to ``grace`` seconds for the child to exit on
+           its own. The child breaks out of its loop cooperatively on
+           the next chunk boundary. If the child exits within
+           ``grace``, no SIGTERM is sent.
+
+        2. **Hard phase**: send SIGTERM, wait ``terminate_timeout``,
+           escalate to SIGKILL if necessary. This is the original
+           terminate() behavior, used as a fallback when the child is
+           GIL-stalled (e.g. blocked in ``XetDownloadStream.__next__``)
+           or otherwise unable to observe the cancel_event.
+
+        Args:
+            grace: Seconds to wait for cooperative exit. If None
+                (default), the cooperative phase is skipped and the
+                hard phase is used immediately (preserves original
+                behavior for existing callers).
+
+        Always safe to call — no-op if no process is running.
+        """
+        with self._lock:
+            # Stop the relay thread (always, regardless of which phase)
             self._stop_event.set()
 
             if self._process is not None:
+                # === Phase 1: cooperative exit (only if grace > 0) ===
+                if grace and grace > 0:
+                    # Signal cancellation first
+                    if self._cancel_event is not None:
+                        try:
+                            self._cancel_event.set()
+                        except Exception:
+                            pass
+                    if self._process.is_alive():
+                        self._process.join(timeout=grace)
+                    if not self._process.is_alive():
+                        # Child exited cooperatively — clean up and return.
+                        if self._relay_thread is not None and self._relay_thread.is_alive():
+                            self._relay_thread.join(timeout=2.0)
+                        self._process = None
+                        self._mp_queue = None
+                        self._cancel_event = None
+                        self._relay_thread = None
+                        return
+                    # Child is still alive after grace period — fall through
+                    # to the hard phase (SIGTERM).
+
+                # === Phase 2: hard terminate (SIGTERM → SIGKILL) ===
+                # If grace was provided, the cancel_event was already
+                # set in phase 1; if grace was None, set it now so the
+                # child can still observe the cancel between chunks
+                # before SIGTERM lands.
+                if self._cancel_event is not None and not (grace and grace > 0):
+                    try:
+                        self._cancel_event.set()
+                    except Exception:
+                        pass
+
                 if self._process.is_alive():
                     logger.debug("Terminating subprocess pid=%d", self._process.pid)
                     self._process.terminate()

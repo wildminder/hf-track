@@ -312,6 +312,123 @@ def test_download_xet_streaming_uses_subprocess_api() -> None:
 # =============================================================================
 
 
+# =============================================================================
+# Plan 2026-06-05 step 5: --no-fsync flag + display trailing-drain
+# =============================================================================
+
+
+def test_download_xet_streaming_supports_no_fsync_flag() -> None:
+    """The streaming example exposes ``--no-fsync`` and forwards it.
+
+    The flag is documented in
+    ``docs/plans/2026-06-05-xet-streaming-flush-reliability.md``
+    (plan step 5). It must:
+
+      * be declared in ``parse_args()`` with default False,
+      * be forwarded as ``disable_fsync=`` to
+        ``HfTracker.download_snapshot_streaming``,
+      * be honored in the banner output so users see the disabled
+        fsync warning at runtime.
+    """
+    import argparse
+
+    mod = _import_example("download_xet_streaming")
+    src = Path(mod.__file__).read_text(encoding="utf-8")
+
+    # 1. parse_args exposes the flag.
+    # Inspect the source AST to confirm the flag is registered.
+    tree = ast.parse(src)
+    flag_names: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_argument"
+        ):
+            if node.args and isinstance(node.args[0], ast.Constant):
+                if isinstance(node.args[0].value, str):
+                    flag_names.add(node.args[0].value)
+    assert "--no-fsync" in flag_names, (
+        "download_xet_streaming.parse_args() must register --no-fsync; "
+        f"found flags: {sorted(flag_names)}"
+    )
+
+    # 2. The example forwards ``disable_fsync=args.no_fsync`` to
+    #    ``tracker.download_snapshot_streaming()``.
+    tree = ast.parse(src)
+    forwarded = False
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.keyword)
+            and node.arg == "disable_fsync"
+        ):
+            # Match the right-hand side: args.no_fsync
+            value = node.value
+            if (
+                isinstance(value, ast.Attribute)
+                and value.attr == "no_fsync"
+            ):
+                forwarded = True
+                break
+    assert forwarded, (
+        "Example must forward ``disable_fsync=args.no_fsync`` to "
+        "tracker.download_snapshot_streaming(). "
+        "See plan 2026-06-05 step 5."
+    )
+
+    # 3. The banner output mentions fsync state so users see the
+    #    warning at runtime.
+    assert "DISABLED" in src or "[DISABLED]" in src, (
+        "Banner should warn when fsync is disabled "
+        "(plan 2026-06-05 step 5)."
+    )
+
+
+def test_download_xet_streaming_drains_events_after_thread_exit() -> None:
+    """The display loop must keep draining events for a short window
+    after the worker thread exits.
+
+    Plan 2026-06-05 step 5: the subprocess runner.terminate(grace=...)
+    call in ``download/xet_streaming.py``'s finally block can publish
+    a final COMPLETE / ERROR / CANCELLED event a few milliseconds
+    AFTER the worker thread has exited (the message goes through the
+    pipe and is read by the tracker drainer in the main thread). The
+    display loop in the example must keep polling the event queue
+    for a short trailing-drain window so the terminal state is shown.
+
+    We detect this by checking the source for the trailing-drain
+    pattern: a ``time.time() + <duration>`` deadline followed by a
+    ``queue.get_nowait()`` loop after the main ``while t.is_alive()``
+    loop.
+    """
+    mod = _import_example("download_xet_streaming")
+    src = Path(mod.__file__).read_text(encoding="utf-8")
+
+    # 1. The trailing-drain uses get_nowait() (non-blocking) on the
+    #    tracker.event_queue.
+    assert "get_nowait()" in src, (
+        "Trailing-drain should use non-blocking queue.get_nowait(); "
+        "see plan 2026-06-05 step 5."
+    )
+
+    # 2. The trailing-drain is bounded by a deadline (time.time() + ...).
+    assert "time.time()" in src and "drain_deadline" in src, (
+        "Trailing-drain must be bounded by a deadline (plan step 5)."
+    )
+
+    # 3. The trailing-drain sits AFTER the main "while t.is_alive()"
+    #    loop, not before.
+    main_loop_idx = src.find("while t.is_alive()")
+    drain_idx = src.find("drain_deadline")
+    assert main_loop_idx >= 0 and drain_idx >= 0, (
+        "Could not locate main display loop / trailing-drain in example."
+    )
+    assert drain_idx > main_loop_idx, (
+        "Trailing-drain must be AFTER the main 'while t.is_alive()' "
+        "display loop, not inside it."
+    )
+
+
 def test_progress_bar_formatting_helpers() -> None:
     """The progress-bar example exposes the documented formatting helpers.
 

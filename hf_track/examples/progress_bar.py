@@ -177,13 +177,34 @@ class ConsoleProgressDisplay:
             elapsed = time.time() - self._start_time
             avg_speed = event.bytes_completed / elapsed if elapsed > 0 else 0
             size_str = format_bytes(event.bytes_completed)
-            
-            if event.total_files > 1:
-                line = f"  [OK] Complete! {event.total_files} files ({size_str}) downloaded in {format_eta(elapsed)} (avg {format_speed(avg_speed)})"
-            else:
-                line = f"  [OK] Complete! {size_str} downloaded in {format_eta(elapsed)} (avg {format_speed(avg_speed)})"
 
-            sys.stderr.write(f"\r{line}\n")
+            # Distinguish a per-file COMPLETE (mid-snapshot, file_index <
+            # total_files) from the final terminal COMPLETE. Per-file
+            # COMPLETE events fire once for every file in a snapshot;
+            # emitting "[OK] Complete! N files" each time is misleading
+            # because the snapshot is not done yet. Only the final event
+            # (file_index == total_files, or file_index == 0 in single-
+            # file mode) should print the "Complete!" summary; the rest
+            # are progress checkpoints.
+            is_final = (
+                event.total_files <= 1
+                or event.file_index >= event.total_files
+            )
+
+            if is_final:
+                if event.total_files > 1:
+                    line = f"  [OK] Complete! {event.total_files} files ({size_str}) downloaded in {format_eta(elapsed)} (avg {format_speed(avg_speed)})"
+                else:
+                    line = f"  [OK] Complete! {size_str} downloaded in {format_eta(elapsed)} (avg {format_speed(avg_speed)})"
+                sys.stderr.write(f"\r{line}\n")
+            else:
+                # Per-file checkpoint. Print a brief one-liner so the
+                # user can see the snapshot is making progress file by
+                # file, even when individual files are large or the
+                # streaming API yields one chunk at the end.
+                pct_str = f"({event.percentage:5.1f}%)"
+                line = f"  done file {event.file_index}/{event.total_files} {pct_str} {size_str}"
+                sys.stderr.write(f"\r{line}\n")
             sys.stderr.flush()
             self._last_line_len = 0
             return

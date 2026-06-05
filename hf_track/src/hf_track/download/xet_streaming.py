@@ -44,6 +44,9 @@ def download_snapshot_streaming(
     is_cancelled: Optional[Callable[[], bool]] = None,
     force_download: bool = False,
     fsync_interval: int = 4 * 1024 * 1024,
+    disable_fsync: bool = False,
+    on_spawn: Optional[Callable[[object], None]] = None,
+    on_finish: Optional[Callable[[], None]] = None,
 ) -> List[str]:
     """Download a snapshot using the streaming Xet API.
 
@@ -57,6 +60,31 @@ def download_snapshot_streaming(
     * For non-xet files: downloads in the main process via
       ``huggingface_hub.hf_hub_download`` (these are typically small
       JSON, markdown, .gitignore; bounded memory).
+
+    Args:
+        repo_id: HuggingFace repository ID.
+        token: Optional API token.
+        event_queue: Queue used to publish progress events.
+        allow_patterns: Optional glob patterns to include.
+        ignore_patterns: Optional glob patterns to exclude.
+        repo_type: ``"model"``, ``"dataset"`` or ``"space"``.
+        revision: Optional git revision.
+        endpoint: Optional HF endpoint override.
+        local_dir: Optional local directory to write to.
+        transfer_id: Pre-existing transfer ID. Auto-generated if None.
+        report_interval: Seconds between progress events.
+        is_cancelled: Optional callback returning True to cancel.
+        force_download: If True, re-download even if files exist.
+        fsync_interval: Bytes between ``os.fsync`` calls in the worker.
+        disable_fsync: If True, skip ``os.fsync`` entirely (fastest,
+            but a SIGKILL may leave zero-byte files on disk).
+            Defaults to False (fsync on at the configured interval).
+        on_spawn: Optional hook called with the active
+            ``XetSubprocessRunner`` as soon as the subprocess is
+            spawned. Used by ``HfTracker`` to register for fast
+            cancel forwarding.
+        on_finish: Optional cleanup hook called after the
+            subprocess exits (success, error, or cancel).
 
     Returns:
         Sorted list of file paths that were downloaded.
@@ -216,16 +244,45 @@ def download_snapshot_streaming(
             "report_interval": report_interval,
             "request_headers": {},
             "fsync_interval": fsync_interval,
+            "disable_fsync": disable_fsync,
         }
         runner = XetSubprocessRunner()
         runner.spawn_streaming(params=params, event_queue=event_queue)
+        # Plan 2026-06-05 step 3: notify the caller that the runner
+        # is now active so it can register for fast cancel forwarding.
+        if on_spawn is not None:
+            try:
+                on_spawn(runner)
+            except Exception:
+                pass
         try:
+            stall_count = 0
             while True:
                 result = runner.wait(timeout=1.0)
                 if result is not None:
                     break
+                # Safety net: if the subprocess is dead but we still
+                # have no result, the _synthesize_result_if_missing
+                # fix in the runner should have set self._result.
+                # If somehow it didn't, break after 3 consecutive
+                # dead checks to avoid an infinite loop.
+                if not runner.is_alive():
+                    stall_count += 1
+                    if stall_count >= 3:
+                        logger.error(
+                            "Subprocess is dead but no result received "
+                            "after %d checks — breaking wait loop",
+                            stall_count,
+                        )
+                        break
+                else:
+                    stall_count = 0
                 if is_cancelled is not None and is_cancelled():
-                    runner.terminate()
+                    # Plan step 3: request_cancel sets the event
+                    # directly; step 4: terminate(grace=2.0) gives the
+                    # child a 2 s cooperative window before SIGTERM.
+                    runner.request_cancel()
+                    runner.terminate(grace=2.0)
                     event_queue.put(
                         ProgressEvent.cancelled_event(
                             transfer_id=transfer_id,
@@ -239,7 +296,8 @@ def download_snapshot_streaming(
             if result.get("status") != "success":
                 raise TransferProgressError(result.get("message", "Streaming snapshot failed"))
         except KeyboardInterrupt:
-            runner.terminate()
+            runner.request_cancel()
+            runner.terminate(grace=2.0)
             event_queue.put(
                 ProgressEvent.cancelled_event(
                     transfer_id=transfer_id,
@@ -249,7 +307,12 @@ def download_snapshot_streaming(
             )
             raise TransferCancelledError("Snapshot streaming interrupted by user (Ctrl+C)")
         finally:
-            runner.terminate()
+            runner.terminate(grace=2.0)
+            if on_finish is not None:
+                try:
+                    on_finish()
+                except Exception:
+                    pass
         for spec in file_specs:
             downloaded_paths.append(spec["dest_path"])
 
