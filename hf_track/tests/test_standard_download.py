@@ -5,7 +5,7 @@ from __future__ import annotations
 import queue
 from unittest.mock import MagicMock, patch
 
-from hf_track.standard_download import download_snapshot
+from hf_track.download import download_snapshot
 from hf_track.callbacks import state_manager
 from hf_track.types import EventType, TransferDirection, ProgressPhase
 

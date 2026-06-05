@@ -9,8 +9,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from hf_track.subprocess_messages import SubprocessMessage
-from hf_track.subprocess_runner import XetSubprocessRunner
+from hf_track.subprocess import SubprocessMessage
+from hf_track.subprocess import XetSubprocessRunner
 from hf_track.types import EventType, ProgressEvent, TransferDirection
 
 
@@ -568,3 +568,126 @@ class TestXetSubprocessRunnerProperties:
             exitcode = runner.exitcode
 
         runner.terminate()
+
+
+# ── Streaming Spawn Tests ────────────────────────────────────────
+
+
+class TestSpawnStreaming:
+    """Test XetSubprocessRunner.spawn_streaming() — the streaming variant.
+
+    spawn_streaming() is a thin convenience wrapper around start() that
+    uses the chunk-by-chunk _xet_streaming_download_worker.
+
+    Note: These tests verify the wrapper behavior in-process (using a
+    mock worker_func substituted for the streaming worker). End-to-end
+    subprocess behavior is covered by test_xet_worker.py and the
+    integration test test_subprocess_e2e.py.
+
+    We avoid running a real subprocess in unit tests because:
+    - multiprocessing.spawn cannot pickle a local function or a MagicMock
+      (would need an importable module-level worker, which is exactly
+       what the real worker is)
+    - The behavior of "the right worker function is invoked" is what
+      matters at this layer; the actual subprocess execution is already
+      tested by the worker-level tests.
+    """
+
+    def _make_streaming_params(self, tmp_path, file_size=1000):
+        """Build streaming-style params (with file_specs list)."""
+        return {
+            "file_specs": [{
+                "hash": "fakehash123",
+                "file_size": file_size,
+                "dest_path": str(tmp_path / "model.bin"),
+                "xet_file_data": {"file_hash": "fakehash123", "refresh_route": "https://xet.example.com/refresh"},
+            }],
+            "token": "hf_test",
+            "endpoint": None,
+            "transfer_id": "stream-runner-001",
+            "report_interval": 0.1,
+            "fsync_interval": 4 * 1024 * 1024,
+            "request_headers": {},
+        }
+
+    def test_spawn_streaming_method_exists(self):
+        """XetSubprocessRunner has a spawn_streaming() method."""
+        assert hasattr(XetSubprocessRunner, "spawn_streaming")
+        assert callable(XetSubprocessRunner.spawn_streaming)
+
+    def test_spawn_streaming_raises_when_already_running(self, tmp_path):
+        """spawn_streaming raises RuntimeError if start() reports already running.
+
+        We mock start() to raise RuntimeError as it would if a process
+        were already running. This avoids needing a real subprocess.
+        """
+        runner = XetSubprocessRunner(terminate_timeout=2.0, kill_timeout=1.0)
+
+        with patch.object(
+            runner, "start",
+            side_effect=RuntimeError("A subprocess is already running. Call terminate() first."),
+        ):
+            with pytest.raises(RuntimeError, match="already running"):
+                runner.spawn_streaming(
+                    self._make_streaming_params(tmp_path),
+                    queue.Queue(),
+                )
+
+    def test_spawn_streaming_uses_correct_worker(self):
+        """spawn_streaming uses _xet_streaming_download_worker, not other workers."""
+        import hf_track._xet_worker as worker_module
+        # The spawn_streaming method should reference the streaming worker.
+        # Verify by reading the source: it must import _xet_streaming_download_worker
+        # and pass it to start().
+        runner = XetSubprocessRunner()
+        import inspect
+        src = inspect.getsource(runner.spawn_streaming)
+        assert "_xet_streaming_download_worker" in src
+        assert "self.start" in src
+        # And the worker function must exist in the worker module
+        assert hasattr(worker_module, "_xet_streaming_download_worker")
+        assert callable(worker_module._xet_streaming_download_worker)
+
+    def test_spawn_streaming_passes_params_unchanged(self, tmp_path):
+        """spawn_streaming passes the params dict through to start() unchanged.
+
+        We verify this by mocking start() to capture the call.
+        """
+        runner = XetSubprocessRunner(terminate_timeout=2.0, kill_timeout=1.0)
+        event_queue = queue.Queue()
+        params = self._make_streaming_params(tmp_path, file_size=2048)
+
+        with patch.object(runner, "start") as mock_start:
+            runner.spawn_streaming(params, event_queue)
+            mock_start.assert_called_once()
+            call_args = mock_start.call_args
+            # The first positional arg after self should be the worker func
+            # (it can be positional or keyword)
+            assert call_args.kwargs.get("params") is params or call_args.args[1] is params
+            # The worker func is the streaming worker
+            wf = call_args.kwargs.get("worker_func") or call_args.args[0]
+            import hf_track._xet_worker as wm
+            assert wf is wm._xet_streaming_download_worker
+            # The event_queue should also be passed
+            eq = call_args.kwargs.get("event_queue") or call_args.args[2]
+            assert eq is event_queue
+
+    def test_spawn_streaming_signature(self):
+        """spawn_streaming has the expected (params, event_queue) signature."""
+        import inspect
+        sig = inspect.signature(XetSubprocessRunner.spawn_streaming)
+        params = list(sig.parameters.keys())
+        # self, params, event_queue
+        assert params == ["self", "params", "event_queue"]
+        # Both should be required (no default)
+        for name in ("params", "event_queue"):
+            assert sig.parameters[name].default is inspect.Parameter.empty
+
+    def test_spawn_streaming_returns_none(self, tmp_path):
+        """spawn_streaming returns None (state is observed via is_alive() / wait())."""
+        runner = XetSubprocessRunner(terminate_timeout=2.0, kill_timeout=1.0)
+        params = self._make_streaming_params(tmp_path)
+
+        with patch.object(runner, "start"):
+            result = runner.spawn_streaming(params, queue.Queue())
+            assert result is None

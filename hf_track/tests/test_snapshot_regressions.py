@@ -101,7 +101,7 @@ class TestSnapshotPathLayout:
         # code does ``full_name.split("/", 1)[1]`` and the correct
         # code strips the full prefix. We verify that *somewhere* in
         # the snapshot download path, the correct prefix is used.
-        from hf_track.xet_download import download_snapshot_with_xet_session
+        from hf_track.download import download_snapshot_with_xet_session
         import inspect
         source = inspect.getsource(download_snapshot_with_xet_session)
 
@@ -131,7 +131,7 @@ class TestSnapshotFileEnumeration:
         subdirectories). The custom ``fs.ls(...)`` call block must
         be gone.
         """
-        from hf_track.xet_download import download_snapshot_with_xet_session
+        from hf_track.download import download_snapshot_with_xet_session
         import inspect
         import re
         import textwrap
@@ -165,7 +165,7 @@ class TestSnapshotFileEnumeration:
         ``huggingface_hub.snapshot_download``) so non-xet files are
         handled correctly.
         """
-        from hf_track.xet_download import (
+        from hf_track.download import (
             download_snapshot_with_xet,
             download_snapshot_with_xet_session,
         )
@@ -228,7 +228,7 @@ class TestSnapshotResumeSafety:
         (which is responsible for the 0-byte file bug) is no longer
         called from the public download_snapshot_with_xet_session API.
         """
-        from hf_track.xet_download import download_snapshot_with_xet_session
+        from hf_track.download import download_snapshot_with_xet_session
         import inspect
         source = inspect.getsource(download_snapshot_with_xet_session)
         assert "_xet_session_snapshot_worker" not in source, (
@@ -279,14 +279,14 @@ class TestDispatcherRouting:
 class TestSnapshotResultIsDirectory:
     """The snapshot return value should be the local_dir, not a nested folder."""
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_snapshot_returns_local_dir(self, MockRunner, _mock_xet_avail):
         """When local_dir is set, the snapshot download should
         return the local_dir path. The function should not nest
         the repo name inside local_dir.
         """
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {

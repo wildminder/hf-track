@@ -14,8 +14,8 @@ from typing import Any, Dict
 
 import pytest
 
-from hf_track.subprocess_messages import SubprocessMessage
-from hf_track.subprocess_runner import XetSubprocessRunner
+from hf_track.subprocess import SubprocessMessage
+from hf_track.subprocess import XetSubprocessRunner
 from hf_track.types import EventType, ProgressEvent, TransferDirection
 
 

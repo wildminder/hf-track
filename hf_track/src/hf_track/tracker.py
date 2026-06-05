@@ -102,7 +102,7 @@ class HfTracker:
                         f"falling back to tqdm_class: {xet_err}"
                     )
 
-            from .standard_download import download_file as _download_file
+            from .download import download_file as _download_file
 
             return _download_file(
                 repo_id=repo_id,
@@ -123,6 +123,75 @@ class HfTracker:
         finally:
             self.cleanup_transfer(transfer_id)
 
+    def download_snapshot_streaming(
+        self,
+        repo_id: str,
+        allow_patterns=None,
+        ignore_patterns=None,
+        repo_type: str = "model",
+        revision: Optional[str] = None,
+        local_dir: Optional[str] = None,
+        transfer_id: Optional[str] = None,
+        force_download: bool = False,
+        fsync_interval: int = 4 * 1024 * 1024,
+    ) -> List[str]:
+        """Download a repository snapshot using the streaming Xet API.
+
+        Alternative to :meth:`download_snapshot` that uses the chunk-by-chunk
+        ``XetSession().new_download_stream_group().download_stream()`` API for
+        Xet-stored files. Each chunk is flushed to disk via ``os.write`` +
+        ``os.fsync`` and the child subprocess can be killed cleanly mid-file.
+
+        Non-Xet files (small JSON, markdown, etc.) are downloaded via the
+        standard ``huggingface_hub.hf_hub_download`` call in the parent
+        process -- these files are small and bounded.
+
+        Args:
+            repo_id: HuggingFace repository ID.
+            allow_patterns: Optional list of glob patterns to include.
+            ignore_patterns: Optional list of glob patterns to exclude.
+            repo_type: Repository type (model/dataset/space).
+            revision: Optional git revision.
+            local_dir: Local directory to download files to. Defaults to
+                the HuggingFace cache (``HF_HOME``/hub).
+            transfer_id: Pre-existing transfer ID. Auto-generated if None.
+            force_download: If True, re-download even if files exist.
+            fsync_interval: Bytes between ``os.fsync`` calls in the worker.
+
+        Returns:
+            Sorted list of file paths that were downloaded.
+
+        Raises:
+            ImportError: If ``hf_xet`` is not installed.
+            TransferCancelledError: If the user cancels mid-stream.
+            TransferProgressError: If a download fails.
+        """
+        transfer_id, is_cancelled_hook = self._prepare_transfer(transfer_id)
+
+        try:
+            from .download import download_snapshot_streaming as _download_snapshot_streaming
+            return _download_snapshot_streaming(
+                repo_id=repo_id,
+                token=self._token,
+                event_queue=self.event_queue,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                repo_type=repo_type,
+                revision=revision,
+                endpoint=self._endpoint,
+                local_dir=local_dir,
+                transfer_id=transfer_id,
+                report_interval=self._report_interval,
+                is_cancelled=is_cancelled_hook,
+                force_download=force_download,
+                fsync_interval=fsync_interval,
+            )
+        except KeyboardInterrupt:
+            raise TransferCancelledError("Download interrupted by user (Ctrl+C)")
+        finally:
+            self.cleanup_transfer(transfer_id)
+
+
     def download_snapshot(
         self,
         repo_id: str,
@@ -136,7 +205,7 @@ class HfTracker:
         use_xet: bool = True,
         **kwargs,
     ) -> str:
-        from .standard_download import download_snapshot as _download_snapshot
+        from .download import download_snapshot as _download_snapshot
 
         transfer_id, is_cancelled_hook = self._prepare_transfer(transfer_id)
 
@@ -395,8 +464,8 @@ class HfTracker:
         is_cancelled: Callable[[], bool],
     ) -> str:
         from huggingface_hub import HfApi, hf_hub_url
-        from .xet_download import download_file_with_xet
-        from .xet_download import download_file_with_xet_session
+        from .download import download_file_with_xet
+        from .download import download_file_with_xet_session
 
         api = HfApi(endpoint=self._endpoint, token=self._token)
         url = hf_hub_url(
@@ -504,7 +573,7 @@ class HfTracker:
             TransferCancelledError: If the transfer is cancelled.
             TransferProgressError: If the download fails.
         """
-        from .xet_download import download_snapshot_with_xet
+        from .download import download_snapshot_with_xet
 
         # Use the proven path: ``huggingface_hub.snapshot_download``
         # running in an isolated subprocess (so ``hf_xet`` is loaded

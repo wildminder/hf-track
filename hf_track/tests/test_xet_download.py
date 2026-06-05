@@ -18,9 +18,9 @@ class TestDownloadFileWithXet:
 
     def test_raises_import_error_when_xet_unavailable(self):
         """Should raise ImportError when hf_xet is not installed."""
-        from hf_track.xet_download import download_file_with_xet
+        from hf_track.download import download_file_with_xet
 
-        with patch("hf_track.xet_download.is_xet_available", return_value=False):
+        with patch("hf_track.download.xet_file.is_xet_available", return_value=False):
             with pytest.raises(ImportError, match="hf_xet is not installed"):
                 download_file_with_xet(
                     file_hash="abc123",
@@ -31,11 +31,11 @@ class TestDownloadFileWithXet:
                     event_queue=queue.Queue(),
                 )
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_file.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_file.XetSubprocessRunner")
     def test_emits_start_event(self, MockRunner, _mock_xet_avail):
         """Should emit a START event before downloading."""
-        from hf_track.xet_download import download_file_with_xet
+        from hf_track.download import download_file_with_xet
 
         # Mock runner to return success immediately
         mock_runner = MagicMock()
@@ -70,11 +70,11 @@ class TestDownloadFileWithXet:
         assert start_event.phase == ProgressPhase.DOWNLOADING
         assert start_event.total_bytes == 2048
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_file.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_file.XetSubprocessRunner")
     def test_emits_complete_event_on_success(self, MockRunner, _mock_xet_avail):
         """Should emit a COMPLETE event after successful download."""
-        from hf_track.xet_download import download_file_with_xet
+        from hf_track.download import download_file_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -108,11 +108,11 @@ class TestDownloadFileWithXet:
         mock_runner.start.assert_called_once()
         mock_runner.terminate.assert_called()
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_file.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_file.XetSubprocessRunner")
     def test_emits_error_event_on_failure(self, MockRunner, _mock_xet_avail):
         """Should raise RuntimeError with TransferError message when worker returns error."""
-        from hf_track.xet_download import download_file_with_xet
+        from hf_track.download import download_file_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -139,11 +139,11 @@ class TestDownloadFileWithXet:
 
         mock_runner.terminate.assert_called()
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_file.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_file.XetSubprocessRunner")
     def test_generates_transfer_id_when_not_provided(self, MockRunner, _mock_xet_avail):
         """Should generate a transfer_id if not provided."""
-        from hf_track.xet_download import download_file_with_xet
+        from hf_track.download import download_file_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -172,11 +172,11 @@ class TestDownloadFileWithXet:
         assert start_event.transfer_id  # Not empty
         assert len(start_event.transfer_id) == 36  # UUID format
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_file.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_file.XetSubprocessRunner")
     def test_cancel_via_is_cancelled_hook(self, MockRunner, _mock_xet_avail):
         """Should terminate runner and emit CANCELLED when is_cancelled returns True."""
-        from hf_track.xet_download import download_file_with_xet
+        from hf_track.download import download_file_with_xet
         from hf_track.types import TransferCancelledError
 
         mock_runner = MagicMock()
@@ -217,9 +217,9 @@ class TestDownloadFilesWithXet:
 
     def test_raises_import_error_when_xet_unavailable(self):
         """Should raise ImportError when hf_xet is not installed."""
-        from hf_track.xet_download import download_files_with_xet
+        from hf_track.download import download_files_with_xet
 
-        with patch("hf_track.xet_download.is_xet_available", return_value=False):
+        with patch("hf_track.download.xet_batch.is_xet_available", return_value=False):
             with pytest.raises(ImportError, match="hf_xet is not installed"):
                 download_files_with_xet(
                     file_specs=[{"dest_path": "/tmp/a.bin", "hash": "a", "file_size": 100, "xet_file_data": MagicMock()}],
@@ -227,11 +227,11 @@ class TestDownloadFilesWithXet:
                     event_queue=queue.Queue(),
                 )
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_batch.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_batch.XetSubprocessRunner")
     def test_emits_start_and_complete_for_each_file(self, MockRunner, _mock_xet_avail):
         """Should emit START events for each file and return results."""
-        from hf_track.xet_download import download_files_with_xet
+        from hf_track.download import download_files_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -263,11 +263,11 @@ class TestDownloadFilesWithXet:
         start_events = [e for e in events if e.event_type == EventType.START]
         assert len(start_events) == 2
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_batch.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_batch.XetSubprocessRunner")
     def test_emits_error_events_for_all_files_on_failure(self, MockRunner, _mock_xet_avail):
         """Should emit ERROR events for all files when batch fails."""
-        from hf_track.xet_download import download_files_with_xet
+        from hf_track.download import download_files_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -307,7 +307,7 @@ class TestXetDownloadResult:
     """Tests for XetDownloadResult dataclass."""
 
     def test_default_values(self):
-        from hf_track.xet_download import XetDownloadResult
+        from hf_track.download import XetDownloadResult
 
         result = XetDownloadResult(success=True, filename="test.bin")
         assert result.success is True
@@ -317,7 +317,7 @@ class TestXetDownloadResult:
         assert result.transfer_id == ""
 
     def test_all_fields(self):
-        from hf_track.xet_download import XetDownloadResult
+        from hf_track.download import XetDownloadResult
 
         result = XetDownloadResult(
             success=True,
@@ -339,9 +339,9 @@ class TestDownloadSnapshotWithXet:
 
     def test_raises_import_error_when_xet_unavailable(self):
         """Should raise ImportError when hf_xet is not installed."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
 
-        with patch("hf_track.xet_download.is_xet_available", return_value=False):
+        with patch("hf_track.download.xet_snapshot.is_xet_available", return_value=False):
             with pytest.raises(ImportError, match="hf_xet is not installed"):
                 download_snapshot_with_xet(
                     repo_id="test/repo",
@@ -349,11 +349,11 @@ class TestDownloadSnapshotWithXet:
                     event_queue=queue.Queue(),
                 )
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_emits_start_event(self, MockRunner, _mock_xet_avail):
         """Should emit a START event before downloading."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -383,11 +383,11 @@ class TestDownloadSnapshotWithXet:
         assert start_event.filename == "test/repo"
         assert start_event.phase == ProgressPhase.DOWNLOADING
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_returns_destination_path_on_success(self, MockRunner, _mock_xet_avail):
         """Should return the destination_path from the result."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -412,11 +412,11 @@ class TestDownloadSnapshotWithXet:
 
         assert result == "/my/local/dir"
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_raises_cancelled_on_cancelled_result(self, MockRunner, _mock_xet_avail):
         """Should raise TransferCancelledError when worker returns cancelled status."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
         from hf_track.types import TransferCancelledError
 
         mock_runner = MagicMock()
@@ -437,11 +437,11 @@ class TestDownloadSnapshotWithXet:
                 transfer_id="snap-cancel",
             )
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_raises_progress_error_on_error_result(self, MockRunner, _mock_xet_avail):
         """Should raise TransferProgressError when worker returns error status."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -462,11 +462,11 @@ class TestDownloadSnapshotWithXet:
                 transfer_id="snap-err",
             )
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_cancel_via_is_cancelled_hook(self, MockRunner, _mock_xet_avail):
         """Should terminate runner and raise TransferCancelledError when is_cancelled returns True."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
         from hf_track.types import TransferCancelledError
 
         mock_runner = MagicMock()
@@ -495,11 +495,11 @@ class TestDownloadSnapshotWithXet:
 
         mock_runner.terminate.assert_called()
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_terminates_runner_on_keyboard_interrupt(self, MockRunner, _mock_xet_avail):
         """Should terminate runner and raise TransferCancelledError on KeyboardInterrupt."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
         from hf_track.types import TransferCancelledError
 
         mock_runner = MagicMock()
@@ -519,11 +519,11 @@ class TestDownloadSnapshotWithXet:
 
         mock_runner.terminate.assert_called()
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_terminates_runner_on_unexpected_exception(self, MockRunner, _mock_xet_avail):
         """Should terminate runner and emit ERROR event on unexpected exceptions."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.side_effect = RuntimeError("unexpected crash")
@@ -548,11 +548,11 @@ class TestDownloadSnapshotWithXet:
         error_events = [e for e in events if e.event_type == EventType.ERROR]
         assert len(error_events) == 1
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_terminates_runner_in_finally(self, MockRunner, _mock_xet_avail):
         """Runner.terminate() should always be called in the finally block."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -574,11 +574,11 @@ class TestDownloadSnapshotWithXet:
 
         mock_runner.terminate.assert_called()
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_passes_all_params_to_runner(self, MockRunner, _mock_xet_avail):
         """All params should be forwarded to the subprocess runner via params dict."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -621,11 +621,11 @@ class TestDownloadSnapshotWithXet:
         assert params["report_interval"] == 0.5
         assert params["force_download"] is True
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_generates_transfer_id_when_not_provided(self, MockRunner, _mock_xet_avail):
         """Should generate a transfer_id if not provided."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -649,11 +649,12 @@ class TestDownloadSnapshotWithXet:
         assert start_event.transfer_id  # Not empty
         assert len(start_event.transfer_id) == 36  # UUID format
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_uses_snapshot_worker(self, MockRunner, _mock_xet_avail):
         """Should use _snapshot_worker as the worker function."""
-        from hf_track.xet_download import download_snapshot_with_xet, _snapshot_worker
+        from hf_track.download import download_snapshot_with_xet
+        from hf_track._xet_worker import _snapshot_worker
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -677,11 +678,11 @@ class TestDownloadSnapshotWithXet:
         call_kwargs = mock_runner.start.call_args
         assert call_kwargs.kwargs["worker_func"] is _snapshot_worker
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_cancelled_error_propagates_without_terminate(self, MockRunner, _mock_xet_avail):
         """TransferCancelledError from result handling should propagate cleanly."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
         from hf_track.types import TransferCancelledError
 
         mock_runner = MagicMock()
@@ -706,11 +707,11 @@ class TestDownloadSnapshotWithXet:
         # terminate is still called in finally
         mock_runner.terminate.assert_called()
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_fallback_to_repo_id_when_no_destination_path(self, MockRunner, _mock_xet_avail):
         """Should fall back to repo_id when destination_path is missing from result."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -732,11 +733,11 @@ class TestDownloadSnapshotWithXet:
         # Falls back to local_dir or repo_id
         assert result == "test/repo"
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_passes_use_xet_in_params(self, MockRunner, _mock_xet_avail):
         """use_xet parameter is included in the params dict passed to the subprocess worker."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {
@@ -762,11 +763,11 @@ class TestDownloadSnapshotWithXet:
         params = call_kwargs.kwargs["params"]
         assert params["use_xet"] is False
 
-    @patch("hf_track.xet_download.is_xet_available", return_value=True)
-    @patch("hf_track.xet_download.XetSubprocessRunner")
+    @patch("hf_track.download.xet_snapshot.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_snapshot.XetSubprocessRunner")
     def test_use_xet_default_is_true(self, MockRunner, _mock_xet_avail):
         """Default use_xet is True when not specified."""
-        from hf_track.xet_download import download_snapshot_with_xet
+        from hf_track.download import download_snapshot_with_xet
 
         mock_runner = MagicMock()
         mock_runner.wait.return_value = {

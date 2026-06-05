@@ -1,4 +1,9 @@
-"""Standard (non-Xet) download progress tracking via tqdm_class."""
+"""Standard (non-Xet) download progress tracking via tqdm_class.
+
+Public entry points:
+  - ``download_file``    — single-file HTTP download with progress
+  - ``download_snapshot`` — repository snapshot via huggingface_hub
+  - ``patch_download_chunk_size`` — context manager to set HF chunk size"""
 
 from __future__ import annotations
 
@@ -6,8 +11,8 @@ import contextlib
 import queue
 from typing import Callable, Optional
 
-from .callbacks import DownloadProgressTqdm, state_manager
-from .types import (
+from ..callbacks import DownloadProgressTqdm, state_manager
+from ..types import (
     EventType,
     ProgressEvent,
     ProgressPhase,

@@ -20,7 +20,7 @@ class TestTrackerFallbackPaths:
                 tracker, "_download_file_xet", side_effect=ValueError("Xet not available")
             ):
                 with patch(
-                    "hf_track.standard_download.download_file",
+                    "hf_track.download.download_file",
                     return_value="/tmp/model.bin",
                 ) as mock_std:
                     result = tracker.download_file(

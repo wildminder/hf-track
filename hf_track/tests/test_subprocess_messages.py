@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from hf_track.subprocess_messages import (
+from hf_track.subprocess import (
     MSG_CANCELLED,
     MSG_ERROR,
     MSG_EVENT,
