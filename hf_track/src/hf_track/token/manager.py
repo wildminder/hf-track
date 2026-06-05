@@ -1,7 +1,19 @@
-"""Xet authentication token management.
+"""XetTokenManager -- unified upload + download token resolution.
 
-Wraps the HuggingFace Xet authentication flow into a reusable class
-that handles both upload and download credential management.
+The ``XetTokenManager`` wraps the HuggingFace Xet authentication flow
+for **both** uploads and downloads. It lazily initializes the
+``HfApi`` instance, exposes fetch methods for both directions, and
+produces token-refresher callables the Rust runtime can call when a
+token expires.
+
+The class is kept whole in this single module (not split into
+``UploadTokenManager`` + ``DownloadTokenManager``) because:
+
+- both paths share the same cached ``HfApi`` and HTTP headers
+- the refresher-callable construction is symmetric across the two
+  directions and benefits from being co-located for review
+- callers consume a single ``XetTokenManager`` instance, never one or
+  the other
 
 The token lifecycle:
 - **Uploads**: Use ``XetTokenType.WRITE`` to get a repo-level token
@@ -16,25 +28,9 @@ The token lifecycle:
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
-
-@dataclass
-class XetCredentials:
-    """Xet authentication credentials for a single operation.
-
-    Attributes:
-        endpoint: Xet storage endpoint URL.
-        token_info: Tuple of (access_token, expiration_unix_epoch).
-        token_refresher: Optional callable that returns a fresh
-            (access_token, expiration_unix_epoch) tuple.
-    """
-
-    endpoint: str
-    token_info: Tuple[str, int]
-    token_refresher: Optional[Callable[[], Tuple[str, int]]] = None
+from .credentials import XetCredentials
 
 
 class XetTokenManager:
@@ -213,69 +209,3 @@ class XetTokenManager:
             return info.access_token, info.expiration_unix_epoch
 
         return token_refresher
-
-
-def is_xet_available() -> bool:
-    """Check if hf_xet package is installed without importing it.
-
-    Uses ``importlib.util.find_spec`` to detect the package without
-    loading the Rust ``.pyd`` extension into the current process.
-    This is critical for subprocess isolation: if ``hf_xet`` is loaded
-    in the main process, it cannot be safely terminated via SIGTERM.
-
-    Respects the HF_HUB_DISABLE_XET environment variable.
-
-    Returns:
-        True if ``hf_xet`` is findable on ``sys.path`` and not disabled, False otherwise.
-    """
-    import importlib.util
-
-    disable_xet = os.environ.get("HF_HUB_DISABLE_XET", "0").lower()
-    if disable_xet in ("1", "true", "yes"):
-        return False
-
-    try:
-        return importlib.util.find_spec("hf_xet") is not None
-    except (ValueError, ImportError):
-        # ValueError: hf_xet is in sys.modules but lacks __spec__
-        # (e.g. a test injected a MagicMock). Treat as unavailable.
-        return False
-
-
-def has_xet_session() -> bool:
-    """Check if the new ``hf_xet.XetSession`` API is available (>= 1.5.0).
-
-    The new ``XetSession`` API provides per-chunk progress callbacks
-    that fire every ~100ms. This is the ONLY API that gives smooth
-    progress for snapshot downloads on ``hf_xet >= 1.5.0``. The older
-    ``hf_xet.download_files`` API only fires its progress callback at
-    file completion, which is unsuitable for per-chunk progress.
-
-    This function is safe to call from any process because it only
-    inspects the package spec (it does not import the .pyd extension).
-
-    Returns:
-        True if ``hf_xet`` is installed AND exposes ``XetSession``,
-        False otherwise.
-    """
-    if not is_xet_available():
-        return False
-    try:
-        import importlib.util
-        spec = importlib.util.find_spec("hf_xet")
-        if spec is None or spec.submodule_search_locations is None:
-            return False
-        # Walk the package looking for XetSession without triggering
-        # full import. We do this by inspecting __init__'s attributes
-        # via importlib's lazy loader, but that's risky. Instead, use
-        # a controlled import in a try/except — at the point of this
-        # call we are NOT in the main subprocess (we are in a worker
-        # or in a fresh main process that won't load the .pyd for
-        # purposes other than checking).
-        # NOTE: this function should be called from a context where
-        # loading the .pyd is safe (e.g. main process before subprocess
-        # spawn, or in the worker where it's expected).
-        import hf_xet  # noqa: F401
-        return hasattr(hf_xet, "XetSession")
-    except Exception:
-        return False
