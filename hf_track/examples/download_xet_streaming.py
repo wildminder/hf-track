@@ -179,6 +179,16 @@ def parse_args() -> argparse.Namespace:
             "Use for max throughput only."
         ),
     )
+    parser.add_argument(
+        "--chunk-timeout", type=int, default=300,
+        help=(
+            "Seconds to wait for the next chunk before timing out "
+            "(default: 300). If the Rust streaming API blocks longer "
+            "than this, the worker cancels the stream and reports a "
+            "ChunkTimeout error. Set to 0 to disable timeout (not "
+            "recommended)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -264,6 +274,7 @@ def main() -> int:
     print(f" Xet              : [OK] streaming API available")
     print(f" Mode             : SUBPROCESS streaming (child does chunks -> disk)")
     print(f" fsync interval   : {args.fsync_interval} bytes")
+    print(f" chunk timeout    : {args.chunk_timeout}s")
     if args.no_fsync:
         print(f" fsync            : [DISABLED] (data only in OS page cache)")
     print("=" * 60)
@@ -286,6 +297,13 @@ def main() -> int:
     #    The method itself spawns a child subprocess for the xet files
     #    and drains progress events into tracker.event_queue. We just
     #    drain that queue into the display until the thread is done.
+    #
+    #    Set XET_CHUNK_TIMEOUT env var so the worker subprocess uses
+    #    the user's --chunk-timeout value (the worker reads this env
+    #    var on startup).
+    if args.chunk_timeout:
+        os.environ["XET_CHUNK_TIMEOUT"] = str(args.chunk_timeout)
+
     result_holder: dict = {}
     err_holder: dict = {}
 

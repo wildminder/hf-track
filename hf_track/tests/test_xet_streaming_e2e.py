@@ -85,9 +85,9 @@ def _build_mock_xet_stream(
 
     mock_xet_module = MagicMock()
     mock_stream = MagicMock()
-    mock_stream.__iter__ = lambda self: _Iter(
-        chunks, first_chunk_delay_s, inter_chunk_delay_s
-    )
+    _iter_instance = _Iter(chunks, first_chunk_delay_s, inter_chunk_delay_s)
+    mock_stream.__iter__ = lambda self: _iter_instance
+    mock_stream.__next__ = lambda self: _iter_instance.__next__()
     mock_stream.cancel = MagicMock()
     mock_xet_module.XetSession.return_value.new_download_stream_group.return_value.download_stream.return_value = mock_stream
     return mock_xet_module
@@ -339,9 +339,9 @@ class TestStreamingE2E:
 
         mock_xet = MagicMock()
         mock_stream = MagicMock()
-        mock_stream.__iter__ = lambda self: _PartialIter(
-            chunks_to_yield, len(chunks_to_yield)
-        )
+        _partial_iter = _PartialIter(chunks_to_yield, len(chunks_to_yield))
+        mock_stream.__iter__ = lambda self: _partial_iter
+        mock_stream.__next__ = lambda self: _partial_iter.__next__()
         mock_stream.cancel = MagicMock()
         mock_xet.XetSession.return_value.new_download_stream_group.return_value.download_stream.return_value = mock_stream
         mock_xet_utils = _build_xet_utils_mock()

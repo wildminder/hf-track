@@ -24,6 +24,7 @@ import logging
 import multiprocessing as mp
 import os
 import signal
+import threading
 import time
 from typing import Any, Dict, List
 
@@ -789,9 +790,138 @@ def _xet_streaming_download_worker(
             write_failed = False
             chunk_count = 0
 
+            # ── Validation: timeout wrapper for __next__ ─────────
+            # ``stream.__next__()`` calls ``blocking_next()`` in Rust,
+            # which calls ``receiver.blocking_recv()`` on a oneshot
+            # channel.  If the Rust async task that should send data
+            # hangs (e.g. CAS server keeps connection open without
+            # sending bytes, or token expires mid-download), the
+            # ``__next__`` call blocks forever with the GIL held.
+            #
+            # We use a thread-based timeout to detect this: a daemon
+            # thread calls ``next(stream)`` and the main worker waits
+            # with a timeout.  If the thread doesn't return within
+            # ``_CHUNK_TIMEOUT_S``, we log a diagnostic and cancel the
+            # stream.
+            #
+            # Default timeout: 300 s (5 min).  This is generous — a
+            # single xet term (~64 MB) at 1 MB/s takes ~64 s.  Set
+            # ``XET_CHUNK_TIMEOUT`` env var to override.
+            _CHUNK_TIMEOUT_S = int(os.environ.get("XET_CHUNK_TIMEOUT", "300"))
+
+            # Sentinel for end-of-iteration (next() returned None)
+            _SENTINEL = object()
+
+            # Shared state between the timeout thread and the main
+            # worker loop.  ``_chunk_result`` is set by the thread
+            # when ``next(stream)`` returns (or raises).
+            _chunk_result: list = [_SENTINEL]  # [_SENTINEL] = not yet set
+            _chunk_error: list = [None]  # [None] = no error
+
+            def _fetch_next_chunk() -> None:
+                """Fetch the next chunk from the stream in a daemon thread."""
+                try:
+                    chunk = next(stream, _SENTINEL)
+                    _chunk_result[0] = chunk
+                except StopIteration:
+                    _chunk_result[0] = _SENTINEL
+                except BaseException as e:
+                    _chunk_error[0] = e
+                    _chunk_result[0] = _SENTINEL
+
             try:
-                _diag(f"file-{i} chunk-loop-start")
-                for chunk in stream:
+                _diag(f"file-{i} chunk-loop-start chunk_timeout={_CHUNK_TIMEOUT_S}s")
+                while True:
+                    # ── Pre-__next__ diagnostic ──────────────────
+                    # Log a timestamped marker BEFORE calling
+                    # ``next(stream)`` so we can see exactly when the
+                    # hang starts.  Also poll ``stream.progress()``
+                    # (non-blocking Rust method) to check if the
+                    # background reconstruction is still advancing.
+                    _pre_next_ts = time.time()
+                    _pre_next_elapsed = _pre_next_ts - file_start_time
+                    _prog_info = ""
+                    if hasattr(stream, "progress"):
+                        try:
+                            _prog = stream.progress()
+                            if _prog is not None:
+                                _bc = getattr(_prog, "bytes_completed", "?")
+                                _tb = getattr(_prog, "total_bytes", "?")
+                                _prog_info = f" rust_progress={_bc}/{_tb}"
+                        except Exception:
+                            _prog_info = " rust_progress=error"
+                    _diag(
+                        f"file-{i} pre-next chunk={chunk_count + 1} "
+                        f"elapsed={_pre_next_elapsed:.1f}s "
+                        f"bytes_on_disk={bytes_completed}/{file_size}"
+                        f"{_prog_info}"
+                    )
+
+                    # ── Fetch next chunk with timeout ──────────────
+                    # Reset shared state
+                    _chunk_result[0] = _SENTINEL
+                    _chunk_error[0] = None
+
+                    _fetch_thread = threading.Thread(
+                        target=_fetch_next_chunk, daemon=True,
+                    )
+                    _fetch_thread.start()
+                    _fetch_thread.join(timeout=_CHUNK_TIMEOUT_S)
+
+                    if _fetch_thread.is_alive():
+                        # Timeout: the thread is still blocked in
+                        # ``next(stream)`` -> ``blocking_next()`` ->
+                        # ``receiver.blocking_recv()``.  The Rust
+                        # async task that should deliver data is stuck.
+                        _hang_ts = time.time()
+                        _hang_elapsed = _hang_ts - file_start_time
+                        _diag(
+                            f"file-{i} CHUNK-TIMEOUT chunk={chunk_count + 1} "
+                            f"waited={_CHUNK_TIMEOUT_S}s "
+                            f"total_elapsed={_hang_elapsed:.1f}s "
+                            f"bytes_on_disk={bytes_completed}/{file_size}"
+                            f"{_prog_info}"
+                        )
+                        # Cancel the stream so the blocked thread can
+                        # exit (``cancel()`` causes ``blocking_next()``
+                        # to return ``Ok(None)``).
+                        if hasattr(stream, "cancel"):
+                            try:
+                                stream.cancel()
+                            except Exception:
+                                pass
+                        # Give the thread a moment to exit after cancel
+                        _fetch_thread.join(timeout=5.0)
+                        _safe_put(mp_queue, SubprocessMessage.error(
+                            message=(
+                                f"Chunk timeout for {filename}: "
+                                f"no data after {_CHUNK_TIMEOUT_S}s "
+                                f"(bytes on disk: {bytes_completed}/{file_size})"
+                            ),
+                            error_type="ChunkTimeout",
+                            retryable=True,
+                        ))
+                        write_failed = True
+                        break
+
+                    # Check for error from the fetch thread
+                    if _chunk_error[0] is not None:
+                        _err = _chunk_error[0]
+                        _diag(
+                            f"file-{i} chunk-error chunk={chunk_count + 1} "
+                            f"error={type(_err).__name__}: {_err}"
+                        )
+                        raise _err
+
+                    chunk = _chunk_result[0]
+                    if chunk is _SENTINEL:
+                        # End of stream (StopIteration or None from __next__)
+                        _diag(
+                            f"file-{i} stream-end chunk={chunk_count} "
+                            f"bytes={bytes_completed}/{file_size}"
+                        )
+                        break
+
                     chunk_count += 1
                     if chunk_count <= 3 or chunk_count % 10 == 0:
                         _diag(f"file-{i} chunk-{chunk_count} len={len(chunk)}")

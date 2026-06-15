@@ -48,10 +48,13 @@ def _build_mock_xet(chunks):
     """Build a mock hf_xet module whose stream yields the given chunks.
 
     The stream's ``__iter__`` returns an iterator over ``chunks``.
+    Also provides ``__next__`` for ``next(stream, sentinel)`` support.
     """
+    _iter = iter(chunks)
     mock_xet_module = MagicMock()
     mock_stream = MagicMock()
-    mock_stream.__iter__ = lambda self: iter(chunks)
+    mock_stream.__iter__ = lambda self: _iter
+    mock_stream.__next__ = lambda self: next(_iter)
     mock_xet_module.XetSession.return_value.new_download_stream_group.return_value.download_stream.return_value = mock_stream
     return mock_xet_module
 
@@ -95,9 +98,9 @@ def _build_mock_xet_with_slow_stream(
 
     mock_xet_module = MagicMock()
     mock_stream = MagicMock()
-    mock_stream.__iter__ = lambda self: _SlowIter(
-        chunks, first_chunk_delay_s, inter_chunk_delay_s
-    )
+    _slow_iter = _SlowIter(chunks, first_chunk_delay_s, inter_chunk_delay_s)
+    mock_stream.__iter__ = lambda self: _slow_iter
+    mock_stream.__next__ = lambda self: _slow_iter.__next__()
     mock_xet_module.XetSession.return_value.new_download_stream_group.return_value.download_stream.return_value = mock_stream
     return mock_xet_module
 

@@ -897,7 +897,9 @@ class TestXetStreamingDownloadWorker:
         mock_session = MagicMock()
         mock_group = MagicMock()
         mock_stream = MagicMock()
-        mock_stream.__iter__ = lambda self: iter(chunks)
+        _iter = iter(chunks)
+        mock_stream.__iter__ = lambda self: _iter
+        mock_stream.__next__ = lambda self: next(_iter)
 
         mock_xet_module.XetSession.return_value = mock_session
         mock_session.new_download_stream_group.return_value = mock_group
@@ -936,7 +938,9 @@ class TestXetStreamingDownloadWorker:
 
         mock_xet_module = MagicMock()
         mock_stream = MagicMock()
-        mock_stream.__iter__ = lambda self: iter(chunks)
+        _iter = iter(chunks)
+        mock_stream.__iter__ = lambda self: _iter
+        mock_stream.__next__ = lambda self: next(_iter)
         mock_xet_module.XetSession.return_value.new_download_stream_group.return_value.download_stream.return_value = mock_stream
 
         ctx = mp.get_context("spawn")
@@ -973,7 +977,9 @@ class TestXetStreamingDownloadWorker:
 
         mock_xet_module = MagicMock()
         mock_stream = MagicMock()
-        mock_stream.__iter__ = lambda self: iter(chunks)
+        _iter = iter(chunks)
+        mock_stream.__iter__ = lambda self: _iter
+        mock_stream.__next__ = lambda self: next(_iter)
         mock_xet_module.XetSession.return_value.new_download_stream_group.return_value.download_stream.return_value = mock_stream
 
         ctx = mp.get_context("spawn")
@@ -1013,7 +1019,9 @@ class TestXetStreamingDownloadWorker:
             yield chunks[0]
             # After the first chunk, the worker's loop checks cancel_event and breaks
 
-        mock_stream.__iter__ = iter_then_cancel
+        _gen = iter_then_cancel(None)
+        mock_stream.__iter__ = lambda self: _gen
+        mock_stream.__next__ = lambda self: next(_gen)
 
         mock_xet_module.XetSession.return_value.new_download_stream_group.return_value.download_stream.return_value = mock_stream
 
@@ -1054,7 +1062,9 @@ class TestXetStreamingDownloadWorker:
 
         mock_xet_module = MagicMock()
         mock_stream = MagicMock()
-        mock_stream.__iter__ = lambda self: iter(chunks)
+        _iter = iter(chunks)
+        mock_stream.__iter__ = lambda self: _iter
+        mock_stream.__next__ = lambda self: next(_iter)
         mock_xet_module.XetSession.return_value.new_download_stream_group.return_value.download_stream.return_value = mock_stream
 
         ctx = mp.get_context("spawn")
@@ -1193,7 +1203,9 @@ class TestXetStreamingDownloadWorker:
 
         def make_stream(size):
             stream = MagicMock()
-            stream.__iter__ = lambda self: iter([b"x" * size])
+            _iter = iter([b"x" * size])
+            stream.__iter__ = lambda self: _iter
+            stream.__next__ = lambda self: next(_iter)
             return stream
 
         # The worker re-creates the group each loop iteration via

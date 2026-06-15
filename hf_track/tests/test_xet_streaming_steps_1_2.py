@@ -39,8 +39,13 @@ def _build_xet_mock_module(stream_iter=None, raise_on_download_stream=None):
     if stream_iter is None:
         stream_iter = [b"x" * 256]
 
+    # Build a mock stream that supports both ``for chunk in stream``
+    # (via __iter__) and ``next(stream, sentinel)`` (via __next__).
+    _iter = iter(stream_iter)
+
     mock_stream = MagicMock()
-    mock_stream.__iter__ = lambda self: iter(stream_iter)
+    mock_stream.__iter__ = lambda self: _iter
+    mock_stream.__next__ = lambda self: next(_iter)
 
     mock_xet = MagicMock()
     if raise_on_download_stream is not None:

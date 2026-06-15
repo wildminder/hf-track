@@ -88,8 +88,9 @@ OVERRIDES: Dict[str, int] = {
     "callbacks/tqdm_download.py": 700,
     # subprocess/runner is the only module that has both a multiprocessing
     # queue and a thread-based relay implementation; it is the most
-    # complex single module left after the refactor.
-    "subprocess/runner.py": 500,
+    # complex single module left after the refactor. Bumped from 500
+    # to 550 after adding _synthesize_result_if_missing (stall safety).
+    "subprocess/runner.py": 550,
 }
 
 # Files that are exempt from the budget entirely.
