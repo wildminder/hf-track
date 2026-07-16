@@ -130,12 +130,18 @@ def test_module_size_budget_soft():
     Tier 3 (HTTP) fallback coordination plus per-file resolution. The
     soft ceiling was raised from 14 KB to 16 KB for that module only
     is intentional -- the function has the most responsibility.
+
+    Plan 2026-07-16 (xet-single-file-subprocess-isolation) added
+    ``download_file_xet_subprocess`` to ``xet_file_only.py`` alongside
+    the existing ``download_file_xet_only``; the module now holds both
+    the in-process and subprocess dedicated xet paths (~18 KB). Raised
+    the soft ceiling to 20 KB to accommodate the second path.
     """
     pkg_root = os.path.join(
         os.path.dirname(__file__),
         "..", "..", "src", "hf_track", "download",
     )
-    SOFT_BYTES = 16_000  # ceiling, not target — just sanity check
+    SOFT_BYTES = 20_000  # ceiling, not target — just sanity check
     for name in os.listdir(pkg_root):
         if not name.endswith(".py"):
             continue

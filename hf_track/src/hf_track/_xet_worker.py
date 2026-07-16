@@ -52,12 +52,14 @@ def _init_worker() -> None:
 def _safe_put(mp_queue: mp.Queue, message: SubprocessMessage) -> None:
     """Put a message to the multiprocessing queue, suppressing all errors.
 
+    Uses ``put_nowait`` so the call never blocks (a blocking ``put`` can
+    deadlock if the queue's feeder thread is busy or the buffer is full).
     Catches ``BaseException`` (including ``KeyboardInterrupt``) so that
     a second interrupt during error/cancel handling never produces a
     traceback from the subprocess.
     """
     try:
-        mp_queue.put(message)
+        mp_queue.put_nowait(message)
     except BaseException:
         pass
 
@@ -532,6 +534,209 @@ def _download_batch_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_ev
         _handle_worker_exception(mp_queue, e)
 
 
+
+
+# ── Single-File Xet Worker (REAL XetSession API, plan 2026-07-16) ──
+#
+# This worker runs the PROVEN real-API pattern (from xet_file_only.py,
+# verified against hf_xet 1.5.0) INSIDE a child process spawned by
+# XetSubprocessRunner. Because hf_xet is imported only in the child, the
+# Rust .pyd background thread lives only in the child and can be killed
+# via runner.terminate() (SIGTERM -> SIGKILL), freeing its memory. This
+# is the safe-isolation pattern the snapshot path already uses.
+#
+# It does NOT use the broken legacy hf_xet.download_files() +
+# refresh_xet_connection_info path (that is _download_worker, deprecated).
+
+
+def _xet_file_only_worker(
+    params: Dict[str, Any],
+    mp_queue: mp.Queue,
+    cancel_event: mp.Event,
+) -> None:
+    """Worker for single-file Xet download via the real XetSession API.
+
+    Runs in a child process. Imports ``hf_xet`` locally. Emits
+    SubprocessMessage events (start / progress / result / error /
+    cancelled) back to the main process.
+
+    Args:
+        params: Dict with keys:
+            file_hash, file_size, dest_path, xet_file_data (dict from
+            ``_serialize_xet_file_data``), token, endpoint, transfer_id,
+            report_interval, request_headers.
+        mp_queue: Queue for sending SubprocessMessage back to main process.
+        cancel_event: Event set by main process to signal cancellation.
+    """
+    _init_worker()
+    from .types import (
+        EventType,
+        ProgressPhase,
+        TransferCancelledError,
+        TransferDirection,
+    )
+
+    transfer_id = params["transfer_id"]
+    dest_path = params["dest_path"]
+    filename = os.path.basename(dest_path)
+    file_size = int(params.get("file_size", 0) or 0)
+    report_interval = float(params.get("report_interval", 0.1) or 0.1)
+
+    # Reconstruct XetFileData from serialized dict
+    xet_file_data = _deserialize_xet_file_data(params.get("xet_file_data", {}))
+
+    if xet_file_data is None or not getattr(xet_file_data, "refresh_route", None):
+        _safe_put(mp_queue, SubprocessMessage.error(
+            message=(
+                f"File '{filename}' is not stored in Xet storage "
+                f"(missing xet_file_data / refresh_route)."
+            ),
+            error_type="TransferProgressError",
+            retryable=False,
+        ))
+        return
+
+    # ── Build headers (Hub auth) ──────────────────────────────────
+    try:
+        from huggingface_hub import HfApi
+        from huggingface_hub.utils._xet import xet_headers_without_auth
+
+        headers: dict = {}
+        try:
+            headers = HfApi(
+                endpoint=params.get("endpoint"),
+                token=params.get("token"),
+            )._build_hf_headers()
+        except Exception:
+            pass
+        xet_headers = xet_headers_without_auth(headers)
+    except Exception as e:
+        _safe_put(mp_queue, SubprocessMessage.error(
+            message=f"Xet header build failed for '{filename}': {e}",
+            error_type=type(e).__name__,
+            retryable=False,
+        ))
+        return
+
+    # ── Progress bookkeeping ──────────────────────────────────────
+    state = {
+        "bytes_completed": 0,
+        "last_emit": 0.0,
+        "start_time": time.time(),
+    }
+
+    def _emit_start() -> None:
+        try:
+            mp_queue.put_nowait(SubprocessMessage.event({
+                "event_type": EventType.START.value,
+                "transfer_id": transfer_id,
+                "direction": TransferDirection.DOWNLOAD.value,
+                "filename": filename,
+                "phase": ProgressPhase.DOWNLOADING.value,
+                "total_bytes": file_size,
+            }))
+        except BaseException:
+            pass
+
+    def _maybe_emit_progress() -> None:
+        now = time.time()
+        if (now - state["last_emit"]) < report_interval:
+            return
+        state["last_emit"] = now
+        bc = state["bytes_completed"]
+        total = file_size or 0
+        pct = (bc / total * 100.0) if total > 0 else 0.0
+        pct = max(0.0, min(100.0, pct))
+        elapsed = max(1e-6, now - state["start_time"])
+        speed = bc / elapsed
+        try:
+            mp_queue.put_nowait(SubprocessMessage.event({
+                "event_type": EventType.PROGRESS.value,
+                "transfer_id": transfer_id,
+                "direction": TransferDirection.DOWNLOAD.value,
+                "filename": filename,
+                "phase": ProgressPhase.DOWNLOADING.value,
+                "bytes_completed": bc,
+                "total_bytes": total,
+                "percentage": pct,
+                "speed": speed,
+                "transfer_bytes_completed": bc,
+                "transfer_bytes_total": total,
+                "transfer_speed": speed,
+            }))
+        except BaseException:
+            pass
+
+    def progress_callback(total_update, item_updates) -> None:
+        # The installed hf_xet wheel calls progress_callback(total_update,
+        # item_updates). For Xet, chunks are buffered and only flushed to
+        # disk at the end, so total_bytes_completed (disk bytes) stays 0
+        # until completion. total_transfer_bytes_completed (network bytes
+        # received) grows continuously and is the right live-progress signal.
+        # The exact parameter names (total_update, item_updates) are REQUIRED:
+        # the Rust WrappedProgressUpdaterImpl inspects the signature and only
+        # uses the detailed (2-arg) mode when both names match.
+        if cancel_event.is_set():
+            raise TransferCancelledError("Transfer cancelled by user")
+        if total_update is None:
+            return
+        completed = getattr(total_update, "total_transfer_bytes_completed", None)
+        if not completed:
+            completed = getattr(total_update, "total_bytes_completed", None)
+        if completed is None:
+            return
+        state["bytes_completed"] = int(completed)
+        _maybe_emit_progress()
+
+    _emit_start()
+
+    try:
+        from huggingface_hub.utils._xet import get_xet_session
+        import hf_xet
+
+        session = get_xet_session()
+        with session.new_file_download_group(
+            token_refresh_url=xet_file_data.refresh_route,
+            token_refresh_headers=headers,
+            custom_headers=xet_headers,
+            progress_callback=progress_callback,
+        ) as group:
+            group.start_download_file(
+                hf_xet.XetFileInfo(
+                    params["file_hash"],
+                    file_size if file_size else None,
+                ),
+                os.path.abspath(dest_path),
+            )
+
+        # Final COMPLETE progress event
+        final_bytes = state["bytes_completed"] or file_size or 0
+        try:
+            mp_queue.put_nowait(SubprocessMessage.event({
+                "event_type": EventType.PROGRESS.value,
+                "transfer_id": transfer_id,
+                "direction": TransferDirection.DOWNLOAD.value,
+                "filename": filename,
+                "phase": ProgressPhase.DOWNLOADING.value,
+                "bytes_completed": final_bytes,
+                "total_bytes": file_size or final_bytes,
+                "percentage": 100.0,
+                "speed": 0,
+                "transfer_bytes_completed": final_bytes,
+                "transfer_bytes_total": file_size or final_bytes,
+                "transfer_speed": 0,
+            }))
+        except BaseException:
+            pass
+
+        _safe_put(mp_queue, SubprocessMessage.result(
+            filename=filename,
+            destination_path=dest_path,
+            file_size=file_size,
+            transfer_id=transfer_id,
+        ))
+    except (KeyboardInterrupt, Exception) as e:  # noqa: BLE001
+        _handle_worker_exception(mp_queue, e)
 
 
 # ── Shared fsync utilities ────────────────────────────────────────

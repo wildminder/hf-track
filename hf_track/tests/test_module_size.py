@@ -84,8 +84,18 @@ OVERRIDES: Dict[str, int] = {
     # 1550 after adding deprecation docstrings for the legacy
     # _download_worker path, then to 1600 after adding the
     # TranslatingQueue adapter (plan 2026-07-09, step 10: dict ->
-    # ProgressEvent translation for the hybrid runner).
-    "_xet_worker.py": 1600,
+    # ProgressEvent translation for the hybrid runner). Bumped to
+    # 1800 after adding _xet_file_only_worker (plan
+    # 2026-07-16-xet-single-file-subprocess-isolation.md) — the
+    # dedicated single-file xet download worker that runs the proven
+    # get_xet_session() pattern in a child process.
+    "_xet_worker.py": 1800,
+    # download/xet_file_only.py holds both the in-process dedicated xet path
+    # (download_file_xet_only) and the terminable-subprocess path
+    # (download_file_xet_subprocess) plus their shared helpers. Plan
+    # 2026-07-16 (xet-single-file-subprocess-isolation) added the subprocess
+    # path here; 500 lines is no longer enough for both paths.
+    "download/xet_file_only.py": 550,
     # tqdm_download is the heaviest of the callback helpers (it
     # contains three progress-bar adapter classes). Still under the
     # original callbacks.py size of 1,400.

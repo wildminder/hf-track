@@ -57,7 +57,6 @@ class _TrackerXetImpls:
         on_finish: Optional[Callable[[], None]] = None,
     ) -> str:
         from huggingface_hub import HfApi, hf_hub_url
-        from ..download import download_file_xet_only
 
         api = HfApi(endpoint=self._endpoint, token=self._token)  # type: ignore[attr-defined]
         url = hf_hub_url(
@@ -82,13 +81,14 @@ class _TrackerXetImpls:
         else:
             dest_path = os.path.join(tempfile.gettempdir(), filename)
 
-        # Plan 2026-07-16: dedicated xet path (NO HTTP fallback). In this
-        # environment (hf_xet 1.5.0) all xet download APIs are broken, so
-        # ``download_file_xet_only`` raises TransferProgressError fast with a
-        # clear message telling the caller to use use_xet=False. We do NOT
-        # catch-and-fall-back to HTTP here — the user wants separate paths,
-        # and a silent fallback would hide the xet failure.
-        return download_file_xet_only(
+        # Plan 2026-07-16 (xet-single-file-subprocess-isolation): run the
+        # dedicated xet download in a TERMINABLE subprocess so the hf_xet
+        # .pyd thread lives only in the child and can be killed via
+        # runner.terminate() (SIGTERM -> SIGKILL), freeing its memory.
+        # No HTTP fallback (dedicated xet path).
+        from ..download import download_file_xet_subprocess
+
+        return download_file_xet_subprocess(
             repo_id=repo_id,
             filename=filename,
             file_hash=getattr(xet_file_data, "file_hash", ""),
@@ -103,6 +103,8 @@ class _TrackerXetImpls:
             transfer_id=transfer_id,
             report_interval=self._report_interval,  # type: ignore[attr-defined]
             is_cancelled=is_cancelled,
+            on_spawn=on_spawn,
+            on_finish=on_finish,
         )
 
     def _download_snapshot_xet(

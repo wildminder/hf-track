@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
-"""Download a file using subprocess-isolated Xet operations.
+"""Download a single file with subprocess-isolated Xet operations.
 
-Demonstrates the ``XetSubprocessRunner`` API for isolating ``hf_xet``
-Rust operations in a terminable subprocess. Key benefits:
+Demonstrates the ``HfTracker.download_file`` API with Xet enabled. Because
+the single-file Xet download now runs ``hf_xet`` inside a terminable
+subprocess (see plan ``docs/plans/2026-07-16-xet-single-file-subprocess-isolation.md``),
+the Rust ``.pyd`` background thread lives only in the child process. This
+means:
 
-- **Ctrl+C safety**: The Rust ``.pyd`` extension cannot be interrupted
-  by Python signals. Running it in a subprocess allows ``terminate()``
-  to kill the OS process directly.
-- **Clean cancellation**: ``mp.Event`` signals the worker to exit
-  gracefully; if it doesn't respond within the timeout, the process
-  is killed.
-- **No zombie processes**: ``daemon=True`` + ``terminate()`` cleanup
-  ensures child processes never outlive the parent.
+- **Ctrl+C safety**: ``tracker.cancel(transfer_id)`` flips the cancel flag,
+  the in-process watchdog observes it, and calls ``runner.terminate()``
+  (SIGTERM -> SIGKILL). The child OS process — and the ``hf_xet`` thread
+  inside it — is killed directly, freeing its memory. The main process is
+  never blocked by the uninterruptible Rust runtime.
+- **No zombie processes**: ``XetSubprocessRunner`` cleans up the child in
+  its ``finally`` block (``terminate()``), so it never outlives the parent.
+- **Clean cancellation**: progress events keep flowing until the child exits;
+  a CANCELLED event is emitted and the transfer raises ``TransferCancelledError``.
+
+The subprocess isolation is internal to the tracker — this example just calls
+``tracker.download_file(...)`` and ``tracker.cancel(transfer_id)`` like the
+regular ``download_file.py`` example. The difference is that with Xet enabled,
+the heavy ``hf_xet`` work happens in a child process that can be terminated.
 
 Usage::
 
     python download_subprocess.py
+    python download_subprocess.py --no-xet
     python download_subprocess.py --timeout 10
 """
 
@@ -27,7 +37,6 @@ import os
 import queue
 import sys
 import threading
-import time
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -76,13 +85,14 @@ def main() -> int:
     print(f" Timeout    : {args.timeout}s")
     xet_status = (
         "[DISABLED]" if args.no_xet
-        else ("[OK] available — Xet runs in subprocess" if is_xet_available()
+        else ("[OK] available — Xet runs in a terminable subprocess" if is_xet_available()
               else "[--] not installed (using HTTP)")
     )
     print(f" Xet        : {xet_status}")
     print("=" * 60)
     print()
     print(" Press Ctrl+C to cancel — the subprocess will be terminated.")
+    print(" (hf_xet's .pyd thread lives only in the child process.)")
     print()
 
     tracker = HfTracker(token=token, report_interval=0.1)
@@ -122,14 +132,13 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n\n [STOP] Ctrl+C received — cancelling transfer...")
 
-        # 1. Signal cancellation through the tracker
+        # 1. Signal cancellation through the tracker. This flips the
+        #    cancel flag; the in-process watchdog in
+        #    download_file_xet_subprocess observes it and calls
+        #    runner.terminate() (SIGTERM -> SIGKILL) on the child.
         tracker.cancel(transfer_id)
 
-        # 2. Wait for the download thread to exit
-        #    The tracker's cancel() sets the is_cancelled hook,
-        #    which the xet_download wait loop polls. When it
-        #    detects cancellation, it calls runner.terminate()
-        #    which kills the subprocess.
+        # 2. Wait for the download thread to exit (the child is killed).
         download_thread.join(timeout=5.0)
 
         if download_thread.is_alive():
@@ -143,7 +152,7 @@ def main() -> int:
             except queue.Empty:
                 break
 
-        print(" Transfer cancelled — subprocess terminated.")
+        print(" Transfer cancelled — subprocess terminated, hf_xet memory freed.")
         return 1
 
     download_thread.join(timeout=5.0)
