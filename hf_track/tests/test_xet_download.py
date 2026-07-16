@@ -208,6 +208,74 @@ class TestDownloadFileWithXet:
 
         mock_runner.terminate.assert_called()
 
+    # ── Plan 2026-07-09 step 7: deprecation ──────────────────────
+
+    def test_download_file_with_xet_emits_deprecation_warning(self):
+        """download_file_with_xet must emit a DeprecationWarning.
+
+        Plan 2026-07-09 step 7: the legacy ``hf_xet.download_files()``
+        path hangs indefinitely in some environments. The function is
+        now deprecated in favor of ``download_file_with_xet_hybrid``.
+        Calling it must warn so users migrate off it.
+        """
+        from hf_track.download import download_file_with_xet
+
+        with patch("hf_track.download.xet_file.is_xet_available", return_value=False):
+            with pytest.warns(DeprecationWarning, match="deprecated"):
+                with pytest.raises(ImportError):
+                    download_file_with_xet(
+                        file_hash="abc123",
+                        file_size=1024,
+                        dest_path="/tmp/test.bin",
+                        xet_file_data=MagicMock(),
+                        token="test-token",
+                        event_queue=queue.Queue(),
+                    )
+
+    @patch("hf_track.download.xet_file.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_file.XetSubprocessRunner")
+    def test_deprecation_warning_mentions_xet_only_alternative(
+        self, MockRunner, _mock_xet_avail
+    ):
+        """The deprecation message must point users to the dedicated path.
+
+        Plan 2026-07-16 step 5: the warning text must mention
+        ``download_file_xet_only`` (or ``use_xet=False``) so users know
+        the replacement for the broken legacy API.
+        """
+        from hf_track.download import download_file_with_xet
+
+        mock_runner = MagicMock()
+        mock_runner.wait.return_value = {
+            "status": "success",
+            "filename": "model.bin",
+            "destination_path": "/tmp/model.bin",
+            "file_size": 1024,
+            "transfer_id": "dep-1",
+        }
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+
+        with pytest.warns(DeprecationWarning) as record:
+            download_file_with_xet(
+                file_hash="abc123",
+                file_size=1024,
+                dest_path="/tmp/model.bin",
+                xet_file_data=MagicMock(),
+                token="test-token",
+                event_queue=queue.Queue(),
+                transfer_id="dep-1",
+            )
+
+        # At least one warning mentions the dedicated-path alternative.
+        messages = [str(w.message) for w in record]
+        assert any(
+            ("download_file_xet_only" in m or "use_xet=False" in m) for m in messages
+        ), (
+            "DeprecationWarning must mention download_file_xet_only / "
+            "use_xet=False as the replacement. Got: " + repr(messages)
+        )
+
 
 # ── download_files_with_xet ───────────────────────────────────
 

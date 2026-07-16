@@ -574,10 +574,12 @@ class TestXetSubprocessRunnerProperties:
 
 
 class TestSpawnStreaming:
-    """Test XetSubprocessRunner.spawn_streaming() — the streaming variant.
+    """Test XetSubprocessRunner.spawn_streaming() — the hybrid Xet + HTTP variant.
 
-    spawn_streaming() is a thin convenience wrapper around start() that
-    uses the chunk-by-chunk _xet_streaming_download_worker.
+    spawn_streaming() is a thin convenience wrapper around ``start()``
+    that calls ``_xet_file_download_worker`` (plan 2026-06-15). It
+    replaces the previous wrapper around the (broken) chunk-by-chunk
+    streaming worker.
 
     Note: These tests verify the wrapper behavior in-process (using a
     mock worker_func substituted for the streaming worker). End-to-end
@@ -634,19 +636,16 @@ class TestSpawnStreaming:
                 )
 
     def test_spawn_streaming_uses_correct_worker(self):
-        """spawn_streaming uses _xet_streaming_download_worker, not other workers."""
+        """spawn_streaming uses _xet_file_download_worker (HYBRID, plan 2026-06-15)."""
         import hf_track._xet_worker as worker_module
-        # The spawn_streaming method should reference the streaming worker.
-        # Verify by reading the source: it must import _xet_streaming_download_worker
-        # and pass it to start().
         runner = XetSubprocessRunner()
         import inspect
         src = inspect.getsource(runner.spawn_streaming)
-        assert "_xet_streaming_download_worker" in src
+        assert "_xet_file_download_worker" in src
         assert "self.start" in src
-        # And the worker function must exist in the worker module
-        assert hasattr(worker_module, "_xet_streaming_download_worker")
-        assert callable(worker_module._xet_streaming_download_worker)
+        # Worker function must exist in worker module and be picklable.
+        assert hasattr(worker_module, "_xet_file_download_worker")
+        assert callable(worker_module._xet_file_download_worker)
 
     def test_spawn_streaming_passes_params_unchanged(self, tmp_path):
         """spawn_streaming passes the params dict through to start() unchanged.
@@ -667,7 +666,7 @@ class TestSpawnStreaming:
             # The worker func is the streaming worker
             wf = call_args.kwargs.get("worker_func") or call_args.args[0]
             import hf_track._xet_worker as wm
-            assert wf is wm._xet_streaming_download_worker
+            assert wf is wm._xet_file_download_worker
             # The event_queue should also be passed
             eq = call_args.kwargs.get("event_queue") or call_args.args[2]
             assert eq is event_queue

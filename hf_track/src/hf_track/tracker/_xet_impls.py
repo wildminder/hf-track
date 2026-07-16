@@ -53,9 +53,11 @@ class _TrackerXetImpls:
         local_dir: Optional[str],
         transfer_id: str,
         is_cancelled: Callable[[], bool],
+        on_spawn: Optional[Callable[[object], None]] = None,
+        on_finish: Optional[Callable[[], None]] = None,
     ) -> str:
         from huggingface_hub import HfApi, hf_hub_url
-        from ..download import download_file_with_xet
+        from ..download import download_file_xet_only
 
         api = HfApi(endpoint=self._endpoint, token=self._token)  # type: ignore[attr-defined]
         url = hf_hub_url(
@@ -80,29 +82,28 @@ class _TrackerXetImpls:
         else:
             dest_path = os.path.join(tempfile.gettempdir(), filename)
 
-        headers = api._build_hf_headers()
-        xet_headers = {k: v for k, v in headers.items() if k != "authorization"}
-
-        # Step 8.5 of the modular refactor (2026-06-05) removed the
-        # ``download_file_with_xet_session`` (XetSession API) variant
-        # because of three documented correctness bugs. The remaining
-        # path is ``download_file_with_xet``, which uses
-        # ``hf_xet.download_files()`` inside a subprocess worker.
-        result = download_file_with_xet(
-            file_hash=xet_file_data.file_hash,
+        # Plan 2026-07-16: dedicated xet path (NO HTTP fallback). In this
+        # environment (hf_xet 1.5.0) all xet download APIs are broken, so
+        # ``download_file_xet_only`` raises TransferProgressError fast with a
+        # clear message telling the caller to use use_xet=False. We do NOT
+        # catch-and-fall-back to HTTP here — the user wants separate paths,
+        # and a silent fallback would hide the xet failure.
+        return download_file_xet_only(
+            repo_id=repo_id,
+            filename=filename,
+            file_hash=getattr(xet_file_data, "file_hash", ""),
             file_size=file_size,
             dest_path=dest_path,
             xet_file_data=xet_file_data,
             token=self._token,
-            event_queue=self.event_queue,  # type: ignore[attr-defined]
+            repo_type=repo_type,
+            revision=revision,
             endpoint=api.endpoint,
+            event_queue=self.event_queue,  # type: ignore[attr-defined]
             transfer_id=transfer_id,
             report_interval=self._report_interval,  # type: ignore[attr-defined]
-            request_headers=xet_headers,
             is_cancelled=is_cancelled,
         )
-
-        return result.destination_path
 
     def _download_snapshot_xet(
         self,

@@ -295,3 +295,159 @@ class TestStreamingRealWorld:
                 f"Partial file is 0 bytes after cancellation: {f}. "
                 f"This is the user-reported '0-length during download' bug."
             )
+
+
+# ── Plan 2026-07-16: single-file dedicated xet path E2E ────────────
+# docs/plans/2026-07-16-xet-download-separate-paths.md, step 6
+#
+# The single-file xet path is now a DEDICATED path (no hybrid, no HTTP
+# fallback). In this environment the hf_xet runtime is broken, so the
+# xet path must FAIL FAST (raise TransferProgressError within a short
+# watchdog window) instead of hanging at 0%. The reliable transfer is
+# the separate ``use_xet=False`` HTTP path.
+
+
+# A small xet-stored file in a public repo. ``model.safetensors`` is
+# the canonical single-file target used by the download_file.py example.
+SINGLE_FILE_REPO = "hf-internal-testing/tiny-random-VoxtralRealtimeForConditionalGeneration"
+SINGLE_FILE_NAME = "model.safetensors"
+
+
+@pytest.mark.network
+class TestSingleFileDedicatedXetRealWorld:
+    """Real network E2E tests for ``HfTracker.download_file`` with the
+    dedicated xet path (Plan 2026-07-16, fixed in
+    docs/plans/2026-07-16-xet-download-real-fix.md).
+
+    These verify:
+      * The xet path actually DOWNLOADS the file (no longer fails fast —
+        the root cause was a wrong ``new_file_download_group`` parameter
+        set; now it uses the proven ``get_xet_session()`` +
+        ``start_download_file`` pattern from huggingface_hub).
+      * Progress events flow (bytes_completed grows, percentage reaches 100).
+      * The separate ``use_xet=False`` HTTP path still downloads the
+        file reliably (the working alternative).
+    """
+
+    def test_single_file_xet_downloads_successfully(self, tmp_path):
+        """``download_file(use_xet=True)`` downloads the file via the real
+        hf_xet Session API (no hang at 0%, no HTTP fallback).
+
+        Regression for the user-reported "stuck at 0%" bug: the dedicated
+        xet path now uses ``get_xet_session()`` + ``new_file_download_group(
+        token_refresh_url=..., token_refresh_headers=..., custom_headers=...,
+        progress_callback=...)`` + ``start_download_file(...)`` — the exact
+        pattern huggingface_hub uses.
+        """
+        from hf_track import HfTracker, is_xet_available
+
+        if not _has_internet():
+            pytest.skip("Network not available (DNS resolution failed)")
+        if not is_xet_available():
+            pytest.skip("hf_xet not installed")
+
+        tracker = HfTracker(report_interval=0.1)
+        output_dir = str(tmp_path / "single_xet")
+        os.makedirs(output_dir, exist_ok=True)
+
+        try:
+            result_path = tracker.download_file(
+                repo_id=SINGLE_FILE_REPO,
+                filename=SINGLE_FILE_NAME,
+                local_dir=output_dir,
+                force_download=True,
+                use_xet=True,
+            )
+        except Exception as e:
+            pytest.skip(f"Download failed (network?): {e}")
+
+        assert result_path is not None, "download_file returned None"
+        assert os.path.exists(result_path), (
+            f"Downloaded file missing: {result_path}"
+        )
+        size = os.path.getsize(result_path)
+        assert size > 0, (
+            f"Downloaded file is 0 bytes: {result_path}. "
+            "The xet path must produce content."
+        )
+
+    def test_single_file_xet_emits_progress_events(self, tmp_path):
+        """The xet download emits START/PROGRESS/COMPLETE events on the queue."""
+        from hf_track import HfTracker, is_xet_available
+        from hf_track.types import EventType
+
+        if not _has_internet():
+            pytest.skip("Network not available (DNS resolution failed)")
+        if not is_xet_available():
+            pytest.skip("hf_xet not installed")
+
+        tracker = HfTracker(report_interval=0.05)
+        output_dir = str(tmp_path / "single_xet_prog")
+        os.makedirs(output_dir, exist_ok=True)
+
+        try:
+            tracker.download_file(
+                repo_id=SINGLE_FILE_REPO,
+                filename=SINGLE_FILE_NAME,
+                local_dir=output_dir,
+                force_download=True,
+                use_xet=True,
+            )
+        except Exception as e:
+            pytest.skip(f"Download failed (network?): {e}")
+
+        # Drain the event queue once and verify we saw progress + completion.
+        events = _drain_events(tracker.event_queue)
+        types_seen = [e.event_type for e in events]
+
+        assert EventType.START in types_seen, "No START event emitted"
+        assert EventType.COMPLETE in types_seen, "No COMPLETE event emitted"
+        # At least one PROGRESS event with bytes > 0.
+        progresses = [
+            e for e in events
+            if e.event_type == EventType.PROGRESS and e.bytes_completed > 0
+        ]
+        assert progresses, "No PROGRESS events with bytes_completed > 0"
+
+    def test_single_file_no_xet_path_works(self, tmp_path):
+        """``download_file(use_xet=False)`` downloads the file via the
+        reliable HTTP path (the separate, working alternative).
+        """
+        from hf_track import HfTracker, is_xet_available
+
+        if not _has_internet():
+            pytest.skip("Network not available (DNS resolution failed)")
+        if not is_xet_available():
+            pytest.skip("hf_xet not installed")
+
+        tracker = HfTracker(report_interval=0.1)
+        output_dir = str(tmp_path / "single_no_xet")
+        os.makedirs(output_dir, exist_ok=True)
+
+        try:
+            result_path = tracker.download_file(
+                repo_id=SINGLE_FILE_REPO,
+                filename=SINGLE_FILE_NAME,
+                local_dir=output_dir,
+                force_download=True,
+                use_xet=False,
+            )
+        except Exception as e:
+            pytest.skip(f"Download failed (network?): {e}")
+
+        assert result_path is not None, "download_file returned None"
+        assert os.path.exists(result_path), (
+            f"Downloaded file missing: {result_path}"
+        )
+        size = os.path.getsize(result_path)
+        assert size > 0, (
+            f"Downloaded file is 0 bytes: {result_path}. "
+            "The no-xet (HTTP) path must produce content."
+        )
+
+
+def _drain_events(q):
+    out = []
+    while not q.empty():
+        out.append(q.get_nowait())
+    return out

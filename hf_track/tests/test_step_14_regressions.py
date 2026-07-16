@@ -6,12 +6,14 @@ etc.). However, three references to the removed API were left in the
 source tree and only surfaced at runtime:
 
   Bug 1 — ``hf_track/download/xet_streaming.py`` had a function-level
-          ``from ._xet_worker import _xet_streaming_download_worker``
+          ``from ._xet_worker import import _xet_streaming_download_worker``
           that re-imported a worker from inside the ``download``
           subpackage — a path that never existed. The module-level
           import on line 30 was correct. This raised
           ``No module named 'hf_track.download._xet_worker'`` at
-          function call time.
+          function call time. (As of 2026-06-15 that streaming worker
+          is replaced by ``_xet_file_download_worker``; the regression
+          is moot but the path-stickiness test is retained.)
 
   Bug 2 — ``hf_track/tracker/_xet_impls.py::_TrackerXetImpls._download_file_xet``
           had a try/except that first tried the removed
@@ -150,7 +152,9 @@ class TestXetStreamingImportable:
     ``download._xet_worker`` never existed, so calling
     ``download_snapshot_streaming()`` raised
     ``No module named 'hf_track.download._xet_worker'`` at runtime,
-    even though the module itself imported fine.
+    even though the module itself imported fine. (Streaming worker
+    removed 2026-06-15 in favour of the file-download-group worker;
+    this test now guards the same import-path for the new worker.)
     """
 
     def test_module_imports(self):

@@ -49,29 +49,39 @@ class _TrackerDownloads:
     ) -> str:
         transfer_id, is_cancelled_hook = self._prepare_transfer(transfer_id)  # type: ignore[attr-defined]
 
+        # Fast-cancel registration hooks (mirror download_snapshot_streaming).
+        # The xet-only path is in-process, so cancellation is cooperative
+        # via the ``is_cancelled`` hook (no separate runner to register).
+        def _on_spawn(runner: object) -> None:
+            with self._lock:  # type: ignore[attr-defined]
+                self._active_runners[transfer_id] = runner  # type: ignore[attr-defined]
+
+        def _on_finish() -> None:
+            with self._lock:  # type: ignore[attr-defined]
+                self._active_runners.pop(transfer_id, None)  # type: ignore[attr-defined]
+
         # NOTE: route through the ``tracker`` package namespace so tests can
         # ``patch("hf_track.tracker.is_xet_available", ...)``. This was the
         # import path in the original monolithic ``tracker.py``.
         from . import is_xet_available  # noqa: PLC0415
         try:
             if is_xet_available() and use_xet:
-                try:
-                    return self._download_file_xet(  # type: ignore[attr-defined]
-                        repo_id=repo_id,
-                        filename=filename,
-                        repo_type=repo_type,
-                        revision=revision,
-                        local_dir=local_dir,
-                        transfer_id=transfer_id,
-                        is_cancelled=is_cancelled_hook,
-                    )
-                except TransferCancelledError:
-                    raise
-                except Exception as xet_err:
-                    logger.warning(
-                        f"Xet direct download failed for {repo_id}/{filename}, "
-                        f"falling back to tqdm_class: {xet_err}"
-                    )
+                # Dedicated xet path (Plan 2026-07-16). It raises
+                # TransferProgressError fast when the xet runtime is broken
+                # (this environment) — we let that error propagate so the
+                # caller sees a clear failure instead of a silent HTTP
+                # fallback. Use use_xet=False for the reliable HTTP path.
+                return self._download_file_xet(  # type: ignore[attr-defined]
+                    repo_id=repo_id,
+                    filename=filename,
+                    repo_type=repo_type,
+                    revision=revision,
+                    local_dir=local_dir,
+                    transfer_id=transfer_id,
+                    is_cancelled=is_cancelled_hook,
+                    on_spawn=_on_spawn,
+                    on_finish=_on_finish,
+                )
 
             from ..download import download_file as _download_file
 
@@ -92,6 +102,7 @@ class _TrackerDownloads:
         except KeyboardInterrupt:
             raise TransferCancelledError("Download interrupted by user (Ctrl+C)")
         finally:
+            _on_finish()
             self.cleanup_transfer(transfer_id)  # type: ignore[attr-defined]
 
     def download_snapshot_streaming(
@@ -106,52 +117,26 @@ class _TrackerDownloads:
         force_download: bool = False,
         fsync_interval: int = 4 * 1024 * 1024,
         disable_fsync: bool = False,
+        tier_timeout_s: float = 60.0,
+        enable_http_fallback: bool = True,
+        use_xet: bool = True,
     ) -> List[str]:
-        """Download a repository snapshot using the streaming Xet API.
+        """HYBRID Xet + HTTP-fallback snapshot download.
 
-        Alternative to :meth:`download_snapshot` that uses the chunk-by-chunk
-        ``XetSession().new_download_stream_group().download_stream()`` API for
-        Xet-stored files. Each chunk is flushed to disk via ``os.write`` +
-        ``os.fsync`` and the child subprocess can be killed cleanly mid-file.
-
-        Non-Xet files (small JSON, markdown, etc.) are downloaded via the
-        standard ``huggingface_hub.hf_hub_download`` call in the parent
-        process -- these files are small and bounded.
+        Plan: ``docs/plans/2026-06-15-xet-streaming-hybrid-approach.md``.
+        Subprocess runs ``_xet_file_download_worker`` which tries
+        ``XetFileDownloadGroup.start_download_file()`` (Tier 1) first
+        and falls back to pure HTTP via ``requests`` (Tier 3) if the
+        xet handle does not complete within ``tier_timeout_s``.
 
         Args:
-            repo_id: HuggingFace repository ID.
-            allow_patterns: Optional list of glob patterns to include.
-            ignore_patterns: Optional list of glob patterns to exclude.
-            repo_type: Repository type (model/dataset/space).
-            revision: Optional git revision.
-            local_dir: Local directory to download files to. Defaults to
-                the HuggingFace cache (``HF_HOME``/hub).
-            transfer_id: Pre-existing transfer ID. Auto-generated if None.
-            force_download: If True, re-download even if files exist.
-            fsync_interval: Bytes between ``os.fsync`` calls in the worker.
-                Set to 0 to fsync after every chunk (slowest, safest).
-                Ignored when ``disable_fsync`` is True.
-            disable_fsync: If True, skip ``os.fsync`` entirely (fastest,
-                but a SIGKILL may leave zero-byte files on disk).
-                Defaults to False (fsync on at the configured interval).
-
-        Returns:
-            Sorted list of file paths that were downloaded.
-
-        Raises:
-            ImportError: If ``hf_xet`` is not installed.
-            TransferCancelledError: If the user cancels mid-stream.
-            TransferProgressError: If a download fails.
-        """
+            tier_timeout_s: Tier 1 timeout before Tier 3 fallback.
+            enable_http_fallback: When False, raise instead of fallback.
+            use_xet: When False, skip Tier 1; route every xet file via
+                HTTP in the worker.
+        """  # noqa: D401
         transfer_id, is_cancelled_hook = self._prepare_transfer(transfer_id)  # type: ignore[attr-defined]
 
-        # Plan 2026-06-05 step 3: register a hook so that
-        # ``self.cancel(transfer_id)`` can forward the cancel to the
-        # child subprocess immediately (via the runner's
-        # ``request_cancel()``), without waiting for the parent's
-        # 1 s poll loop. The streaming download helper accepts an
-        # ``on_spawn`` callable that is called with the active
-        # ``XetSubprocessRunner`` as soon as it spawns the child.
         def _on_spawn(runner: object) -> None:
             with self._lock:  # type: ignore[attr-defined]
                 self._active_runners[transfer_id] = runner  # type: ignore[attr-defined]
@@ -178,13 +163,15 @@ class _TrackerDownloads:
                 force_download=force_download,
                 fsync_interval=fsync_interval,
                 disable_fsync=disable_fsync,
+                tier_timeout_s=tier_timeout_s,
+                enable_http_fallback=enable_http_fallback,
+                use_xet=use_xet,
                 on_spawn=_on_spawn,
                 on_finish=_on_finish,
             )
         except KeyboardInterrupt:
             raise TransferCancelledError("Download interrupted by user (Ctrl+C)")
         finally:
-            # Always clean up both the cancel set and the runner registry.
             _on_finish()
             self.cleanup_transfer(transfer_id)  # type: ignore[attr-defined]
 

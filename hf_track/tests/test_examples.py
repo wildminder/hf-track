@@ -448,3 +448,84 @@ def test_progress_bar_formatting_helpers() -> None:
         assert callable(getattr(mod, name)), (
             f"progress_bar.py is missing the {name!r} helper"
         )
+
+
+# =============================================================================
+# Plan 2026-07-16: download_file.py has NO hybrid CLI flags
+# (docs/plans/2026-07-16-xet-download-separate-paths.md, step 4)
+#
+# The single-file downloader uses two SEPARATE paths (no hybrid, no HTTP
+# fallback): ``--no-xet`` selects the reliable HTTP path; the default
+# (xet) path fails fast with a clear error when the xet runtime is broken.
+# The old ``--tier-timeout`` / ``--no-http-fallback`` hybrid flags are gone.
+# =============================================================================
+
+
+def _collect_flag_names(src: str) -> set[str]:
+    """Return the set of CLI flag strings declared via add_argument()."""
+    tree = ast.parse(src)
+    flag_names: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_argument"
+        ):
+            if node.args and isinstance(node.args[0], ast.Constant):
+                if isinstance(node.args[0].value, str):
+                    flag_names.add(node.args[0].value)
+    return flag_names
+
+
+def test_download_file_has_no_hybrid_flags() -> None:
+    """download_file.py must NOT declare the removed hybrid flags.
+
+    Plan 2026-07-16 step 4: ``--tier-timeout`` and ``--no-http-fallback``
+    belonged to the hybrid/fallback design that is now removed. Their
+    presence would indicate dead code / a regression toward the old hang.
+    """
+    mod = _import_example("download_file")
+    src = Path(mod.__file__).read_text(encoding="utf-8")
+
+    flag_names = _collect_flag_names(src)
+    assert "--tier-timeout" not in flag_names, (
+        "download_file.parse_args() must NOT register --tier-timeout "
+        "(hybrid flag removed in plan 2026-07-16)."
+    )
+    assert "--no-http-fallback" not in flag_names, (
+        "download_file.parse_args() must NOT register --no-http-fallback "
+        "(hybrid flag removed in plan 2026-07-16)."
+    )
+
+
+def test_download_file_keeps_no_xet_flag() -> None:
+    """download_file.py keeps the ``--no-xet`` flag (separate HTTP path)."""
+    mod = _import_example("download_file")
+    src = Path(mod.__file__).read_text(encoding="utf-8")
+
+    flag_names = _collect_flag_names(src)
+    assert "--no-xet" in flag_names, (
+        "download_file.parse_args() must keep --no-xet (the separate "
+        "reliable HTTP path). See plan 2026-07-16 step 4."
+    )
+
+
+def test_download_file_forwards_no_hybrid_kwargs() -> None:
+    """The example does NOT forward tier_timeout_s / enable_http_fallback."""
+    mod = _import_example("download_file")
+    src = Path(mod.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    forwarded_hybrid = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg in (
+            "tier_timeout_s",
+            "enable_http_fallback",
+        ):
+            forwarded_hybrid = True
+            break
+    assert not forwarded_hybrid, (
+        "download_file.py must not forward hybrid kwargs "
+        "(tier_timeout_s / enable_http_fallback) to tracker.download_file(). "
+        "See plan 2026-07-16 step 4."
+    )

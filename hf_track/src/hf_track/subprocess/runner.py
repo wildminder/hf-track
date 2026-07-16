@@ -127,21 +127,30 @@ class XetSubprocessRunner:
         params: Dict[str, Any],
         event_queue: queue.Queue,
     ) -> None:
-        """Spawn a streaming-download subprocess using the chunk-by-chunk worker.
+        """Spawn a hybrid FileDownloadGroup + HTTP-fallback subprocess.
 
-        Convenience wrapper that calls ``start()`` with the streaming
-        worker function ``_xet_streaming_download_worker``. The worker
-        uses ``XetSession().new_download_stream_group().download_stream()``
-        to write each file's chunks to disk incrementally — no in-memory
-        buffering of whole files.
+        Convenience wrapper that calls ``start()`` with
+        ``_xet_file_download_worker`` from ``hf_track._xet_worker``.
+
+        The worker uses
+        ``hf_xet.XetSession().new_file_download_group().start_download_file()``
+        and falls back to a pure-HTTP download via
+        ``hf_track.download.http_fallback.download_file_http`` if the
+        xet handle does not complete within ``params["tier_timeout_s"]``
+        seconds. Either path delivers an incrementally-growing file to
+        disk; cancel via ``request_cancel()``.
 
         Args:
             params: Picklable dict of parameters for the worker. Must
-                include the keys required by ``_xet_streaming_download_worker``:
+                include the keys required by ``_xet_file_download_worker``:
                 ``file_specs`` (list of dicts with ``hash``, ``file_size``,
-                ``dest_path``, ``xet_file_data``), ``token``, ``endpoint``,
-                ``transfer_id``, ``report_interval``, ``request_headers``,
-                ``fsync_interval`` (optional).
+                ``dest_path``, ``xet_file_data``, optional ``filename``),
+                ``token``, ``endpoint``, ``transfer_id``,
+                ``report_interval``, ``request_headers``, ``repo_id``,
+                ``repo_type``, ``revision``, ``tier_timeout_s`` (optional,
+                default 60), ``enable_http_fallback`` (optional,
+                default True), ``use_xet`` (optional, default True),
+                ``fsync_interval`` (optional), ``disable_fsync`` (optional).
             event_queue: Main-process queue to receive ``ProgressEvent`` objects.
 
         Raises:
@@ -149,11 +158,10 @@ class XetSubprocessRunner:
         """
         # Local import to avoid a circular dependency at module load time
         # (subprocess_runner is imported by _xet_worker, which is imported by
-        # subprocess_messages → runner → worker chain). The streaming worker
-        # itself doesn't import the runner.
-        from .._xet_worker import _xet_streaming_download_worker
+        # subprocess_messages → runner → worker chain).
+        from .._xet_worker import _xet_file_download_worker
         self.start(
-            worker_func=_xet_streaming_download_worker,
+            worker_func=_xet_file_download_worker,
             params=params,
             event_queue=event_queue,
         )

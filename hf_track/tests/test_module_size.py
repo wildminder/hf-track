@@ -80,8 +80,12 @@ OVERRIDES: Dict[str, int] = {
     # The worker module consolidates all the subprocess workers. It
     # is allowed to be the largest source file in the package, but
     # not larger than the smallest original god module (callbacks.py
-    # was ~1,400 lines, tracker.py was ~750).
-    "_xet_worker.py": 1500,
+    # was ~1,400 lines, tracker.py was ~750). Bumped from 1500 to
+    # 1550 after adding deprecation docstrings for the legacy
+    # _download_worker path, then to 1600 after adding the
+    # TranslatingQueue adapter (plan 2026-07-09, step 10: dict ->
+    # ProgressEvent translation for the hybrid runner).
+    "_xet_worker.py": 1600,
     # tqdm_download is the heaviest of the callback helpers (it
     # contains three progress-bar adapter classes). Still under the
     # original callbacks.py size of 1,400.

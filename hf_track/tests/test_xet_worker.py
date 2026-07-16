@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import queue
 import time
 from unittest.mock import MagicMock, patch
 
@@ -20,7 +21,6 @@ from hf_track._xet_worker import (
     _snapshot_worker,
     _upload_bytes_worker,
     _upload_file_worker,
-    _xet_streaming_download_worker,
     DEFAULT_FSYNC_INTERVAL,
 )
 from hf_track.subprocess import MSG_CANCELLED, MSG_ERROR, MSG_EVENT, MSG_RESULT, SubprocessMessage
@@ -801,471 +801,110 @@ class TestSnapshotWorkerUseXet:
 # ── Streaming Download Worker Tests ───────────────────────────────
 
 
-class TestXetStreamingDownloadWorker:
-    """Test _xet_streaming_download_worker — chunk-by-chunk file writer.
+# ── TranslatingQueue Tests ────────────────────────────────────────
 
-    This worker uses ``XetSession().new_download_stream_group().download_stream()``
-    and writes each chunk directly to disk via ``os.write`` (no userspace buffer).
-    Cancellation is checked before every chunk write.
+
+class TestTranslatingQueue:
+    """Tests for TranslatingQueue (dict → ProgressEvent adapter).
+
+    Plan 2026-07-09 step 10: the hybrid runner emits plain dict events
+    into the user's event_queue, but the public API contract and the
+    example display expect ProgressEvent objects. TranslatingQueue
+    converts dicts → ProgressEvent transparently.
     """
 
-    def _make_params(self, tmp_path, file_size=1000, **overrides):
-        """Build default params dict for the worker (multi-file shape)."""
-        params = {
-            "file_specs": [{
-                "hash": "abc123",
-                "file_size": file_size,
-                "dest_path": str(tmp_path / "model.bin"),
-                "xet_file_data": {"file_hash": "abc123", "refresh_route": "https://xet.example.com/refresh"},
-            }],
-            "token": "hf_test",
-            "endpoint": None,
-            "transfer_id": "stream-test-001",
-            "report_interval": 0.05,
-            "fsync_interval": 1024,
-            "request_headers": {},
-        }
-        params.update(overrides)
-        return params
+    def test_dict_is_converted_to_progress_event(self):
+        """A dict with 'event_type' is converted to a ProgressEvent."""
+        from hf_track._xet_worker import TranslatingQueue
+        from hf_track.types import EventType, ProgressEvent, ProgressPhase, TransferDirection
 
-    def _drain_messages(self, mp_queue):
-        """Drain all messages from queue and return as a list."""
-        messages = []
-        while True:
-            try:
-                messages.append(mp_queue.get_nowait())
-            except Exception:
-                break
-        return messages
+        inner = queue.Queue()
+        tq = TranslatingQueue(inner)
+        tq.put({
+            "event_type": "progress",
+            "transfer_id": "t1",
+            "direction": "download",
+            "filename": "model.bin",
+            "phase": "downloading",
+            "bytes_completed": 1024,
+            "total_bytes": 4096,
+        })
+        item = inner.get_nowait()
+        assert isinstance(item, ProgressEvent)
+        assert item.event_type == EventType.PROGRESS
+        assert item.transfer_id == "t1"
+        assert item.bytes_completed == 1024
+        assert item.total_bytes == 4096
+        assert item.direction == TransferDirection.DOWNLOAD
+        assert item.phase == ProgressPhase.DOWNLOADING
 
-    def test_open_unbuffered_creates_file(self, tmp_path):
-        """_open_unbuffered creates a new file."""
-        path = tmp_path / "x.bin"
-        fd = _open_unbuffered(str(path))
-        try:
-            os.write(fd, b"hello")
-        finally:
-            os.close(fd)
-        assert path.read_bytes() == b"hello"
+    def test_progress_event_passes_through_unchanged(self):
+        """An already-ProgressEvent object is not double-wrapped."""
+        from hf_track._xet_worker import TranslatingQueue
+        from hf_track.types import ProgressEvent, EventType, TransferDirection, ProgressPhase
 
-    def test_open_unbuffered_truncates_existing(self, tmp_path):
-        """_open_unbuffered truncates an existing file on open."""
-        path = tmp_path / "x.bin"
-        path.write_bytes(b"old content here")
-        fd = _open_unbuffered(str(path))
-        try:
-            os.write(fd, b"new")
-        finally:
-            os.close(fd)
-        assert path.read_bytes() == b"new"
-
-    def test_open_unbuffered_returns_int(self, tmp_path):
-        """_open_unbuffered returns a positive integer fd."""
-        fd = _open_unbuffered(str(tmp_path / "x.bin"))
-        try:
-            assert isinstance(fd, int)
-            assert fd > 0
-        finally:
-            os.close(fd)
-
-    def test_default_fsync_interval_is_4mb(self):
-        """DEFAULT_FSYNC_INTERVAL is 4 MB."""
-        assert DEFAULT_FSYNC_INTERVAL == 4 * 1024 * 1024
-
-    def test_import_error_emits_error_message(self, tmp_path):
-        """Worker emits an error message when hf_xet is not importable."""
-        ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
-        cancel_event = ctx.Event()
-        params = self._make_params(tmp_path)
-
-        with patch.dict("sys.modules", {"hf_xet": None}):
-            _xet_streaming_download_worker(params, mp_queue, cancel_event)
-
-        messages = self._drain_messages(mp_queue)
-        errors = [m for m in messages if m.msg_type == MSG_ERROR]
-        assert len(errors) == 1
-        assert errors[0].payload["error_type"] == "ImportError"
-
-    def test_emits_progress_event_per_chunk(self, tmp_path):
-        """Worker emits PROGRESS events as chunks are written."""
-        chunks = [b"A" * 100, b"B" * 200, b"C" * 300, b"D" * 400]
-        full_size = sum(len(c) for c in chunks)  # 1000
-
-        # Build a mock hf_xet module that produces a stream of chunks
-        mock_xet_module = MagicMock()
-        mock_session = MagicMock()
-        mock_group = MagicMock()
-        mock_stream = MagicMock()
-        _iter = iter(chunks)
-        mock_stream.__iter__ = lambda self: _iter
-        mock_stream.__next__ = lambda self: next(_iter)
-
-        mock_xet_module.XetSession.return_value = mock_session
-        mock_session.new_download_stream_group.return_value = mock_group
-        mock_group.download_stream.return_value = mock_stream
-
-        ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
-        cancel_event = ctx.Event()
-        params = self._make_params(
-            tmp_path, file_size=full_size, report_interval=0.0,
+        inner = queue.Queue()
+        tq = TranslatingQueue(inner)
+        original = ProgressEvent(
+            event_type=EventType.START,
+            transfer_id="t2",
+            direction=TransferDirection.DOWNLOAD,
+            filename="f.bin",
+            phase=ProgressPhase.DOWNLOADING,
         )
+        tq.put(original)
+        item = inner.get_nowait()
+        assert item is original  # same object, not re-created
 
-        with patch.dict("sys.modules", {
-            "hf_xet": mock_xet_module,
-            "huggingface_hub.utils._xet": MagicMock(
-                refresh_xet_connection_info=MagicMock(return_value=MagicMock(
-                    endpoint="https://xet.example.com",
-                    access_token="tok",
-                    expiration_unix_epoch=9999999999,
-                )),
-            ),
-        }):
-            _xet_streaming_download_worker(params, mp_queue, cancel_event)
+    def test_non_event_dict_passes_through(self):
+        """A dict without 'event_type' is passed through unchanged."""
+        from hf_track._xet_worker import TranslatingQueue
 
-        messages = self._drain_messages(mp_queue)
-        events = [m for m in messages if m.msg_type == MSG_EVENT and m.payload.get("event_type") == "progress"]
-        # 4 chunks, 4 events (no throttling since report_interval=0)
-        assert len(events) == 4, f"Expected 4 progress events, got {len(events)}"
-        # bytes_completed should be cumulative
-        bytes_vals = [e.payload["bytes_completed"] for e in events]
-        assert bytes_vals == [100, 300, 600, 1000]
+        inner = queue.Queue()
+        tq = TranslatingQueue(inner)
+        tq.put({"some": "other", "data": 1})
+        item = inner.get_nowait()
+        assert item == {"some": "other", "data": 1}
 
-    def test_emits_complete_and_result_at_end(self, tmp_path):
-        """Worker emits a COMPLETE event and a RESULT message on success."""
-        chunks = [b"x" * 250, b"x" * 250, b"x" * 250, b"x" * 250]  # 1000 bytes
+    def test_malformed_dict_passes_through(self):
+        """A dict with 'event_type' but missing required keys is passed
+        through (not raised) so the caller can handle it."""
+        from hf_track._xet_worker import TranslatingQueue
 
-        mock_xet_module = MagicMock()
-        mock_stream = MagicMock()
-        _iter = iter(chunks)
-        mock_stream.__iter__ = lambda self: _iter
-        mock_stream.__next__ = lambda self: next(_iter)
-        mock_xet_module.XetSession.return_value.new_download_stream_group.return_value.download_stream.return_value = mock_stream
+        inner = queue.Queue()
+        tq = TranslatingQueue(inner)
+        tq.put({"event_type": "progress"})  # missing transfer_id etc.
+        item = inner.get_nowait()
+        assert item == {"event_type": "progress"}
 
-        ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
-        cancel_event = ctx.Event()
-        params = self._make_params(tmp_path)
+    def test_put_nowait_also_translates(self):
+        """put_nowait translates dicts the same as put."""
+        from hf_track._xet_worker import TranslatingQueue
+        from hf_track.types import ProgressEvent, EventType
 
-        with patch.dict("sys.modules", {
-            "hf_xet": mock_xet_module,
-            "huggingface_hub.utils._xet": MagicMock(
-                refresh_xet_connection_info=MagicMock(return_value=MagicMock(
-                    endpoint="https://xet.example.com",
-                    access_token="tok",
-                    expiration_unix_epoch=9999999999,
-                )),
-            ),
-        }):
-            _xet_streaming_download_worker(params, mp_queue, cancel_event)
+        inner = queue.Queue()
+        tq = TranslatingQueue(inner)
+        tq.put_nowait({
+            "event_type": "complete",
+            "transfer_id": "t3",
+            "direction": "download",
+            "filename": "f.bin",
+            "phase": "complete",
+        })
+        item = inner.get_nowait()
+        assert isinstance(item, ProgressEvent)
+        assert item.event_type == EventType.COMPLETE
 
-        messages = self._drain_messages(mp_queue)
-        complete = [m for m in messages if m.msg_type == MSG_EVENT and m.payload.get("event_type") == "complete"]
-        result = [m for m in messages if m.msg_type == MSG_RESULT]
-        assert len(complete) == 1
-        assert complete[0].payload["percentage"] == 100.0
-        assert len(result) == 1
-        assert result[0].payload["status"] == "success"
-        assert result[0].payload["filename"] == "model.bin"
-        assert result[0].payload["file_size"] == 1000
+    def test_get_and_empty_delegated(self):
+        """Consumer-side methods delegate to the wrapped queue."""
+        from hf_track._xet_worker import TranslatingQueue
 
-    def test_writes_full_content_to_disk(self, tmp_path):
-        """Worker writes all chunks to the destination file."""
-        chunks = [bytes([i]) * 100 for i in range(10)]  # 1000 bytes total
-        expected = b"".join(chunks)
+        inner = queue.Queue()
+        tq = TranslatingQueue(inner)
+        assert tq.empty() is True
+        inner.put("x")
+        assert tq.empty() is False
+        assert tq.get() == "x"
+        assert tq.empty() is True
 
-        mock_xet_module = MagicMock()
-        mock_stream = MagicMock()
-        _iter = iter(chunks)
-        mock_stream.__iter__ = lambda self: _iter
-        mock_stream.__next__ = lambda self: next(_iter)
-        mock_xet_module.XetSession.return_value.new_download_stream_group.return_value.download_stream.return_value = mock_stream
 
-        ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
-        cancel_event = ctx.Event()
-        dest = str(tmp_path / "out.bin")
-        params = self._make_params(tmp_path, dest_path=dest, file_size=1000)
-        params["file_specs"][0]["dest_path"] = dest
-
-        with patch.dict("sys.modules", {
-            "hf_xet": mock_xet_module,
-            "huggingface_hub.utils._xet": MagicMock(
-                refresh_xet_connection_info=MagicMock(return_value=MagicMock(
-                    endpoint="https://xet.example.com",
-                    access_token="tok",
-                    expiration_unix_epoch=9999999999,
-                )),
-            ),
-        }):
-            _xet_streaming_download_worker(params, mp_queue, cancel_event)
-
-        with open(dest, "rb") as f:
-            data = f.read()
-        assert data == expected
-        assert len(data) == 1000
-
-    def test_cancel_event_stops_loop(self, tmp_path):
-        """Setting cancel_event makes the worker exit cooperatively."""
-        # 5 chunks of 100 bytes; cancel after the first chunk
-        chunks = [b"a" * 100] * 5
-
-        mock_xet_module = MagicMock()
-        mock_stream = MagicMock()
-
-        # Make the iterator raise a fake cancel signal after yielding one chunk
-        def iter_then_cancel(self):
-            yield chunks[0]
-            # After the first chunk, the worker's loop checks cancel_event and breaks
-
-        _gen = iter_then_cancel(None)
-        mock_stream.__iter__ = lambda self: _gen
-        mock_stream.__next__ = lambda self: next(_gen)
-
-        mock_xet_module.XetSession.return_value.new_download_stream_group.return_value.download_stream.return_value = mock_stream
-
-        ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
-        cancel_event = ctx.Event()
-        cancel_event.set()  # Pre-cancel
-        dest = str(tmp_path / "cancelled.bin")
-        params = self._make_params(tmp_path, dest_path=dest, file_size=500)
-        params["file_specs"][0]["dest_path"] = dest
-
-        with patch.dict("sys.modules", {
-            "hf_xet": mock_xet_module,
-            "huggingface_hub.utils._xet": MagicMock(
-                refresh_xet_connection_info=MagicMock(return_value=MagicMock(
-                    endpoint="https://xet.example.com",
-                    access_token="tok",
-                    expiration_unix_epoch=9999999999,
-                )),
-            ),
-        }):
-            _xet_streaming_download_worker(params, mp_queue, cancel_event)
-
-        # We should see a CANCELLED message
-        messages = self._drain_messages(mp_queue)
-        cancelled = [m for m in messages if m.msg_type == MSG_CANCELLED]
-        assert len(cancelled) == 1
-
-        # The file may be empty or contain at most 1 chunk (since cancel is checked BEFORE write)
-        if os.path.exists(dest):
-            size = os.path.getsize(dest)
-            assert size <= 100, f"Expected ≤100 bytes (cancelled), got {size}"
-
-    def test_fsync_called_at_interval(self, tmp_path):
-        """Worker calls os.fsync at the configured fsync_interval boundary."""
-        # 10 chunks of 200 bytes = 2000 bytes total; fsync_interval=500 → expect ≥3 fsyncs
-        chunks = [b"X" * 200 for _ in range(10)]
-
-        mock_xet_module = MagicMock()
-        mock_stream = MagicMock()
-        _iter = iter(chunks)
-        mock_stream.__iter__ = lambda self: _iter
-        mock_stream.__next__ = lambda self: next(_iter)
-        mock_xet_module.XetSession.return_value.new_download_stream_group.return_value.download_stream.return_value = mock_stream
-
-        ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
-        cancel_event = ctx.Event()
-        dest = str(tmp_path / "fsync.bin")
-        params = self._make_params(tmp_path, dest_path=dest, file_size=2000, fsync_interval=500)
-        params["file_specs"][0]["dest_path"] = dest
-
-        fsync_call_count = [0]
-        real_fsync = os.fsync
-
-        def tracking_fsync(fd):
-            fsync_call_count[0] += 1
-            return real_fsync(fd)
-
-        with patch.dict("sys.modules", {
-            "hf_xet": mock_xet_module,
-            "huggingface_hub.utils._xet": MagicMock(
-                refresh_xet_connection_info=MagicMock(return_value=MagicMock(
-                    endpoint="https://xet.example.com",
-                    access_token="tok",
-                    expiration_unix_epoch=9999999999,
-                )),
-            ),
-        }), patch("hf_track._xet_worker.os.fsync", side_effect=tracking_fsync):
-            _xet_streaming_download_worker(params, mp_queue, cancel_event)
-
-        # 2000 bytes / 500 = 4 fsync intervals. With the final fsync in finally,
-        # we expect at least 4 fsync calls.
-        assert fsync_call_count[0] >= 3, f"Expected ≥3 fsync calls, got {fsync_call_count[0]}"
-
-    def test_credential_error_emits_error(self, tmp_path):
-        """Worker emits an error if credentials cannot be fetched."""
-        ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
-        cancel_event = ctx.Event()
-        params = self._make_params(tmp_path)
-
-        with patch.dict("sys.modules", {
-            "hf_xet": MagicMock(),
-            "huggingface_hub.utils._xet": MagicMock(
-                refresh_xet_connection_info=MagicMock(side_effect=ConnectionError("auth failed")),
-            ),
-        }):
-            _xet_streaming_download_worker(params, mp_queue, cancel_event)
-
-        messages = self._drain_messages(mp_queue)
-        errors = [m for m in messages if m.msg_type == MSG_ERROR]
-        assert len(errors) == 1
-        assert "credential" in errors[0].payload["message"].lower() or "auth" in errors[0].payload["message"].lower()
-
-    def test_empty_file_is_handled(self, tmp_path):
-        """Worker creates an empty file and emits COMPLETE for zero-byte files."""
-        ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
-        cancel_event = ctx.Event()
-        dest = str(tmp_path / "empty.bin")
-        params = self._make_params(tmp_path, file_size=0)
-        params["file_specs"][0]["dest_path"] = dest
-        params["file_specs"][0]["file_size"] = 0
-
-        # No need to mock hf_xet since empty files short-circuit before opening a stream
-        with patch.dict("sys.modules", {
-            "hf_xet": MagicMock(),
-            "huggingface_hub.utils._xet": MagicMock(
-                refresh_xet_connection_info=MagicMock(return_value=MagicMock(
-                    endpoint="https://xet.example.com",
-                    access_token="tok",
-                    expiration_unix_epoch=9999999999,
-                )),
-            ),
-        }):
-            _xet_streaming_download_worker(params, mp_queue, cancel_event)
-
-        # Empty file should exist on disk
-        assert os.path.exists(dest)
-        assert os.path.getsize(dest) == 0
-
-        # COMPLETE event and RESULT message should be emitted
-        messages = self._drain_messages(mp_queue)
-        complete = [m for m in messages if m.msg_type == MSG_EVENT and m.payload.get("event_type") == "complete"]
-        result = [m for m in messages if m.msg_type == MSG_RESULT]
-        assert len(complete) == 1
-        assert len(result) == 1
-        assert result[0].payload["status"] == "success"
-        assert result[0].payload["file_size"] == 0
-
-    def test_multi_file_emits_one_result(self, tmp_path):
-        """Regression: multi-file download emits exactly ONE terminal result, not one per file.
-
-        The relay thread in ``XetSubprocessRunner._relay_events`` treats
-        ``SubprocessMessage.result`` as the terminal signal and breaks out of
-        the loop on the first one. Previously, the streaming worker emitted a
-        per-file ``result`` for every file in the loop, causing the relay to
-        break after file 1 and lose all remaining progress events and the
-        final result. Symptom: 0 files / 0 bytes on the parent side even
-        though the worker was still running.
-
-        This test verifies the fix: only ONE ``result`` is emitted at the
-        very end of the loop, and one COMPLETE per file. Three xet files
-        in the input produce three COMPLETEs and exactly one RESULT.
-        """
-        file_sizes = [100, 200, 300]
-        # Each spec gets a unique hash → triggers per-file group rebuild
-        specs = []
-        for i, sz in enumerate(file_sizes):
-            specs.append({
-                "hash": f"hash_{i}",
-                "file_size": sz,
-                "dest_path": str(tmp_path / f"file_{i}.bin"),
-                "xet_file_data": {
-                    "file_hash": f"hash_{i}",
-                    "refresh_route": f"https://xet.example.com/refresh/{i}",
-                },
-            })
-
-        # We don't know the order in which ``new_download_stream_group`` will
-        # be called (depends on which file the worker iterates first), so we
-        # bind each call to a size determined at call time. We do this by
-        # capturing the file_info passed to download_stream via a side_effect
-        # that introspects the spec's hash via a lookup table.
-        hash_to_size = {f"hash_{i}": sz for i, sz in enumerate(file_sizes)}
-
-        # Mock hf_xet module. The XetFileInfo returned by ``hf_xet.XetFileInfo(...)``
-        # is a MagicMock with arbitrary attribute access — but we can use a
-        # namedtuple-like real class to expose file_hash / file_size attributes
-        # that the side_effect can read.
-        class _FakeFileInfo:
-            def __init__(self, file_hash, file_size):
-                self.file_hash = file_hash
-                self.file_size = file_size
-
-        def fake_xet_file_info(file_hash, file_size):
-            return _FakeFileInfo(file_hash, file_size)
-
-        def make_stream(size):
-            stream = MagicMock()
-            _iter = iter([b"x" * size])
-            stream.__iter__ = lambda self: _iter
-            stream.__next__ = lambda self: next(_iter)
-            return stream
-
-        # The worker re-creates the group each loop iteration via
-        # ``new_download_stream_group``, so each call must produce a fresh
-        # mock whose ``download_stream`` returns the stream for the
-        # currently-iterated file.
-        def new_group(**kwargs):
-            g = MagicMock()
-            g.download_stream = MagicMock(
-                side_effect=lambda fi: make_stream(fi.file_size),
-            )
-            return g
-
-        mock_xet_module = MagicMock()
-        mock_xet_module.XetFileInfo = fake_xet_file_info
-        mock_xet_module.XetSession.return_value.new_download_stream_group.side_effect = new_group
-
-        ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
-        cancel_event = ctx.Event()
-        params = self._make_params(tmp_path)
-        params["file_specs"] = specs
-        params["report_interval"] = 0.0  # no throttling
-
-        with patch.dict("sys.modules", {
-            "hf_xet": mock_xet_module,
-            "huggingface_hub.utils._xet": MagicMock(
-                refresh_xet_connection_info=MagicMock(return_value=MagicMock(
-                    endpoint="https://xet.example.com",
-                    access_token="tok",
-                    expiration_unix_epoch=9999999999,
-                )),
-            ),
-        }):
-            _xet_streaming_download_worker(params, mp_queue, cancel_event)
-
-        messages = self._drain_messages(mp_queue)
-        complete_events = [
-            m for m in messages
-            if m.msg_type == MSG_EVENT and m.payload.get("event_type") == "complete"
-        ]
-        results = [m for m in messages if m.msg_type == MSG_RESULT]
-
-        # ONE COMPLETE per file (3 files → 3 COMPLETEs)
-        assert len(complete_events) == 3, (
-            f"Expected 3 COMPLETE events (one per file), got {len(complete_events)}. "
-            f"Messages: {[(m.msg_type, m.payload) for m in messages]}"
-        )
-        # EXACTLY ONE terminal RESULT — the bug was emitting one per file
-        assert len(results) == 1, (
-            f"Expected exactly 1 terminal RESULT message, got {len(results)}. "
-            f"Multiple result messages break the relay thread's terminal-state "
-            f"detection in XetSubprocessRunner._relay_events. "
-            f"Messages: {[(m.msg_type, m.payload) for m in messages]}"
-        )
-        # The single result should aggregate the whole transfer
-        result = results[0]
-        assert result.payload["status"] == "success"
-        # All three files should exist on disk with correct sizes
-        for i, sz in enumerate(file_sizes):
-            p = tmp_path / f"file_{i}.bin"
-            assert p.exists(), f"file_{i}.bin missing"
-            assert p.stat().st_size == sz, f"file_{i}.bin wrong size"

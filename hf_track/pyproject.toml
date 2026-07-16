@@ -51,4 +51,5 @@ asyncio_mode = "auto"
 addopts = "--tb=short"
 markers = [
     "integration: marks tests requiring real HF credentials (deselect with '-m \"not integration\"')",
+    "network: marks tests requiring real network access to huggingface.co (deselect with '-m \"not network\"')",
 ]

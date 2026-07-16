@@ -23,12 +23,13 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import queue
 import signal
-import threading
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .subprocess.messages import SubprocessMessage
+from .types import ProgressEvent
 
 logger = logging.getLogger(__name__)
 
@@ -343,6 +344,14 @@ def _download_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_event: m
 
     Runs in a child process. Imports ``hf_xet`` locally.
 
+    .. deprecated:: 2026-07-09
+        This worker uses the legacy ``hf_xet.download_files()`` API
+        which hangs indefinitely in some environments. The hybrid
+        approach (``download_file_with_xet_hybrid`` /
+        ``HybridRunner`` + ``download_hybrid``) replaces it for
+        single-file downloads. See
+        docs/plans/2026-07-09-xet-single-file-download-fix.md.
+
     Args:
         params: Dict with keys: file_hash, file_size, dest_path,
             xet_file_data (dict), token, endpoint, transfer_id,
@@ -523,22 +532,15 @@ def _download_batch_worker(params: Dict[str, Any], mp_queue: mp.Queue, cancel_ev
         _handle_worker_exception(mp_queue, e)
 
 
-# ── Streaming Xet Download Worker (NEW 2026-06-04) ────────────────
-#
-# This worker uses ``hf_xet.XetSession().new_download_stream_group()``
-# instead of ``hf_xet.download_files()`` to bypass the buffered API.
-# It writes each file's chunks to disk immediately via ``os.write`` on
-# a raw file descriptor (no userspace buffer) and calls ``os.fsync``
-# periodically so a SIGKILL preserves the in-flight data.
-#
-# See: docs/plans/2026-06-04-xet-streaming-subprocess.md for the
-# rationale and the test coverage matrix.
 
 
-# Default fsync cadence: commit the OS page cache to disk every N bytes.
-# 4 MiB is a good trade-off: cheap on SSD, fast enough on HDD, and
-# ensures no more than ~4 MiB of work is lost on SIGKILL.
-DEFAULT_FSYNC_INTERVAL = 4 * 1024 * 1024
+# ── Shared fsync utilities ────────────────────────────────────────
+#
+# Used by the hybrid file-download-group worker below. The previous
+# streaming worker (broken at the Rust __next__ layer) also relied on
+# these; they are kept here as shared helpers.
+
+DEFAULT_FSYNC_INTERVAL: int = 4 * 1024 * 1024
 
 
 def _open_unbuffered(path: str) -> int:
@@ -555,553 +557,667 @@ def _open_unbuffered(path: str) -> int:
     return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
 
 
-def _xet_streaming_download_worker(
-    params: Dict[str, Any],
-    mp_queue: mp.Queue,
-    cancel_event: mp.Event,
-    session_factory: Any = None,
-) -> None:
-    """Worker function for multi-file Xet downloads via the STREAMING API.
+# ── File-Download-Group Worker (HYBRID, plan 2026-06-15) ───────────
 
-    Runs in a child process. Imports ``hf_xet`` locally.
+DEFAULT_TIER_TIMEOUT_S: float = 60.0
+DEFAULT_POLL_INTERVAL_S: float = 0.1
+DEFAULT_TIER_PROGRESS_INTERVAL_S: float = 0.1
 
-    Uses ``hf_xet.XetSession().new_download_stream_group().download_stream()``
-    to write each file's chunks to disk incrementally. Memory stays
-    bounded by chunk size (~4 MB) instead of file size. Each chunk is
-    written via ``os.write`` on a raw fd (no userspace buffer) and
-    ``os.fsync`` is called every ``fsync_interval`` bytes plus once at
-    the end in a ``finally`` block. This guarantees that a SIGKILL
-    at any point leaves a non-empty, non-truncated file on disk.
+
+def download_hybrid(
+    file_specs: List[Dict[str, Any]],
+    *,
+    repo_id: str = "",
+    repo_type: str = "model",
+    revision: Optional[str] = None,
+    endpoint: Optional[str] = None,
+    token: Any = None,
+    transfer_id: str = "hybrid",
+    report_interval: float = 0.1,
+    fsync_interval: int = DEFAULT_FSYNC_INTERVAL,
+    disable_fsync: bool = False,
+    tier_timeout_s: float = DEFAULT_TIER_TIMEOUT_S,
+    poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+    enable_http_fallback: bool = True,
+    use_xet: bool = True,
+    cancel_event: Optional[Any] = None,
+    progress_queue: Any = None,
+    progress_dict: Any = None,
+) -> Dict[str, Any]:
+    """Run the HYBRID download IN-PROCESS from the parent thread.
+
+    Plan: ``docs/plans/2026-06-15-xet-streaming-hybrid-approach.md``
+    (re-designed to run without a subprocess -- the legacy ``spawn``
+    worker introduced GIL/CAS issues that were not worth carrying).
+
+    Per-file loop:
+
+    1. ``XetFileDownloadGroup.start_download_file()`` is called via
+       ``hf_xet.XetSession()``. We poll ``handle.progress()`` and emit
+       progress into ``progress_queue`` (a ``queue.Queue`` of plain
+       dict events -- see ``hf_track.types.ProgressEvent.to_dict()``).
+    2. If progress reaches ``file_size`` or the status becomes
+       ``Completed`` before ``tier_timeout_s`` elapses, Tier 1 wins and
+       we move on to the next file.
+    3. Otherwise ``group.abort()`` is called and the file is
+       downloaded via ``download_file_http`` -- ``requests`` →
+       ``iter_content`` → ``os.write`` + periodic ``os.fsync``. This
+       path gives full incremental disk visibility independent of the
+       Rust runtime.
+    4. If both tiers fail the worker raises; the caller turns that
+       into an arbitrary ``progress_queue.put({"event_type": "error",
+       ...})`` event.
+
+    Progress reporting goes through ``progress_queue`` if provided,
+    otherwise it is dropped. ``progress_dict`` is an optional mutable
+    container (e.g. ``[int]`` or ``dict``) the caller can inspect
+    mid-call for live state (last error, last completed index).
 
     Args:
-        params: Dict with keys: file_specs (list of dicts with
-            ``hash``, ``file_size``, ``dest_path``, ``xet_file_data``),
-            token, endpoint, transfer_id, report_interval,
-            request_headers, fsync_interval (optional, default 4 MiB).
-        mp_queue: Queue for sending SubprocessMessage back to main process.
-        cancel_event: Event set by main process to signal cancellation.
+        file_specs: List of dicts each with ``hash``, ``file_size``,
+            ``dest_path``, optional ``filename`` and ``xet_file_data``
+            (serialized ``XetFileData``).
+        repo_id, repo_type, revision, endpoint, token: needed for the
+            HTTP fallback and for refreshing xet credentials.
+        tier_timeout_s: How long (per file) Tier 1 may stall before
+            falling back to HTTP.
+        poll_interval_s: Loop interval between ``handle.progress()``
+            polls.
+        report_interval: Seconds between emitted PROGRESS events.
+        fsync_interval: Bytes between ``os.fsync`` calls in HTTP path.
+        disable_fsync: If True, skip ``os.fsync`` (fastest).
+        enable_http_fallback: When False, Tier 1 failure is fatal.
+        use_xet: When False, all files go through Tier 3 (HTTP).
+        cancel_event: Any object with ``.is_set()`` / ``.set()``. Used
+            both between chunks and between polls.
+        progress_queue: ``queue.Queue`` to receive ProgressEvent dicts.
+        progress_dict: Mutable container inspected by tests.
 
-    Cancellation semantics:
-        - Cooperative: ``cancel_event.is_set()`` is checked between
-          chunks. If set, the worker's inner loop calls ``stream.cancel()``
-          (best-effort), breaks, and emits a CANCELLED message.
-        - Hard: the parent process can ``terminate()`` the child at any
-          point. The ``finally`` block ensures ``os.fsync`` + ``os.close``
-          run on the in-flight file before the OS reaps the process.
+    Returns:
+        A ``dict`` summary: ``{"bytes_completed": int,
+        "total_bytes": int, "files_completed": int, "total_files":
+        int, "errors": [str] }``.
     """
-    _init_worker()
+    import sys as _sys
+
     from .types import (
         EventType,
         ProgressPhase,
         TransferCancelledError,
         TransferDirection,
     )
+    from .download.http_fallback import download_file_http
 
-    transfer_id = params["transfer_id"]
-    file_specs: List[Dict[str, Any]] = params["file_specs"]
-    total_files = len(file_specs)
-    fsync_interval = params.get("fsync_interval", DEFAULT_FSYNC_INTERVAL)
-    # Step 5 (plan §4 L1 / step 5): ``disable_fsync=True`` skips ALL
-    # ``os.fsync`` calls. Used by the ``--no-fsync`` example flag for
-    # max throughput (data loss on SIGKILL is acceptable). Default
-    # False preserves the existing safety semantics.
-    disable_fsync: bool = bool(params.get("disable_fsync", False))
+    def _diag(msg: str) -> None:
+        try:
+            _sys.stderr.write(f"[HYBRID] {msg}\n")
+            _sys.stderr.flush()
+        except Exception:
+            pass
 
-    # ── Diagnostic markers (stderr) ──────────────────────────────
-    # Each step writes to stderr so the user can see exactly where
-    # the worker hangs.  Uses sys.stderr.write (not logging) because
-    # the child process may not have logging configured and stderr
-    # is always available.  Remove after the streaming hang is fixed.
-    import sys as _sys
-    def _diag(marker: str) -> None:
-        _sys.stderr.write(f"[STREAM-WORKER] {marker}\n")
-        _sys.stderr.flush()
+    def _put_progress(event: Dict[str, Any]) -> None:
+        if progress_queue is None:
+            return
+        try:
+            progress_queue.put_nowait(event)
+        except Exception:
+            pass
 
-    _diag(f"worker-start files={total_files} pid={os.getpid()}")
+    def _is_cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
 
-    try:
-        _diag("import-hf-xet-start")
-        import hf_xet
-        _diag(f"import-hf-xet-ok version={getattr(hf_xet, '__version__', '?')}")
-        from huggingface_hub.utils._xet import refresh_xet_connection_info
-        _diag("import-hf-hub-xet-ok")
-    except ImportError as e:
-        _diag(f"import-failed: {e}")
-        _safe_put(mp_queue, SubprocessMessage.error(
-            message=str(e), error_type="ImportError", retryable=False,
-        ))
-        return
+    if not file_specs:
+        return {
+            "bytes_completed": 0,
+            "total_bytes": 0,
+            "files_completed": 0,
+            "total_files": 0,
+            "errors": [],
+        }
 
-    # Use first file's xet_file_data for credentials. We refresh the
-    # connection per file (see below) because the access token is scoped
-    # to a specific xet file's blocks; downloading a different file with
-    # another file's token would either fail or yield zero bytes (the
-    # symptom we hit when downloading all three xet files in a snapshot
-    # in one subprocess).
-    headers = params.get("request_headers", {})
-
-    # Build the XetSession once. The per-file DownloadStreamGroup is
-    # rebuilt on each iteration of the file loop, because the group
-    # binds to a single (endpoint, token) pair.
-    try:
-        _diag("xet-session-start")
-        session = hf_xet.XetSession()
-        _diag("xet-session-ok")
-    except Exception as e:
-        _diag(f"xet-session-failed: {e}")
-        _safe_put(mp_queue, SubprocessMessage.error(
-            message=f"Failed to build XetSession: {e}",
-            error_type=type(e).__name__,
-        ))
-        return
-
-    # Per-file group: we will re-create this in the loop below.
-    group = None
-    # Per-file stream: tracked here so the outer finally (Step 2 of plan
-    # 2026-06-05) can call stream.cancel() on cleanup paths.
-    stream = None  # type: ignore[assignment]
-
-    # Per-file throttler
-    throttler = _ProgressThrottler(report_interval=params.get("report_interval", 0.1))
-
-    # Track overall progress across all files
-    total_bytes_all = sum(spec["file_size"] for spec in file_specs)
+    total_bytes_all = sum(int(spec["file_size"]) for spec in file_specs)
     bytes_completed_all = 0
+    errors: List[str] = []
+    files_completed = 0
+
+    # ── Set up Tier 1 (lazily) ─────────────────────────────────────
+    session = None
+    refresh_xet_connection_info = None
+    hf_xet_mod = None
+    if use_xet:
+        try:
+            import hf_xet as _hf_xet
+            from huggingface_hub.utils._xet import (
+                refresh_xet_connection_info as _refresh,
+            )
+        except ImportError as e:
+            _diag(f"hf_xet-import-failed: {e}")
+            errors.append(f"hf_xet unavailable: {e}")
+            session = None
+            refresh_xet_connection_info = None
+            hf_xet_mod = None
+        else:
+            session = _hf_xet.XetSession()
+            refresh_xet_connection_info = _refresh
+            hf_xet_mod = _hf_xet
+    else:
+        _diag("use_xet=False → Tier 1 disabled, all files via HTTP")
+
+    headers: Dict[str, Any] = {}
     start_time = time.time()
-    transfer_completed = 0
-    transfer_speed = 0.0
 
-    # Outer finally (plan Step 2): release the in-flight ``stream`` and
-    # ``group`` on any exit path so the Rust runtime's background
-    # threads are not leaked. This is the cooperative counterpart to
-    # the parent's SIGTERM fallback in Step 4.
-    try:
-        for i, spec in enumerate(file_specs):
-            filename = os.path.basename(spec["dest_path"])
-            file_hash = spec["hash"]
-            file_size = spec["file_size"]
-            dest_path = spec["dest_path"]
+    for i, spec in enumerate(file_specs):
+        if _is_cancelled():
+            _put_progress({
+                "event_type": EventType.CANCELLED.value,
+                "transfer_id": transfer_id,
+                "direction": TransferDirection.DOWNLOAD.value,
+                "filename": spec.get("filename") or os.path.basename(spec["dest_path"]),
+                "phase": ProgressPhase.CANCELLED.value,
+                "bytes_completed": bytes_completed_all,
+                "total_bytes": total_bytes_all,
+            })
+            if progress_dict is not None:
+                progress_dict["cancelled"] = True
+            return {
+                "bytes_completed": bytes_completed_all,
+                "total_bytes": total_bytes_all,
+                "files_completed": files_completed,
+                "total_files": len(file_specs),
+                "errors": errors,
+            }
 
-            # Cancellation check between files
-            if cancel_event.is_set():
-                from .types import TransferCancelledError
-                raise TransferCancelledError("Transfer cancelled by user")
+        filename = spec.get("filename") or os.path.basename(spec["dest_path"])
+        file_hash = spec["hash"]
+        file_size = int(spec["file_size"])
+        dest_path = spec["dest_path"]
 
-            # NOTE: The previous file's ``stream`` and ``group`` are left
-            # for the outer ``finally`` to clean up. Re-creating the group
-            # per-file gives us a fresh (endpoint, token) pair; the old
-            # group is closed there. The Rust runtime releases its
-            # background tasks as soon as the new stream starts producing
-            # data, so per-file leaks are bounded.
+        # ── Tier 1 ────────────────────────────────────────────────
+        tier1_ok = False
+        if use_xet and session is not None and file_size > 0:
+            tier1_ok = _run_tier1_file(
+                session=session,
+                refresh_xet_connection_info=refresh_xet_connection_info,
+                hf_xet=hf_xet_mod,
+                filename=filename,
+                file_hash=file_hash,
+                file_size=file_size,
+                dest_path=dest_path,
+                xet_file_data=spec.get("xet_file_data", {}),
+                headers=headers,
+                transfer_id=transfer_id,
+                file_index=i,
+                total_files=len(file_specs),
+                progress_queue=progress_queue,
+                cancel_event=cancel_event,
+                tier_timeout_s=tier_timeout_s,
+                poll_interval_s=poll_interval_s,
+                total_bytes_all=total_bytes_all,
+                bytes_completed_baseline=bytes_completed_all,
+                start_time=start_time,
+                diag=_diag,
+                report_interval=report_interval,
+            )
 
-            # Empty file: create and emit COMPLETE.
-            # NOTE: we deliberately do NOT send a per-file SubprocessMessage.result()
-            # here. The relay thread treats ``result`` as the terminal message and
-            # breaks out of the loop on the first one it sees. If we emitted one
-            # per file, the relay would break after file 1 and lose all remaining
-            # progress events and the final result. Per-file completion is
-            # communicated via the COMPLETE event below; the final terminal
-            # ``result`` is sent once after the loop ends.
-            #
-            # Step 1 (plan D5): fsync the empty file before close so it
-            # is immediately visible on disk.
-            if file_size == 0:
-                fd = _open_unbuffered(dest_path)
-                if not disable_fsync:
-                    try:
-                        os.fsync(fd)
-                    except OSError:
-                        pass
-                os.close(fd)
-                _safe_put(mp_queue, SubprocessMessage.event({
-                    "event_type": EventType.COMPLETE.value,
+        if tier1_ok:
+            bytes_completed_all += file_size
+        elif file_size == 0:
+            # Empty file handled in Tier 1, no fallback needed.
+            parent = os.path.dirname(dest_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            open(dest_path, "wb").close()
+            bytes_completed_all += 0
+        elif enable_http_fallback:
+            # ── Tier 3 (HTTP) ────────────────────────────────────
+            _diag(f"file-{i} tier1-failed, falling back to http")
+            if os.path.exists(dest_path):
+                try:
+                    os.remove(dest_path)
+                except OSError:
+                    pass
+            try:
+                written = download_file_http(
+                    repo_id=repo_id,
+                    filename=filename,
+                    dest_path=dest_path,
+                    token=token,
+                    repo_type=repo_type,
+                    revision=revision or "main",
+                    endpoint=endpoint,
+                    fsync_interval=fsync_interval,
+                    cancel_event=cancel_event,
+                    expected_size=file_size,
+                )
+            except Exception as fb_err:
+                err_msg = f"Tier 3 (HTTP) failed for {filename}: {fb_err}"
+                _diag(f"file-{i} tier3-failed: {fb_err}")
+                errors.append(err_msg)
+                _put_progress({
+                    "event_type": EventType.ERROR.value,
                     "transfer_id": transfer_id,
                     "direction": TransferDirection.DOWNLOAD.value,
                     "filename": filename,
-                    "phase": ProgressPhase.COMPLETE.value,
-                    "bytes_completed": 0,
-                    "total_bytes": 0,
-                    "percentage": 100.0,
-                    "speed": 0,
-                    "file_index": i,
-                    "total_files": total_files,
-                    "transfer_bytes_completed": transfer_completed,
-                    "transfer_bytes_total": total_bytes_all,
-                    "transfer_speed": transfer_speed,
-                }))
-                continue
-
-            # Open the stream
-            file_info = hf_xet.XetFileInfo(file_hash, file_size)
-            _diag(f"file-{i}/{total_files} xet-info-built hash={file_hash[:12]}... size={file_size}")
-    
-            # Refresh the connection_info + group for this specific file.
-            # The Xet access token is scoped to a specific xet file's
-            # blocks; if we reuse the previous file's group/token, the
-            # stream will return 0 bytes for the new file (the symptom
-            # we hit when downloading 3 xet files in a single batch).
-            try:
-                _diag(f"file-{i} refresh-creds-start")
-                this_xet_file_data = _deserialize_xet_file_data(
-                    spec.get("xet_file_data", {})
-                )
-                this_conn_info = refresh_xet_connection_info(
-                    file_data=this_xet_file_data, headers=headers,
-                )
-                _diag(f"file-{i} refresh-creds-ok endpoint={this_conn_info.endpoint}")
-                # _XetFileDataProxy has __slots__, so use getattr
-                refresh_route = getattr(this_xet_file_data, "refresh_route", "")
-                _diag(f"file-{i} new-stream-group-start")
-                group = session.new_download_stream_group(
-                    endpoint=this_conn_info.endpoint,
-                    token=this_conn_info.access_token,
-                    token_expiry_unix_secs=this_conn_info.expiration_unix_epoch,
-                    token_refresh_url=refresh_route,
-                    token_refresh_headers=headers,
-                )
-                _diag(f"file-{i} new-stream-group-ok")
-            except Exception as e:
-                _diag(f"file-{i} refresh-creds-failed: {e}")
-                _safe_put(mp_queue, SubprocessMessage.error(
-                    message=f"Failed to refresh credentials for {filename}: {e}",
-                    error_type=type(e).__name__,
-                ))
-                return
-    
-            try:
-                _diag(f"file-{i} download-stream-start (blocks until first chunk ready)")
-                stream = group.download_stream(file_info)
-                _diag(f"file-{i} download-stream-ok (iterator ready)")
-            except Exception as e:
-                _diag(f"file-{i} download-stream-failed: {e}")
-                _safe_put(mp_queue, SubprocessMessage.error(
-                    message=f"Failed to open stream for {filename}: {e}",
-                    error_type=type(e).__name__,
-                ))
-                return
-    
-            # Iterate chunks, write to disk, emit progress
-            fd = _open_unbuffered(dest_path)
-            _diag(f"file-{i} fd-opened path={dest_path}")
-            bytes_completed = 0
-            bytes_since_fsync = 0
-            file_start_time = time.time()
-            cancelled = False
-            write_failed = False
-            chunk_count = 0
-
-            # ── Validation: timeout wrapper for __next__ ─────────
-            # ``stream.__next__()`` calls ``blocking_next()`` in Rust,
-            # which calls ``receiver.blocking_recv()`` on a oneshot
-            # channel.  If the Rust async task that should send data
-            # hangs (e.g. CAS server keeps connection open without
-            # sending bytes, or token expires mid-download), the
-            # ``__next__`` call blocks forever with the GIL held.
-            #
-            # We use a thread-based timeout to detect this: a daemon
-            # thread calls ``next(stream)`` and the main worker waits
-            # with a timeout.  If the thread doesn't return within
-            # ``_CHUNK_TIMEOUT_S``, we log a diagnostic and cancel the
-            # stream.
-            #
-            # Default timeout: 300 s (5 min).  This is generous — a
-            # single xet term (~64 MB) at 1 MB/s takes ~64 s.  Set
-            # ``XET_CHUNK_TIMEOUT`` env var to override.
-            _CHUNK_TIMEOUT_S = int(os.environ.get("XET_CHUNK_TIMEOUT", "300"))
-
-            # Sentinel for end-of-iteration (next() returned None)
-            _SENTINEL = object()
-
-            # Shared state between the timeout thread and the main
-            # worker loop.  ``_chunk_result`` is set by the thread
-            # when ``next(stream)`` returns (or raises).
-            _chunk_result: list = [_SENTINEL]  # [_SENTINEL] = not yet set
-            _chunk_error: list = [None]  # [None] = no error
-
-            def _fetch_next_chunk() -> None:
-                """Fetch the next chunk from the stream in a daemon thread."""
-                try:
-                    chunk = next(stream, _SENTINEL)
-                    _chunk_result[0] = chunk
-                except StopIteration:
-                    _chunk_result[0] = _SENTINEL
-                except BaseException as e:
-                    _chunk_error[0] = e
-                    _chunk_result[0] = _SENTINEL
-
-            try:
-                _diag(f"file-{i} chunk-loop-start chunk_timeout={_CHUNK_TIMEOUT_S}s")
-                while True:
-                    # ── Pre-__next__ diagnostic ──────────────────
-                    # Log a timestamped marker BEFORE calling
-                    # ``next(stream)`` so we can see exactly when the
-                    # hang starts.  Also poll ``stream.progress()``
-                    # (non-blocking Rust method) to check if the
-                    # background reconstruction is still advancing.
-                    _pre_next_ts = time.time()
-                    _pre_next_elapsed = _pre_next_ts - file_start_time
-                    _prog_info = ""
-                    if hasattr(stream, "progress"):
-                        try:
-                            _prog = stream.progress()
-                            if _prog is not None:
-                                _bc = getattr(_prog, "bytes_completed", "?")
-                                _tb = getattr(_prog, "total_bytes", "?")
-                                _prog_info = f" rust_progress={_bc}/{_tb}"
-                        except Exception:
-                            _prog_info = " rust_progress=error"
-                    _diag(
-                        f"file-{i} pre-next chunk={chunk_count + 1} "
-                        f"elapsed={_pre_next_elapsed:.1f}s "
-                        f"bytes_on_disk={bytes_completed}/{file_size}"
-                        f"{_prog_info}"
-                    )
-
-                    # ── Fetch next chunk with timeout ──────────────
-                    # Reset shared state
-                    _chunk_result[0] = _SENTINEL
-                    _chunk_error[0] = None
-
-                    _fetch_thread = threading.Thread(
-                        target=_fetch_next_chunk, daemon=True,
-                    )
-                    _fetch_thread.start()
-                    _fetch_thread.join(timeout=_CHUNK_TIMEOUT_S)
-
-                    if _fetch_thread.is_alive():
-                        # Timeout: the thread is still blocked in
-                        # ``next(stream)`` -> ``blocking_next()`` ->
-                        # ``receiver.blocking_recv()``.  The Rust
-                        # async task that should deliver data is stuck.
-                        _hang_ts = time.time()
-                        _hang_elapsed = _hang_ts - file_start_time
-                        _diag(
-                            f"file-{i} CHUNK-TIMEOUT chunk={chunk_count + 1} "
-                            f"waited={_CHUNK_TIMEOUT_S}s "
-                            f"total_elapsed={_hang_elapsed:.1f}s "
-                            f"bytes_on_disk={bytes_completed}/{file_size}"
-                            f"{_prog_info}"
-                        )
-                        # Cancel the stream so the blocked thread can
-                        # exit (``cancel()`` causes ``blocking_next()``
-                        # to return ``Ok(None)``).
-                        if hasattr(stream, "cancel"):
-                            try:
-                                stream.cancel()
-                            except Exception:
-                                pass
-                        # Give the thread a moment to exit after cancel
-                        _fetch_thread.join(timeout=5.0)
-                        _safe_put(mp_queue, SubprocessMessage.error(
-                            message=(
-                                f"Chunk timeout for {filename}: "
-                                f"no data after {_CHUNK_TIMEOUT_S}s "
-                                f"(bytes on disk: {bytes_completed}/{file_size})"
-                            ),
-                            error_type="ChunkTimeout",
-                            retryable=True,
-                        ))
-                        write_failed = True
-                        break
-
-                    # Check for error from the fetch thread
-                    if _chunk_error[0] is not None:
-                        _err = _chunk_error[0]
-                        _diag(
-                            f"file-{i} chunk-error chunk={chunk_count + 1} "
-                            f"error={type(_err).__name__}: {_err}"
-                        )
-                        raise _err
-
-                    chunk = _chunk_result[0]
-                    if chunk is _SENTINEL:
-                        # End of stream (StopIteration or None from __next__)
-                        _diag(
-                            f"file-{i} stream-end chunk={chunk_count} "
-                            f"bytes={bytes_completed}/{file_size}"
-                        )
-                        break
-
-                    chunk_count += 1
-                    if chunk_count <= 3 or chunk_count % 10 == 0:
-                        _diag(f"file-{i} chunk-{chunk_count} len={len(chunk)}")
-                    # Cooperative cancellation between chunks
-                    if cancel_event.is_set():
-                        if hasattr(stream, "cancel"):
-                            try:
-                                stream.cancel()
-                            except Exception:
-                                pass
-                        cancelled = True
-                        break
-                    if not chunk:
-                        continue
-                    try:
-                        os.write(fd, chunk)
-                    except OSError as e:
-                        _safe_put(mp_queue, SubprocessMessage.error(
-                            message=f"os.write failed for {filename}: {e}",
-                            error_type=type(e).__name__,
-                        ))
-                        write_failed = True
-                        break
-                    bytes_completed += len(chunk)
-                    bytes_since_fsync += len(chunk)
-                    if not disable_fsync and bytes_since_fsync >= fsync_interval:
-                        try:
-                            os.fsync(fd)
-                        except OSError:
-                            pass
-                        bytes_since_fsync = 0
-
-                    # Step 1 (plan D5): small-file early-fsync. If the
-                    # file is smaller than fsync_interval and we have
-                    # at least one chunk on disk, fsync immediately so
-                    # the partial file is visible to external observers
-                    # (e.g. ``watch ls -l``) before the next chunk
-                    # arrives. This fixes the "0-length during download"
-                    # symptom for small files like README.md, .gitignore,
-                    # config.json, etc.
-                    if (
-                        not disable_fsync
-                        and bytes_completed > 0
-                        and file_size <= fsync_interval
-                        and bytes_since_fsync > 0
-                    ):
-                        try:
-                            os.fsync(fd)
-                        except OSError:
-                            pass
-                        bytes_since_fsync = 0
-
-                    # Emit PROGRESS event (throttled)
-                    now = time.time()
-                    transfer_completed = bytes_completed_all + bytes_completed
-                    elapsed = now - start_time
-                    transfer_speed = (transfer_completed / elapsed) if elapsed > 0 else 0.0
-                    if throttler.should_emit(transfer_completed, total_bytes_all, now):
-                        _safe_put(mp_queue, SubprocessMessage.event({
-                            "event_type": EventType.PROGRESS.value,
-                            "transfer_id": transfer_id,
-                            "direction": TransferDirection.DOWNLOAD.value,
-                            "filename": filename,
-                            "phase": ProgressPhase.DOWNLOADING.value,
-                            "bytes_completed": bytes_completed,
-                            "total_bytes": file_size,
-                            "percentage": (bytes_completed / file_size * 100.0) if file_size else 0.0,
-                            "speed": transfer_speed,
-                            "file_index": i,
-                            "total_files": total_files,
-                            "transfer_bytes_completed": transfer_completed,
-                            "transfer_bytes_total": total_bytes_all,
-                            "transfer_speed": transfer_speed,
-                        }))
-                        throttler.record_emit(transfer_completed, now)
-            finally:
-                # Always fsync + close, even on cancel / error / success.
-                if not disable_fsync:
-                    try:
-                        os.fsync(fd)
-                    except OSError:
-                        pass
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-
-            if cancelled:
-                _safe_put(mp_queue, SubprocessMessage.cancelled(
-                    message=f"Cancelled mid-download of {filename} "
-                            f"({bytes_completed}/{file_size} bytes on disk)",
-                ))
-                return
-
-            if write_failed:
-                return
-
-            # Verify size match
-            if bytes_completed != file_size:
-                _safe_put(mp_queue, SubprocessMessage.error(
-                    message=f"Size mismatch for {filename}: got {bytes_completed} bytes, "
-                            f"expected {file_size}",
-                    error_type="SizeMismatch",
-                ))
-                return
-
-            bytes_completed_all += bytes_completed
-            _diag(f"file-{i} done chunks={chunk_count} bytes={bytes_completed}")
-
-            # Emit COMPLETE event for this file.
-            # NOTE: we deliberately do NOT send a per-file SubprocessMessage.result()
-            # here (see empty-file branch above for the full rationale). The
-            # COMPLETE event above is what tells the parent "this file is done";
-            # the terminal ``result`` is sent once after the loop ends.
-            now = time.time()
-            elapsed = now - start_time
-            transfer_speed = (bytes_completed_all / elapsed) if elapsed > 0 else 0.0
-            _safe_put(mp_queue, SubprocessMessage.event({
-                "event_type": EventType.COMPLETE.value,
+                    "phase": ProgressPhase.ERROR.value,
+                    "bytes_completed": bytes_completed_all,
+                    "total_bytes": total_bytes_all,
+                    "error": {"message": err_msg, "error_type": "AllTiersFailed"},
+                })
+                if progress_dict is not None:
+                    progress_dict["error"] = err_msg
+                break
+            if written != file_size:
+                err_msg = f"http fallback wrote {written}/{file_size} bytes"
+                errors.append(err_msg)
+                _put_progress({
+                    "event_type": EventType.ERROR.value,
+                    "transfer_id": transfer_id,
+                    "direction": TransferDirection.DOWNLOAD.value,
+                    "filename": filename,
+                    "phase": ProgressPhase.ERROR.value,
+                    "bytes_completed": bytes_completed_all,
+                    "total_bytes": total_bytes_all,
+                    "error": {"message": err_msg, "error_type": "SizeMismatch"},
+                })
+                if progress_dict is not None:
+                    progress_dict["error"] = err_msg
+                break
+            bytes_completed_all += written
+        else:
+            err_msg = (
+                f"Tier 1 (Xet) failed for {filename} but HTTP "
+                f"fallback is disabled."
+            )
+            errors.append(err_msg)
+            _put_progress({
+                "event_type": EventType.ERROR.value,
                 "transfer_id": transfer_id,
                 "direction": TransferDirection.DOWNLOAD.value,
                 "filename": filename,
-                "phase": ProgressPhase.COMPLETE.value,
-                "bytes_completed": bytes_completed,
-                "total_bytes": file_size,
-                "percentage": 100.0,
-                "speed": 0,
-                "file_index": i,
+                "phase": ProgressPhase.ERROR.value,
+                "bytes_completed": bytes_completed_all,
+                "total_bytes": total_bytes_all,
+                "error": {"message": err_msg, "error_type": "XetTierFailed"},
+            })
+            if progress_dict is not None:
+                progress_dict["error"] = err_msg
+            break
+
+        files_completed += 1
+        now = time.time()
+        elapsed = now - start_time
+        transfer_speed = (bytes_completed_all / elapsed) if elapsed > 0 else 0.0
+        _put_progress({
+            "event_type": EventType.COMPLETE.value,
+            "transfer_id": transfer_id,
+            "direction": TransferDirection.DOWNLOAD.value,
+            "filename": filename,
+            "phase": ProgressPhase.COMPLETE.value,
+            "bytes_completed": file_size,
+            "total_bytes": file_size,
+            "percentage": 100.0,
+            "speed": 0,
+            "file_index": i,
+            "total_files": len(file_specs),
+            "transfer_bytes_completed": bytes_completed_all,
+            "transfer_bytes_total": total_bytes_all,
+            "transfer_speed": transfer_speed,
+        })
+
+    summary = {
+        "bytes_completed": bytes_completed_all,
+        "total_bytes": total_bytes_all,
+        "files_completed": files_completed,
+        "total_files": len(file_specs),
+        "errors": errors,
+    }
+    if progress_dict is not None:
+        progress_dict.update(summary)
+    return summary
+
+
+def _run_tier1_file(
+    *,
+    session: Any,
+    refresh_xet_connection_info: Any,
+    hf_xet: Any,
+    filename: str,
+    file_hash: str,
+    file_size: int,
+    dest_path: str,
+    xet_file_data: Dict[str, Any],
+    headers: Dict[str, Any],
+    transfer_id: str,
+    file_index: int,
+    total_files: int,
+    progress_queue: Any,
+    cancel_event: Any,
+    tier_timeout_s: float,
+    poll_interval_s: float,
+    total_bytes_all: int,
+    bytes_completed_baseline: int,
+    start_time: float,
+    diag: Any,
+    report_interval: float,
+) -> bool:
+    """Tier 1 driver: ``XetFileDownloadGroup.start_download_file()`` for one file.
+
+    Returns True on completion, False on timeout/error. Polls
+    ``handle.progress()`` every ``poll_interval_s`` and emits
+    throttled PROGRESS events into ``progress_queue``. Tier 1
+    completes when ``handle.try_result()`` returns, ``status()``
+    reports ``Completed``, or the bytes-completed reaches the
+    expected file size.
+    """
+    from .types import EventType, ProgressPhase, TransferCancelledError, TransferDirection
+
+    file_info = hf_xet.XetFileInfo(file_hash, file_size)
+    try:
+        file_data = _deserialize_xet_file_data(xet_file_data) if xet_file_data else None
+        conn_info = refresh_xet_connection_info(file_data=file_data, headers=headers)
+        endpoint = conn_info.endpoint
+        access_token = conn_info.access_token
+        token_expiry = getattr(conn_info, "expiration_unix_epoch", 0)
+        refresh_route = getattr(file_data, "refresh_route", "") if file_data else ""
+        group = session.new_file_download_group(
+            endpoint=endpoint,
+            token=access_token,
+            token_expiry_unix_secs=token_expiry,
+            token_refresh_url=refresh_route,
+            token_refresh_headers=headers,
+        )
+    except Exception as e:
+        diag(f"file-{file_index} tier1-setup-failed: {e}")
+        return False
+
+    if file_size == 0:
+        parent = os.path.dirname(dest_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fd = _open_unbuffered(dest_path)
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        os.close(fd)
+        return True
+
+    try:
+        handle = group.start_download_file(file_info, os.path.abspath(dest_path))
+    except Exception as e:
+        diag(f"file-{file_index} tier1-start-failed: {e}")
+        try:
+            group.abort()
+        except Exception:
+            pass
+        return False
+
+    deadline = time.time() + tier_timeout_s
+    last_progress_bytes = 0
+    last_emit_time = 0.0
+    last_emit_bytes = 0
+    first_event = True
+
+    def _emit_prog(prog_bytes: int, total_bytes: int, now: float) -> None:
+        nonlocal last_emit_time, last_emit_bytes, first_event
+        transfer_completed = bytes_completed_baseline + prog_bytes
+        elapsed = now - start_time
+        transfer_speed = (transfer_completed / elapsed) if elapsed > 0 else 0.0
+        if progress_queue is None:
+            return
+        try:
+            progress_queue.put_nowait({
+                "event_type": EventType.PROGRESS.value,
+                "transfer_id": transfer_id,
+                "direction": TransferDirection.DOWNLOAD.value,
+                "filename": filename,
+                "phase": ProgressPhase.DOWNLOADING.value,
+                "bytes_completed": prog_bytes,
+                "total_bytes": total_bytes,
+                "percentage": (prog_bytes / total_bytes * 100.0) if total_bytes else 0.0,
+                "speed": transfer_speed,
+                "file_index": file_index,
                 "total_files": total_files,
-                "transfer_bytes_completed": bytes_completed_all,
+                "transfer_bytes_completed": transfer_completed,
                 "transfer_bytes_total": total_bytes_all,
                 "transfer_speed": transfer_speed,
-            }))
+            })
+        except Exception:
+            pass
+        last_emit_time = now
+        last_emit_bytes = prog_bytes
+        first_event = False
 
-        # Emit ONE terminal ``result`` message after the loop ends.
-        # The relay thread treats this as the signal to stop and return
-        # the result to the parent. The payload summarizes the whole
-        # transfer (not a single file) so the parent can confirm
-        # ``status == "success"`` and look up the per-file dest paths
-        # via ``file_specs``.
-        _diag(f"all-files-done total_bytes={bytes_completed_all}")
-        _safe_put(mp_queue, SubprocessMessage.result(
-            filename=os.path.basename(file_specs[-1]["dest_path"]),
-            destination_path=os.path.commonpath(
-                [s["dest_path"] for s in file_specs]
-            ) if len({os.path.dirname(s["dest_path"]) for s in file_specs}) == 1
-            else file_specs[-1]["dest_path"],
-            file_size=bytes_completed_all,
-            transfer_id=transfer_id,
-            file_index=len(file_specs),
-            total_files=len(file_specs),
-            bytes_completed=bytes_completed_all,
-            total_bytes=total_bytes_all,
-        ))
-        _diag("result-sent-to-parent")
-    
-    except (KeyboardInterrupt, Exception) as e:
-        _diag(f"exception: {type(e).__name__}: {e}")
-        _handle_worker_exception(mp_queue, e)
+    try:
+        while True:
+            now = time.time()
+
+            if cancel_event is not None and cancel_event.is_set():
+                diag(f"file-{file_index} tier1-cancelled")
+                return False
+
+            prog_bytes = int(file_size)  # default to "done" so we exit if progress() fails
+            total_bytes = file_size
+            try:
+                prog = handle.progress()
+                if prog is not None:
+                    prog_bytes = int(getattr(prog, "bytes_completed", 0) or 0)
+                    total_bytes = int(getattr(prog, "total_bytes", 0) or file_size)
+                    last_progress_bytes = prog_bytes
+            except Exception:
+                pass
+
+            # Throttle PROGRESS emits: first event, completion, or report_interval.
+            emit_now = first_event
+            if not emit_now and prog_bytes >= total_bytes and total_bytes > 0:
+                emit_now = True
+            if not emit_now and (now - last_emit_time) >= report_interval:
+                emit_now = True
+            if emit_now:
+                _emit_prog(prog_bytes, total_bytes, now)
+
+            # Short-circuit when bytes_completed reaches full.
+            if total_bytes and prog_bytes >= total_bytes:
+                diag(f"file-{file_index} tier1-progress-complete ({prog_bytes}/{total_bytes})")
+                return True
+
+            # Polling checks.
+            try:
+                result = handle.try_result()
+                if result is not None:
+                    diag(f"file-{file_index} tier1-try-result-ok")
+                    return True
+            except Exception:
+                pass
+
+            try:
+                status_str = str(handle.status())
+                if "Completed" in status_str or status_str.lower() == "complete":
+                    diag(f"file-{file_index} tier1-status-completed ({status_str})")
+                    return True
+                if "Failed" in status_str or "Error" in status_str:
+                    diag(f"file-{file_index} tier1-status-failed ({status_str})")
+                    return False
+            except Exception:
+                pass
+
+            if now >= deadline:
+                diag(
+                    f"file-{file_index} tier1-timeout "
+                    f"({tier_timeout_s}s, last_progress={last_progress_bytes}/{file_size})"
+                )
+                return False
+
+            time.sleep(poll_interval_s)
     finally:
-        # Step 2 (plan D4/D6/D10): release the in-flight stream and
-        # group on any exit path. Without this, a cancelled or
-        # errored download leaves the Rust runtime's background
-        # threads running until the OS reaps the process.
         try:
-            if stream is not None and hasattr(stream, "cancel"):
-                try:
-                    stream.cancel()
-                except Exception:
-                    pass
+            group.abort()
         except Exception:
             pass
-        try:
-            if group is not None and hasattr(group, "close"):
-                try:
-                    group.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+
+
+# Backward compatibility: an alias for any external caller that imported
+# the original worker by its old name. Runs synchronously in the calling
+# process (not via multiprocessing.spawn) and returns the result dict.
+_xet_file_download_worker = download_hybrid
+
+
+class TranslatingQueue:
+    """Queue adapter that converts dict events into ``ProgressEvent`` objects.
+
+    ``download_hybrid`` emits plain dicts (see ``ProgressEvent.to_dict()``)
+    into its ``progress_queue``. The public API contract, however, promises
+    ``ProgressEvent`` objects in ``HfTracker.event_queue`` — and the example
+    ``ConsoleProgressDisplay.update()`` accesses ``.event_type`` etc. directly.
+
+    This adapter wraps the user-supplied queue and transparently translates
+    any dict it sees into a ``ProgressEvent`` (via ``ProgressEvent.from_dict``)
+    before forwarding. Non-dict items (already-``ProgressEvent`` objects, or
+    anything else) pass through unchanged.
+
+    Only ``put`` / ``put_nowait`` are overridden; the consumer side
+    (``get`` / ``get_nowait`` / ``empty``) is delegated so the driver loop in
+    the caller keeps working unchanged.
+    """
+
+    def __init__(self, wrapped: Any) -> None:
+        self._wrapped = wrapped
+
+    def _translate(self, item: Any) -> Any:
+        if isinstance(item, dict) and "event_type" in item:
+            try:
+                return ProgressEvent.from_dict(item)
+            except Exception:
+                # If the dict is malformed, pass it through untouched so
+                # the caller can decide (avoids swallowing real errors).
+                return item
+        return item
+
+    def put(self, item: Any, *args, **kwargs) -> None:
+        self._wrapped.put(self._translate(item), *args, **kwargs)
+
+    def put_nowait(self, item: Any, *args, **kwargs) -> None:
+        self._wrapped.put_nowait(self._translate(item), *args, **kwargs)
+
+    def get(self, *args, **kwargs) -> Any:
+        return self._wrapped.get(*args, **kwargs)
+
+    def get_nowait(self, *args, **kwargs) -> Any:
+        return self._wrapped.get_nowait(*args, **kwargs)
+
+    def empty(self) -> bool:
+        return self._wrapped.empty()
+
+    def qsize(self) -> int:
+        return self._wrapped.qsize()
+
+
+class HybridRunner:
+    """Simple IN-PROCESS runner for ``download_hybrid`` (plan 2026-06-15).
+
+    Uses a daemon ``threading.Thread`` instead of a spawned subprocess.
+    No GIL-watching, no ``multiprocessing`` pickling, and no relay
+    thread: progress events go straight into the user-supplied
+    ``event_queue`` (a ``queue.Queue``). Cancellation is via a
+    ``threading.Event``.
+
+    The runner exposes ``wait(timeout)`` like the legacy
+    ``XetSubprocessRunner`` so the driver loop in
+    ``download_snapshot_streaming`` does not need to be rewritten.
+    """
+
+    def __init__(self) -> None:
+        import threading as _t
+        self._thread: Optional["_t.Thread"] = None
+        self._cancel_event = _t.Event()
+        self._result: Optional[Dict[str, Any]] = None
+        self._error: Optional[BaseException] = None
+        self._done_event = _t.Event()
+
+    def start(self, params: Dict[str, Any], event_queue: Any) -> None:
+        import threading as _t
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError("HybridRunner already started")
+
+        # ``file_specs`` lives inside params; mirror the field into a
+        # top-level arg for ``download_hybrid``.
+        call_kwargs = dict(params)
+        file_specs = call_kwargs.pop("file_specs", None)
+        if file_specs is None:
+            raise ValueError("HybridRunner.start requires params['file_specs']")
+
+        # ``download_hybrid`` emits plain dict events into its
+        # ``progress_queue``. The public API contract promises
+        # ``ProgressEvent`` objects in the user's queue (and the example
+        # display accesses ``.event_type`` etc. directly), so wrap the
+        # queue with a translator that converts dicts → ProgressEvent.
+        translating_queue = TranslatingQueue(event_queue)
+
+        def _runner():
+            try:
+                summary = download_hybrid(
+                    file_specs,
+                    progress_queue=translating_queue,
+                    cancel_event=self._cancel_event,
+                    **call_kwargs,
+                )
+                self._result = summary
+            except BaseException as exc:  # noqa: BLE001
+                self._error = exc
+            finally:
+                self._done_event.set()
+
+        self._thread = _t.Thread(target=_runner, daemon=True, name="hybrid-runner")
+        self._thread.start()
+
+    def request_cancel(self) -> None:
+        self._cancel_event.set()
+
+    def is_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def wait(self, timeout: Optional[float] = 1.0) -> Optional[Dict[str, Any]]:
+        if timeout is None:
+            self._done_event.wait()
+        else:
+            self._done_event.wait(timeout=timeout)
+        if not self._done_event.is_set():
+            return None
+        if self._error is not None:
+            return {
+                "status": "error",
+                "message": str(self._error),
+                "error_type": type(self._error).__name__,
+            }
+        summary = self._result or {}
+        if summary.get("errors"):
+            return {
+                "status": "error",
+                "message": "; ".join(summary["errors"]),
+                "error_type": "AllTiersFailed",
+                "bytes_completed": summary.get("bytes_completed", 0),
+                "total_bytes": summary.get("total_bytes", 0),
+            }
+        if summary.get("cancelled"):
+            return {
+                "status": "cancelled",
+                "message": "Transfer cancelled by user",
+                "bytes_completed": summary.get("bytes_completed", 0),
+                "total_bytes": summary.get("total_bytes", 0),
+            }
+        return {
+            "status": "success",
+            "bytes_completed": summary.get("bytes_completed", 0),
+            "total_bytes": summary.get("total_bytes", 0),
+            "files_completed": summary.get("files_completed", 0),
+            "total_files": summary.get("total_files", 0),
+        }
+
+    def terminate(self, grace: Optional[float] = None) -> None:  # noqa: ARG002
+        """Best-effort termination: set the cancel flag and wait."""
+        self.request_cancel()
+        if self._thread is not None:
+            self._thread.join(timeout=grace if grace is not None else 1.0)
 
 
 # ── Snapshot Download Worker ─────────────────────────────────────

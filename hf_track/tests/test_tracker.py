@@ -796,7 +796,126 @@ class TestUseXetParameter:
 
         mock_xet.assert_called_once()
 
-    # ── _download_snapshot_xet passes use_xet ──────────────────────
+    # ── download_file dedicated xet routing (plan 2026-07-16) ────────
+    #
+    # These tests patch ``_download_file_xet`` because it calls
+    # ``api.get_hf_file_metadata()`` which hits the network. The routing
+    # logic in ``download_file()`` is what we verify: xet errors propagate
+    # (NO silent HTTP fallback), and use_xet=False uses the standard path.
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_file_xet")
+    def test_download_file_xet_error_propagates_no_fallback(self, mock_xet, _mock_avail):
+        """A xet failure raises (no silent HTTP fallback to standard path)."""
+        from hf_track.types import TransferProgressError
+
+        tracker = HfTracker(token="hf_test")
+        mock_xet.side_effect = TransferProgressError("xet broken")
+
+        with patch("hf_track.download.download_file", return_value="/tmp/file") as mock_std:
+            with pytest.raises(TransferProgressError):
+                tracker.download_file(repo_id="test/repo", filename="file.bin", use_xet=True)
+
+        # The standard path must NOT have been used as a fallback.
+        mock_std.assert_not_called()
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_file_xet")
+    def test_download_file_xet_no_hybrid_kwargs(self, mock_xet, _mock_avail):
+        """_download_file_xet is called WITHOUT tier_timeout_s /
+        enable_http_fallback (hybrid-only params removed)."""
+        tracker = HfTracker(token="hf_test")
+        mock_xet.return_value = "/tmp/file"
+
+        tracker.download_file(repo_id="test/repo", filename="file.bin")
+
+        kwargs = mock_xet.call_args.kwargs
+        assert "tier_timeout_s" not in kwargs
+        assert "enable_http_fallback" not in kwargs
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_file_xet")
+    def test_download_file_xet_receives_on_spawn_hook(self, mock_xet, _mock_avail):
+        """on_spawn/on_finish hooks are still passed to _download_file_xet."""
+        tracker = HfTracker(token="hf_test")
+        mock_xet.return_value = "/tmp/file"
+
+        tracker.download_file(repo_id="test/repo", filename="file.bin", transfer_id="tid-1")
+
+        assert callable(mock_xet.call_args.kwargs["on_spawn"])
+        assert callable(mock_xet.call_args.kwargs["on_finish"])
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_file_xet")
+    def test_download_file_deregisters_runner_on_finish(self, mock_xet, _mock_avail):
+        """_active_runners is empty after download_file returns."""
+        tracker = HfTracker(token="hf_test")
+        mock_xet.return_value = "/tmp/file"
+
+        tracker.download_file(repo_id="test/repo", filename="file.bin", transfer_id="tid-y")
+
+        assert "tid-y" not in tracker._active_runners
+        assert len(tracker._active_runners) == 0
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_file_xet")
+    def test_download_file_deregisters_on_error(self, mock_xet, _mock_avail):
+        """_active_runners is cleaned up even when _download_file_xet errors,
+        and the error propagates (no silent HTTP fallback)."""
+        tracker = HfTracker(token="hf_test")
+
+        def _raise_after_spawn(**kwargs):
+            # Simulate a real xet path: registers the runner, then fails.
+            kwargs["on_spawn"](MagicMock(name="runner"))
+            raise RuntimeError("boom")
+
+        mock_xet.side_effect = _raise_after_spawn
+
+        with pytest.raises(RuntimeError):
+            tracker.download_file(repo_id="test/repo", filename="file.bin", transfer_id="tid-z")
+
+        assert "tid-z" not in tracker._active_runners
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_file_xet")
+    def test_download_file_on_spawn_registers_runner(self, mock_xet, _mock_avail):
+        """The on_spawn hook registers the runner in _active_runners."""
+        tracker = HfTracker(token="hf_test")
+        fake_runner = MagicMock(name="runner")
+
+        def _call_on_spawn(**kwargs):
+            kwargs["on_spawn"](fake_runner)
+            return "/tmp/file"
+
+        mock_xet.side_effect = _call_on_spawn
+        tracker.download_file(repo_id="test/repo", filename="file.bin", transfer_id="tid-r")
+
+        # After the call, the finally block deregisters it.
+        assert "tid-r" not in tracker._active_runners
+
+    @patch("hf_track.tracker.is_xet_available", return_value=True)
+    @patch.object(HfTracker, "_download_file_xet")
+    def test_tracker_cancel_forwards_to_registered_runner(self, mock_xet, _mock_avail):
+        """tracker.cancel(tid) calls request_cancel on a registered runner."""
+        tracker = HfTracker(token="hf_test")
+        fake_runner = MagicMock(name="runner")
+
+        def _call_on_spawn(**kwargs):
+            kwargs["on_spawn"](fake_runner)
+            # Simulate the runner being still active during the call by
+            # re-registering it (the finally block deregisters after we
+            # return, but cancel happens mid-call in real usage).
+            tracker._active_runners["tid-c"] = fake_runner
+            return "/tmp/file"
+
+        mock_xet.side_effect = _call_on_spawn
+        tracker.download_file(repo_id="test/repo", filename="file.bin", transfer_id="tid-c")
+
+        # Manually re-register to simulate a still-running transfer, then cancel.
+        tracker._active_runners["tid-c"] = fake_runner
+        tracker.cancel("tid-c")
+        fake_runner.request_cancel.assert_called_once()
+
 
     @patch("hf_track.download.download_snapshot_with_xet")
     def test_snapshot_xet_passes_use_xet_to_xet_download(self, mock_dl_snap):

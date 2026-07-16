@@ -78,7 +78,27 @@ def download_file_with_xet(
         ImportError: If hf_xet is not installed.
         TransferCancelledError: If the transfer is cancelled.
         TransferError: If the download fails.
+
+    .. deprecated:: 2026-07-09
+        This function uses the legacy ``hf_xet.download_files()`` API
+        which hangs indefinitely in some environments (see
+        docs/plans/2026-07-09-xet-single-file-download-fix.md).
+        Use :func:`download_file_xet_only` instead, which is the
+        dedicated single-file Xet path (fail-fast, no HTTP fallback).
+        For a reliable transfer, use ``use_xet=False`` with
+        :func:`hf_track.HfTracker.download_file`.
     """
+    import warnings
+
+    warnings.warn(
+        "download_file_with_xet is deprecated: it uses the legacy "
+        "hf_xet.download_files() API which can hang indefinitely. "
+        "Use download_file_xet_only instead, or pass use_xet=False to "
+        "HfTracker.download_file for the reliable HTTP path. "
+        "See docs/plans/2026-07-16-xet-download-separate-paths.md.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if not is_xet_available():
         raise ImportError("hf_xet is not installed.")
 

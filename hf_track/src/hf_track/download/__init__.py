@@ -20,14 +20,17 @@ from __future__ import annotations
 
 from .xet_batch import download_files_with_xet
 from .xet_file import XetDownloadResult, download_file_with_xet
+from .xet_file_only import download_file_xet_only
 from .xet_snapshot import download_snapshot_with_xet
 from .xet_streaming import download_snapshot_streaming
 from .standard import download_file, download_snapshot, patch_download_chunk_size
 
 __all__ = [
-    # Xet single-file
+    # Xet single-file (legacy subprocess path — deprecated, see xet_file)
     "XetDownloadResult",
     "download_file_with_xet",
+    # Xet single-file (dedicated path, fail-fast, NO HTTP fallback)
+    "download_file_xet_only",
     # Xet batch
     "download_files_with_xet",
     # Xet snapshot

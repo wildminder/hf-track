@@ -1,9 +1,17 @@
-"""Streaming snapshot download via chunk-by-chunk subprocess.
+"""Streaming snapshot download via in-process hybrid Xet + HTTP worker.
 
-Resolves the file list, partitions into xet-stored and non-xet
-files, and downloads xet files via the streaming worker. Kept in
-its own module because of the substantial file-resolution logic
-and the unique dual-path (xet streaming + main-process hf_hub_download).
+Plan ``docs/plans/2026-06-15-xet-streaming-hybrid-approach.md``
+(2026-06-15 revision): runs HYBRID downloads **in-process** (a daemon
+``threading.Thread``) instead of via a spawned subprocess, because the
+``hf_xet`` Rust extension's APIs misbehave when called from a separate
+process in this environment. A single ``HybridRunner`` wraps the
+``download_hybrid`` driver which tries ``XetFileDownloadGroup``
+(Tier 1) and falls back to a pure-HTTP download via ``requests``
+(Tier 3).
+
+The driver also downloads non-xet files (small JSON, .gitignore,
+markdown) via ``huggingface_hub.hf_hub_download`` in the main
+process -- these files are small and bounded.
 """
 
 from __future__ import annotations
@@ -11,7 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +33,8 @@ from ..types import (
     TransferProgressError,
     generate_transfer_id,
 )
-from ..subprocess import XetSubprocessRunner
 from ..token import is_xet_available
-from .._xet_worker import _serialize_xet_file_data, _xet_streaming_download_worker
+from .._xet_worker import HybridRunner, download_hybrid, _serialize_xet_file_data
 
 def download_snapshot_streaming(
     repo_id: str,
@@ -45,18 +52,29 @@ def download_snapshot_streaming(
     force_download: bool = False,
     fsync_interval: int = 4 * 1024 * 1024,
     disable_fsync: bool = False,
+    tier_timeout_s: float = 60.0,
+    enable_http_fallback: bool = True,
+    use_xet: bool = True,
     on_spawn: Optional[Callable[[object], None]] = None,
     on_finish: Optional[Callable[[], None]] = None,
 ) -> List[str]:
-    """Download a snapshot using the streaming Xet API.
+    """Download a snapshot using the hybrid ``XetFileDownloadGroup`` + HTTP fallback path.
+
+    Plan: ``docs/plans/2026-06-15-xet-streaming-hybrid-approach.md``.
 
     Resolves the file list, partitions into xet-stored and non-xet
     files, and:
 
-    * For xet files: spawns one ``XetSubprocessRunner`` running the
-      chunk-by-chunk ``_xet_streaming_download_worker`` so each file's
-      bytes are flushed to disk via ``os.write`` + ``os.fsync`` and the
-      child can be killed mid-file.
+    * For xet files: spawns one ``XetSubprocessRunner`` running the new
+      ``_xet_file_download_worker`` which uses
+      ``hf_xet.XetSession().new_file_download_group().start_download_file()``
+      under the hood. Per file, the worker polls
+      ``handle.progress()`` and falls back to a pure-HTTP download
+      ``(download.download.http_fallback.download_file_http)`` if the
+      xet handle does not complete within ``tier_timeout_s``
+      seconds. The HTTP path streams bytes via ``requests`` and writes
+      them to disk with ``os.write`` + periodic ``os.fsync``, so the
+      file is observable on disk throughout the download.
     * For non-xet files: downloads in the main process via
       ``huggingface_hub.hf_hub_download`` (these are typically small
       JSON, markdown, .gitignore; bounded memory).
@@ -79,6 +97,14 @@ def download_snapshot_streaming(
         disable_fsync: If True, skip ``os.fsync`` entirely (fastest,
             but a SIGKILL may leave zero-byte files on disk).
             Defaults to False (fsync on at the configured interval).
+        tier_timeout_s: Seconds to wait on a Tier 1 (xet) download
+            before falling back to Tier 3 (HTTP) for one file.
+        enable_http_fallback: When False, the worker emits a
+            ``XetTierFailed`` error instead of falling back to HTTP.
+        use_xet: When False, skips the Tier 1 (xet) path entirely and
+            routes every xet file through the HTTP fallback in the
+            worker. Equivalent to ``--no-xet`` for the streaming
+            snapshot path.
         on_spawn: Optional hook called with the active
             ``XetSubprocessRunner`` as soon as the subprocess is
             spawned. Used by ``HfTracker`` to register for fast
@@ -99,14 +125,10 @@ def download_snapshot_streaming(
 
     from huggingface_hub import HfApi
 
-    # _xet_streaming_download_worker is already imported at module level
-    # (line 30, ``from .._xet_worker import ...``). An older version of
-    # this file re-imported it here with a wrong relative path
-    # (``from ._xet_worker import ...``), which raised
-    # ``No module named 'hf_track.download._xet_worker'`` at function
-    # call time. The runner (``XetSubprocessRunner.spawn_streaming``)
-    # re-imports the worker itself when the subprocess starts, so we
-    # never need the local name here.
+    # ``_xet_file_download_worker`` is imported at module level (line 30).
+    # The runner (``XetSubprocessRunner.spawn_streaming``) re-imports
+    # the worker itself when the subprocess starts, so we never need
+    # the local name here.
     transfer_id = transfer_id or generate_transfer_id()
 
     # Emit START event from main process
@@ -225,79 +247,68 @@ def download_snapshot_streaming(
             }
         )
 
-    # Spawn streaming subprocess for xet files
+    # Run IN-PROCESS via HybridRunner (daemon thread + threading.Event).
+    # Plan 2026-06-15 redesign: dropping the spawned-subprocess path
+    # avoids GIL/CAS issues with hf_xet 1.5.0 and lets Xet run normally.
+    # Each file uses Tier 1 (XetFileDownloadGroup) with a timeout; if
+    # the timeout fires, Tier 3 (HTTP) is used for that file.
     downloaded_paths: List[str] = []
     if file_specs:
-        serialized_specs = []
+        serialized_specs: List[Dict[str, Any]] = []
         for spec in file_specs:
-            serialized_specs.append({
+            entry = {
                 "hash": spec["hash"],
                 "file_size": spec["file_size"],
                 "dest_path": spec["dest_path"],
                 "xet_file_data": spec["xet_file_data"],
-            })
-        params = {
-            "file_specs": serialized_specs,
-            "token": token,
-            "endpoint": endpoint,
-            "transfer_id": transfer_id,
-            "report_interval": report_interval,
-            "request_headers": {},
-            "fsync_interval": fsync_interval,
-            "disable_fsync": disable_fsync,
-        }
-        runner = XetSubprocessRunner()
-        runner.spawn_streaming(params=params, event_queue=event_queue)
-        # Plan 2026-06-05 step 3: notify the caller that the runner
-        # is now active so it can register for fast cancel forwarding.
+            }
+            if spec.get("filename"):
+                entry["filename"] = spec["filename"]
+            serialized_specs.append(entry)
+
+        runner = HybridRunner()
         if on_spawn is not None:
             try:
                 on_spawn(runner)
             except Exception:
                 pass
+        runner.start(
+            params={
+                "file_specs": serialized_specs,
+                "repo_id": repo_id,
+                "repo_type": repo_type,
+                "revision": revision,
+                "endpoint": endpoint,
+                "token": token,
+                "transfer_id": transfer_id,
+                "report_interval": report_interval,
+                "fsync_interval": fsync_interval,
+                "tier_timeout_s": tier_timeout_s,
+                "poll_interval_s": 0.1,
+                "enable_http_fallback": enable_http_fallback,
+                "use_xet": use_xet,
+            },
+            event_queue=event_queue,
+        )
+
         try:
-            stall_count = 0
-            while True:
-                result = runner.wait(timeout=1.0)
-                if result is not None:
-                    break
-                # Safety net: if the subprocess is dead but we still
-                # have no result, the _synthesize_result_if_missing
-                # fix in the runner should have set self._result.
-                # If somehow it didn't, break after 3 consecutive
-                # dead checks to avoid an infinite loop.
-                if not runner.is_alive():
-                    stall_count += 1
-                    if stall_count >= 3:
-                        logger.error(
-                            "Subprocess is dead but no result received "
-                            "after %d checks — breaking wait loop",
-                            stall_count,
-                        )
-                        break
-                else:
-                    stall_count = 0
-                if is_cancelled is not None and is_cancelled():
-                    # Plan step 3: request_cancel sets the event
-                    # directly; step 4: terminate(grace=2.0) gives the
-                    # child a 2 s cooperative window before SIGTERM.
-                    runner.request_cancel()
-                    runner.terminate(grace=2.0)
-                    event_queue.put(
-                        ProgressEvent.cancelled_event(
-                            transfer_id=transfer_id,
-                            direction=TransferDirection.DOWNLOAD,
-                            filename=repo_id,
-                        )
-                    )
-                    raise TransferCancelledError("Snapshot streaming cancelled by user")
+            result = runner.wait(timeout=None)
+            assert result is not None  # in-process never times out
             if result.get("status") == "cancelled":
-                raise TransferCancelledError(result.get("message", "cancelled"))
+                event_queue.put(
+                    ProgressEvent.cancelled_event(
+                        transfer_id=transfer_id,
+                        direction=TransferDirection.DOWNLOAD,
+                        filename=repo_id,
+                        bytes_completed=result.get("bytes_completed", 0),
+                        total_bytes=result.get("total_bytes", 0),
+                    )
+                )
+                raise TransferCancelledError("Snapshot streaming cancelled by user")
             if result.get("status") != "success":
                 raise TransferProgressError(result.get("message", "Streaming snapshot failed"))
         except KeyboardInterrupt:
             runner.request_cancel()
-            runner.terminate(grace=2.0)
             event_queue.put(
                 ProgressEvent.cancelled_event(
                     transfer_id=transfer_id,
@@ -306,8 +317,10 @@ def download_snapshot_streaming(
                 )
             )
             raise TransferCancelledError("Snapshot streaming interrupted by user (Ctrl+C)")
+        except TransferCancelledError:
+            raise
         finally:
-            runner.terminate(grace=2.0)
+            runner.terminate(grace=1.0)
             if on_finish is not None:
                 try:
                     on_finish()
