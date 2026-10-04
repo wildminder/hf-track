@@ -38,4 +38,12 @@ hf_track/examples/downloads/
 
 # desloppify local state
 .desloppify/
-downloads/
+
+# coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# local tool indexes / caches
+.codegraph/
+.zcode/
