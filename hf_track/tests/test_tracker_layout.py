@@ -16,8 +16,16 @@ import pathlib
 
 import pytest
 
+from . import test_module_size
 
-TRACKER_DIR = pathlib.Path("hf_track/src/hf_track/tracker")
+
+# Resolve the package from this file, never from the process CWD. A
+# CWD-relative path made this file pass from the repository root and fail
+# (10 failures) when run from ``hf_track/``, because it silently pointed
+# at a non-existent ``<cwd>/hf_track/src/...``. Reusing
+# ``test_module_size._find_source_root()`` keeps the two in agreement.
+PACKAGE_ROOT = pathlib.Path(__file__).resolve().parents[1]
+TRACKER_DIR = PACKAGE_ROOT / "src" / "hf_track" / "tracker"
 
 
 # ── Existence ───────────────────────────────────────────────────────
@@ -30,6 +38,18 @@ class TestTrackerPackageExists:
         assert TRACKER_DIR.is_dir(), (
             f"Expected {TRACKER_DIR} to be a directory (subpackage)"
         )
+
+    def test_tracker_dir_is_cwd_independent(self):
+        """``TRACKER_DIR`` must agree with the module-size helper.
+
+        Both files resolve the source tree the same way, so neither can
+        drift back to a CWD-relative path (which resolved differently
+        depending on where pytest was invoked from).
+        """
+        assert TRACKER_DIR == (
+            pathlib.Path(test_module_size._find_source_root()) / "tracker"
+        )
+        assert TRACKER_DIR == PACKAGE_ROOT / "src" / "hf_track" / "tracker"
 
     def test_tracker_init_exists(self):
         assert (TRACKER_DIR / "__init__.py").is_file()
@@ -47,7 +67,7 @@ class TestTrackerPackageExists:
 
     def test_no_legacy_tracker_py_module(self):
         """The old monolithic tracker.py must not co-exist with the package."""
-        legacy = pathlib.Path("hf_track/src/hf_track/tracker.py")
+        legacy = TRACKER_DIR.parent / "tracker.py"
         assert not legacy.exists(), (
             f"{legacy} still exists. Either delete it (after split) or "
             "make it a backward-compat shim (it cannot be both a module "

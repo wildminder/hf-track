@@ -275,41 +275,31 @@ class TestDownloadWorker:
         return params
 
     @patch("hf_track._xet_worker._deserialize_xet_file_data")
-    @patch("huggingface_hub.utils._xet.refresh_xet_connection_info")
-    @patch("hf_xet.download_files", create=True)
-    @patch("hf_xet.PyXetDownloadInfo", create=True)
-    def test_download_worker_success(self, mock_info_cls, mock_download, mock_refresh, mock_deserialize):
+    @patch("huggingface_hub.utils._xet.get_xet_session")
+    def test_download_worker_success(self, mock_get_session, mock_deserialize):
         """Worker emits result message on successful download."""
         mock_deserialize.return_value = MagicMock(file_hash="abc123", refresh_route="https://xet.example.com/refresh")
-        mock_conn = MagicMock()
-        mock_conn.endpoint = "https://xet.example.com"
-        mock_conn.access_token = "token123"
-        mock_conn.expiration_unix_epoch = 9999999999
-        mock_refresh.return_value = mock_conn
-        mock_download.return_value = None
+        group = mock_get_session.return_value.new_file_download_group.return_value
+        group.__enter__.return_value = group
 
         ctx = mp.get_context("spawn")
         mp_queue = ctx.Queue()
         cancel_event = ctx.Event()
 
-        # We need to mock hf_xet at module level since the worker imports it
-        with patch.dict("sys.modules", {"hf_xet": MagicMock(
-            PyXetDownloadInfo=mock_info_cls,
-            download_files=mock_download,
-        )}):
-            _download_worker(self._make_params(), mp_queue, cancel_event)
+        _download_worker(self._make_params(), mp_queue, cancel_event)
 
+        group.start_download_file.assert_called_once()
         msg = mp_queue.get(timeout=2)
         assert msg.msg_type == MSG_RESULT
         assert msg.payload["status"] == "success"
         assert msg.payload["filename"] == "model.bin"
 
     @patch("hf_track._xet_worker._deserialize_xet_file_data")
-    @patch("huggingface_hub.utils._xet.refresh_xet_connection_info")
-    def test_download_worker_credential_error(self, mock_refresh, mock_deserialize):
+    @patch("huggingface_hub.utils._xet.get_xet_session")
+    def test_download_worker_credential_error(self, mock_get_session, mock_deserialize):
         """Worker emits error message when credential fetch fails."""
-        mock_deserialize.return_value = MagicMock()
-        mock_refresh.side_effect = ConnectionError("Auth failed")
+        mock_deserialize.return_value = MagicMock(refresh_route="https://xet.example.com/refresh")
+        mock_get_session.return_value.new_file_download_group.side_effect = ConnectionError("Auth failed")
 
         ctx = mp.get_context("spawn")
         mp_queue = ctx.Queue()

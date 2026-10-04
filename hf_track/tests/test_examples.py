@@ -20,11 +20,10 @@ directory healthy?". It runs four kinds of checks against every
      would actually fail at step 1, so this check is mostly
      about catching *re-imports* of the same names after they
      reappear in the codebase.
-  4. *Class-export check* — the two examples that define a
-     helper class (``SmoothTicker`` for the smooth ticker, and
-     ``MemoryWatcher`` for the streaming example) must still
-     expose it, because their ``--watch-mem`` / ``--smooth``
-     CLI flags depend on it.
+  4. *Class-export check* — the one example that defines a
+     helper class (``MemoryWatcher`` for the streaming example)
+     must still expose it, because its ``--watch-mem``
+     CLI flag depends on it.
 
 If a new example is added, the discovery loop picks it up
 automatically (as long as it follows the parse_args/main
@@ -98,9 +97,14 @@ REMOVED_SYMBOLS: tuple[str, ...] = (
 
 # Per-example class exports (mapping example -> expected class name).
 # These are classes that an example defines and exposes for its
-# own CLI flags to use.
+# own CLI flags to use. Every key MUST correspond to a file that is
+# actually on disk -- ``test_examples_root_exists`` asserts that, so a
+# deleted example fails loudly here instead of silently at import time.
+#
+# ``download_xet_inprocess_smooth`` was removed along with its test on
+# 2026-10-04 (CRIT-010): its example had been deleted upstream, leaving
+# ``test_smooth_ticker.py`` to abort collection with ModuleNotFoundError.
 EXAMPLE_CLASSES: dict[str, str] = {
-    "download_xet_inprocess_smooth": "SmoothTicker",
     "download_xet_streaming": "MemoryWatcher",
 }
 
@@ -111,10 +115,26 @@ EXAMPLE_CLASSES: dict[str, str] = {
 
 
 def test_examples_root_exists() -> None:
-    """The examples/ directory must exist and contain at least one .py file."""
+    """The examples/ directory must exist and contain at least one .py file.
+
+    Also asserts that every example named in ``EXAMPLE_CLASSES`` is on
+    disk. That map drives ``test_example_exposes_documented_class``; when
+    the two disagree, the parametrized case fails with a FileNotFoundError
+    from ``spec.loader.exec_module`` that reads like an import bug rather
+    than a missing file.
+    """
     assert EXAMPLES_ROOT.is_dir(), f"{EXAMPLES_ROOT} is not a directory"
     examples = _all_example_names()
     assert len(examples) > 0, f"No example scripts found in {EXAMPLES_ROOT}"
+    missing = sorted(
+        name for name in EXAMPLE_CLASSES
+        if not (EXAMPLES_ROOT / f"{name}.py").is_file()
+    )
+    assert not missing, (
+        f"EXAMPLE_CLASSES references examples that are not on disk: {missing}. "
+        f"Restore the example or drop the entry -- do not leave a map entry "
+        f"pointing at a deleted file."
+    )
 
 
 # =============================================================================
@@ -220,12 +240,11 @@ def test_example_exposes_documented_class(
     """Examples that define a helper class must still expose it.
 
     Specifically:
-      * download_xet_inprocess_smooth.SmoothTicker
       * download_xet_streaming.MemoryWatcher
 
-    These are referenced by the example's ``--smooth`` /
-    ``--watch-mem`` CLI flags; if the class is renamed or removed
-    without updating the example, the CLI breaks.
+    This is referenced by the example's ``--watch-mem`` CLI flag; if the
+    class is renamed or removed without updating the example, the CLI
+    breaks.
     """
     mod = _import_example(name)
     cls = getattr(mod, class_name, None)
@@ -429,6 +448,24 @@ def test_download_xet_streaming_drains_events_after_thread_exit() -> None:
     )
 
 
+def test_streaming_example_avoids_deprecated_api() -> None:
+    """The streaming example must not call the deprecated xet file API.
+
+    ``download_file_with_xet`` is deprecated
+    (``hf_track/src/hf_track/download/xet_file.py`` raises
+    ``DeprecationWarning`` when it is called). The example was restored on
+    2026-10-04 from commit ``d7593e3^``, and this is the assertion that
+    stops that restore from re-teaching a path the library warns on.
+    """
+    src_text = (
+        EXAMPLES_ROOT / "download_xet_streaming.py"
+    ).read_text(encoding="utf-8")
+    assert "download_file_with_xet" not in src_text, (
+        "download_xet_streaming.py references download_file_with_xet, which "
+        "is deprecated; use the tracker's public snapshot-streaming API."
+    )
+
+
 def test_progress_bar_formatting_helpers() -> None:
     """The progress-bar example exposes the documented formatting helpers.
 
@@ -529,3 +566,55 @@ def test_download_file_forwards_no_hybrid_kwargs() -> None:
         "(tier_timeout_s / enable_http_fallback) to tracker.download_file(). "
         "See plan 2026-07-16 step 4."
     )
+
+
+def test_progress_bar_renders_transport_mode():
+    """NTH-007(b): the example bar shows which transport carried the event.
+
+    The library half (``ProgressEvent.extra["transport"]``) is
+    ``test_callbacks.py::TestModeIndicator``; this is the rendering half,
+    which lives in an example rather than in the package.
+    """
+    import importlib.util
+    import sys
+
+    from hf_track.types import (
+        EventType,
+        ProgressEvent,
+        ProgressPhase,
+        TransferDirection,
+    )
+
+    example = EXAMPLES_ROOT / "progress_bar.py"
+    if not example.is_file():
+        pytest.skip(f"{example} is absent")
+
+    if "hf_track_example_progress_bar" not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            "hf_track_example_progress_bar", example
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["hf_track_example_progress_bar"] = module
+        spec.loader.exec_module(module)
+
+    def _line(transport):
+        event = ProgressEvent(
+            event_type=EventType.PROGRESS,
+            transfer_id="t",
+            direction=TransferDirection.DOWNLOAD,
+            filename="model.bin",
+            phase=ProgressPhase.DOWNLOADING,
+            bytes_completed=500,
+            total_bytes=1000,
+            percentage=50.0,
+            speed=1000.0,
+        )
+        if transport is not None:
+            event.extra["transport"] = transport
+        return module.render_progress_line(event)
+
+    assert "[XET]" in _line("xet")
+    assert "[HTTP]" in _line("http")
+    # No flag, no claim: the line must not invent a mode.
+    assert "[XET]" not in _line(None)
+    assert "[HTTP]" not in _line(None)

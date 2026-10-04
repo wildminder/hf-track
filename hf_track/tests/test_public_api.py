@@ -20,14 +20,32 @@ external users will see ImportErrors / AttributeErrors.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
 
 import pytest
 
+from .test_module_size import _find_source_root
+
 
 PACKAGE = "hf_track"
+
+# ``pytest`` puts ``<package>/src`` on ``sys.path`` of the *parent*
+# process (the ``pythonpath`` ini option), but a child interpreter
+# launched as ``sys.executable -c ...`` inherits nothing from that: it
+# only reads the real ``PYTHONPATH`` environment variable. On a bare
+# checkout ``hf_track`` is not pip-installed, so every subprocess import
+# check below died with ``ModuleNotFoundError`` before it could assert
+# anything about circular imports. Handing the child an explicit
+# ``PYTHONPATH`` is the fix. See plan 2026-10-04, step S05.
+SOURCE_ROOT = _find_source_root().parent
+
+
+def _child_env() -> dict[str, str]:
+    """An environment in which a fresh interpreter can import ``hf_track``."""
+    return {**os.environ, "PYTHONPATH": str(SOURCE_ROOT)}
 
 
 # ── Existence of public symbols ────────────────────────────────────
@@ -117,6 +135,7 @@ SUBPACKAGES = [
     "hf_track.download",
     "hf_track.upload",
     "hf_track.tracker",
+    "hf_track.integrations",
 ]
 
 
@@ -148,6 +167,7 @@ def _check_subpackage_in_subprocess(subpkg: str) -> None:
         capture_output=True,
         text=True,
         timeout=30,
+        env=_child_env(),
     )
     if result.returncode != 0 or "OK" not in result.stdout:
         raise AssertionError(
@@ -181,6 +201,34 @@ class TestNoCircularImports:
     def test_hf_track_does_not_trigger_circular_import(self):
         """``import hf_track`` must complete in a clean process."""
         _check_subpackage_in_subprocess(PACKAGE)
+
+    def test_public_api_subprocess_child_gets_pythonpath(self):
+        """The env handed to child interpreters must make the package importable.
+
+        Guards the fix in ``_check_subpackage_in_subprocess``: without an
+        explicit ``PYTHONPATH`` the child cannot import ``hf_track`` on a
+        bare checkout, and every parametrized case above fails for a reason
+        that has nothing to do with circular imports.
+        """
+        result = subprocess.run(
+            [sys.executable, "-c", "import hf_track"],
+            env=_child_env(),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, (
+            f"Child interpreter could not import hf_track with the env this "
+            f"file builds.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+
+    def test_integrations_is_in_subpackages(self):
+        """``hf_track.integrations`` must stay in the guarded list.
+
+        It is referenced by the ``sse`` extra but was absent from
+        ``SUBPACKAGES``, so its circular-import safety was never checked.
+        """
+        assert "hf_track.integrations" in SUBPACKAGES
 
 
 # ── Submodule consistency ───────────────────────────────────────────

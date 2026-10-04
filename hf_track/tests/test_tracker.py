@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -13,9 +14,10 @@ from hf_track.tracker import HfTracker
 from hf_track.types import (
     EventType,
     ProgressEvent,
+    ProgressPhase,
     TransferCancelledError,
     TransferDirection,
-    TransferError,
+    TransferErrorInfo,
     TransferProgressError,
 )
 
@@ -178,14 +180,14 @@ class TestHfTrackerEvents:
                 direction=TransferDirection.UPLOAD,
                 filename="test.bin",
                 phase="error",
-                error=TransferError(message="Connection refused", error_type="ConnectionError"),
+                error=TransferErrorInfo(message="Connection refused", error_type="ConnectionError"),
             )
         )
 
         result = tracker.wait_for_complete("err-1", timeout=1)
         assert result is not None
         assert result.event_type == EventType.ERROR
-        assert isinstance(result.error, TransferError)
+        assert isinstance(result.error, TransferErrorInfo)
         assert result.error.message == "Connection refused"
 
     def test_wait_for_complete_ignores_other_transfers(self):
@@ -1037,3 +1039,209 @@ class TestDownloadSnapshotStreaming:
             mock_helper.side_effect = TransferProgressError("download failed")
             with pytest.raises(TransferProgressError, match="download failed"):
                 tracker.download_snapshot_streaming(repo_id="user/repo")
+
+
+class TestCancelledTransferCleanup:
+    """Cancelled ids must not accumulate for the life of the tracker.
+
+    ``cancel()`` adds an id to ``_cancelled_transfers``; the public
+    download/upload methods discard it in a ``finally``. An id that is
+    cancelled and then reaches a terminal event through *any* other path was
+    never discarded — that residue is what ``_TrackingEventQueue`` closes.
+    """
+
+    @staticmethod
+    def _terminal(transfer_id: str, event_type: EventType) -> ProgressEvent:
+        return ProgressEvent(
+            event_type=event_type,
+            transfer_id=transfer_id,
+            direction=TransferDirection.DOWNLOAD,
+            phase=ProgressPhase.DOWNLOADING,
+            filename="weights.bin",
+            bytes_completed=0,
+            total_bytes=0,
+        )
+
+    @pytest.mark.parametrize(
+        "event_type",
+        [EventType.COMPLETE, EventType.ERROR, EventType.CANCELLED],
+    )
+    def test_cancelled_transfers_discarded_on_terminal_event(self, event_type):
+        """A cancelled id is dropped when its transfer ends, whatever the end.
+
+        No download/upload method is entered: the event is pushed straight
+        at the queue, which is the residue the tracker's own ``finally``
+        blocks cannot reach.
+        """
+        tracker = HfTracker()
+        tracker_id = f"orphan-{event_type.value}"
+
+        tracker.cancel(tracker_id)
+        assert tracker.is_cancelled(tracker_id)
+
+        tracker.event_queue.put_nowait(self._terminal(tracker_id, event_type))
+
+        assert tracker_id not in tracker._cancelled_transfers
+        assert not tracker.is_cancelled(tracker_id)
+
+    def test_non_terminal_event_does_not_discard(self):
+        """PROGRESS and START must not clear a live cancellation flag.
+
+        Clearing on a non-terminal event would make ``cancel()`` a no-op for
+        any transfer that reports progress before it finishes.
+        """
+        tracker = HfTracker()
+        tracker_id = "still-running"
+
+        tracker.cancel(tracker_id)
+        tracker.event_queue.put_nowait(self._terminal(tracker_id, EventType.PROGRESS))
+
+        assert tracker.is_cancelled(tracker_id)
+
+    def test_cancelled_set_does_not_grow_across_completed_transfers(self):
+        """N cancel/terminal cycles leave the set empty, not N entries."""
+        tracker = HfTracker()
+
+        for i in range(50):
+            transfer_id = f"cycle-{i}"
+            tracker.cancel(transfer_id)
+            tracker.event_queue.put_nowait(
+                self._terminal(transfer_id, EventType.COMPLETE)
+            )
+
+        assert len(tracker._cancelled_transfers) == 0
+
+    def test_discarding_one_id_leaves_the_others_alone(self):
+        """Cleanup is per-transfer, not a blanket clear."""
+        tracker = HfTracker()
+        tracker.cancel("a")
+        tracker.cancel("b")
+
+        tracker.event_queue.put_nowait(self._terminal("a", EventType.COMPLETE))
+
+        assert not tracker.is_cancelled("a")
+        assert tracker.is_cancelled("b")
+
+    def test_queue_still_behaves_like_a_queue(self):
+        """The subclass must not change the queue's observable behaviour."""
+        import queue as _queue
+
+        tracker = HfTracker()
+        tracker.event_queue.put_nowait(self._terminal("x", EventType.PROGRESS))
+
+        assert isinstance(tracker.event_queue, _queue.Queue)
+        assert tracker.event_queue.qsize() == 1
+        assert tracker.event_queue.get_nowait().transfer_id == "x"
+
+        with pytest.raises(_queue.Empty):
+            tracker.event_queue.get_nowait()
+
+
+class TestAsyncApi:
+    """The async wrappers cover both transports (NTH-002 + NTH-011).
+
+    ``download_file_async``/``upload_file_async`` delegate to the sync
+    methods through ``asyncio.to_thread``. That is the whole contract, so
+    the tests assert the two things that can break it silently: that the
+    work really does leave the event-loop thread, and that cancelling the
+    task reaches the tracker instead of abandoning a running transfer.
+    """
+
+    @staticmethod
+    def _make_tracker(sync_method_name, *, result="ok", raises=None, delay=0.0):
+        """An HfTracker whose one sync method records the thread it ran on."""
+        tracker = HfTracker()
+        seen = {}
+
+        def _fake(*args, **kwargs):
+            seen["thread_id"] = threading.get_ident()
+            seen["kwargs"] = kwargs
+            if delay:
+                time.sleep(delay)
+            if raises is not None:
+                raise raises
+            return result
+
+        setattr(tracker, sync_method_name, _fake)
+        return tracker, seen
+
+    async def test_async_download_file_runs_in_thread(self):
+        """The transfer must not execute on the event loop thread."""
+        tracker, seen = self._make_tracker("download_file", result="/tmp/model.bin")
+
+        path = await tracker.download_file_async(
+            "user/repo", "model.bin", transfer_id="async-dl-1",
+        )
+
+        assert path == "/tmp/model.bin"
+        assert seen["thread_id"] != threading.get_ident()
+        assert seen["kwargs"]["transfer_id"] == "async-dl-1"
+
+    async def test_async_upload_file_runs_in_thread(self):
+        """NTH-011's half: the upload wrapper behaves the same way."""
+        tracker, seen = self._make_tracker("upload_file", result="/tmp/model.bin")
+
+        path = await tracker.upload_file_async(
+            "/tmp/model.bin", "user/repo", transfer_id="async-up-1",
+        )
+
+        assert path == "/tmp/model.bin"
+        assert seen["thread_id"] != threading.get_ident()
+
+    async def test_async_api_propagates_transfer_cancelled_error(self):
+        """A cancellation raised in the thread reaches the awaiter."""
+        tracker, _ = self._make_tracker(
+            "download_file", raises=TransferCancelledError("cancelled in thread"),
+        )
+
+        with pytest.raises(TransferCancelledError, match="cancelled in thread"):
+            await tracker.download_file_async(
+                "user/repo", "model.bin", transfer_id="async-dl-2",
+            )
+
+    async def test_task_cancellation_is_forwarded_to_the_tracker(self):
+        """Cancelling the task cancels the transfer, it does not abandon it.
+
+        ``asyncio.to_thread`` cannot kill the thread it started, so a
+        cancelled ``await`` on its own would leave the download running to
+        completion with nobody watching it.
+        """
+        tracker, _ = self._make_tracker("download_file", delay=2.0)
+        tracker._cancelled_transfers.clear()
+
+        task = asyncio.ensure_future(
+            tracker.download_file_async(
+                "user/repo", "model.bin", transfer_id="async-dl-3",
+            )
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert "async-dl-3" in tracker._cancelled_transfers
+
+    async def test_every_wrapper_exists_for_its_sync_counterpart(self):
+        """No transport is left without an async form."""
+        tracker = HfTracker()
+        pairs = [
+            ("download_file", "download_file_async"),
+            ("download_snapshot", "download_snapshot_async"),
+            ("upload_file", "upload_file_async"),
+            ("upload_bytes", "upload_bytes_async"),
+            ("upload_folder", "upload_folder_async"),
+        ]
+        for sync_name, async_name in pairs:
+            assert callable(getattr(tracker, sync_name, None)), sync_name
+            assert callable(getattr(tracker, async_name, None)), async_name
+
+    async def test_other_errors_are_not_swallowed(self):
+        """A failure in the thread surfaces to the awaiter unchanged."""
+        tracker, _ = self._make_tracker(
+            "upload_file", raises=TransferProgressError("upload failed"),
+        )
+        with pytest.raises(TransferProgressError, match="upload failed"):
+            await tracker.upload_file_async(
+                "/tmp/model.bin", "user/repo", transfer_id="async-up-2",
+            )

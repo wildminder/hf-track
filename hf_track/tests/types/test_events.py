@@ -13,7 +13,7 @@ from hf_track.types import (
     ProgressEvent,
     ProgressPhase,
     TransferDirection,
-    TransferError,
+    TransferErrorInfo,
 )
 
 
@@ -98,7 +98,7 @@ class TestProgressEvent:
         assert event.bytes_completed == 1000
 
     def test_error_event_factory(self):
-        err = TransferError(message="Connection refused", error_type="ConnectionError")
+        err = TransferErrorInfo(message="Connection refused", error_type="ConnectionError")
         event = ProgressEvent.error_event(
             transfer_id="test-factory",
             direction=TransferDirection.UPLOAD,
@@ -167,7 +167,7 @@ class TestProgressEvent:
 
     def test_to_dict_error(self):
         """Error field is serialized to dict."""
-        err = TransferError(message="Connection refused", error_type="ConnectionError")
+        err = TransferErrorInfo(message="Connection refused", error_type="ConnectionError")
         event = ProgressEvent(
             event_type=EventType.ERROR,
             transfer_id="test-5",
@@ -217,7 +217,7 @@ class TestProgressEvent:
         assert restored.speed == event.speed
 
     def test_from_dict_legacy_error_string(self):
-        """Should parse older string-based error formats seamlessly into a TransferError object."""
+        """Should parse older string-based error formats seamlessly into a TransferErrorInfo object."""
         legacy_data = {
             "event_type": "error",
             "transfer_id": "test-legacy",
@@ -226,7 +226,7 @@ class TestProgressEvent:
             "error": "Legacy string error",
         }
         restored = ProgressEvent.from_dict(legacy_data)
-        assert isinstance(restored.error, TransferError)
+        assert isinstance(restored.error, TransferErrorInfo)
         assert restored.error.message == "Legacy string error"
         assert restored.error.error_type == "Exception"
 

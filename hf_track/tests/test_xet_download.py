@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import queue
+import threading
+import time
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from hf_track.types import EventType, ProgressPhase, TransferDirection, TransferError, TransferProgressError
+from hf_track.types import EventType, ProgressPhase, TransferDirection, TransferErrorInfo, TransferProgressError
 
 
 # ── download_file_with_xet ────────────────────────────────────
@@ -111,7 +114,7 @@ class TestDownloadFileWithXet:
     @patch("hf_track.download.xet_file.is_xet_available", return_value=True)
     @patch("hf_track.download.xet_file.XetSubprocessRunner")
     def test_emits_error_event_on_failure(self, MockRunner, _mock_xet_avail):
-        """Should raise RuntimeError with TransferError message when worker returns error."""
+        """Should raise RuntimeError with TransferErrorInfo message when worker returns error."""
         from hf_track.download import download_file_with_xet
 
         mock_runner = MagicMock()
@@ -364,7 +367,7 @@ class TestDownloadFilesWithXet:
             events.append(event_queue.get_nowait())
         error_events = [e for e in events if e.event_type == EventType.ERROR]
         assert len(error_events) == 2
-        assert all(isinstance(e.error, TransferError) for e in error_events)
+        assert all(isinstance(e.error, TransferErrorInfo) for e in error_events)
         assert all(e.error.message == "batch failed" for e in error_events)
 
 
@@ -859,3 +862,362 @@ class TestDownloadSnapshotWithXet:
         call_kwargs = mock_runner.start.call_args
         params = call_kwargs.kwargs["params"]
         assert params["use_xet"] is True
+
+
+class TestStatusDiscrimination:
+    """``status`` is the sole discriminator for a worker result (IMP-008).
+
+    The dispatch used to read ``status``, *then* ``error_type``, then
+    substring-match the message for "cancelled"/"interrupted". That last
+    clause is what made a plain failure look like a cancellation: a worker
+    that fails with ``{"status": "error", "error_type":
+    "TransferCancelledError", "message": "interrupted by peer"}`` raised
+    ``TransferCancelledError``, so the caller's retry/abort logic took the
+    wrong branch on a transport error.
+    """
+
+    @staticmethod
+    def _mock_runner(MockRunner, result):
+        mock_runner = MagicMock()
+        mock_runner.wait.return_value = result
+        mock_runner.is_alive.return_value = False
+        MockRunner.return_value = mock_runner
+        return mock_runner
+
+    @patch("hf_track.download.xet_file.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_file.XetSubprocessRunner")
+    def test_error_type_field_alone_does_not_raise_cancelled(self, MockRunner, _):
+        """The payload that used to raise the wrong exception type."""
+        from hf_track.download import download_file_with_xet
+        from hf_track.types import TransferCancelledError
+
+        self._mock_runner(
+            MockRunner,
+            {
+                "status": "error",
+                "error_type": "TransferCancelledError",
+                "message": "interrupted by peer",
+            },
+        )
+
+        with pytest.raises(TransferProgressError) as exc_info:
+            download_file_with_xet(
+                file_hash="abc123",
+                file_size=1024,
+                dest_path="/tmp/test.bin",
+                xet_file_data=MagicMock(),
+                token="test-token",
+                event_queue=queue.Queue(),
+            )
+
+        assert not isinstance(exc_info.value, TransferCancelledError)
+        assert "interrupted by peer" in str(exc_info.value)
+
+    @patch("hf_track.download.xet_file.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_file.XetSubprocessRunner")
+    def test_status_cancelled_still_raises_cancelled(self, MockRunner, _):
+        """The real cancellation path is unchanged."""
+        from hf_track.download import download_file_with_xet
+        from hf_track.types import TransferCancelledError
+
+        self._mock_runner(
+            MockRunner, {"status": "cancelled", "message": "Transfer cancelled by user"}
+        )
+
+        with pytest.raises(TransferCancelledError):
+            download_file_with_xet(
+                file_hash="abc123",
+                file_size=1024,
+                dest_path="/tmp/test.bin",
+                xet_file_data=MagicMock(),
+                token="test-token",
+                event_queue=queue.Queue(),
+            )
+
+    @patch("hf_track.download.xet_batch.is_xet_available", return_value=True)
+    @patch("hf_track.download.xet_batch.XetSubprocessRunner")
+    def test_batch_uses_the_same_discriminator(self, MockRunner, _):
+        """The batch path must not keep the message matching the file path lost."""
+        from hf_track.download import download_files_with_xet
+        from hf_track.types import TransferCancelledError
+
+        self._mock_runner(
+            MockRunner,
+            {
+                "status": "error",
+                "error_type": "TransferCancelledError",
+                "message": "interrupted by peer",
+            },
+        )
+
+        with pytest.raises(TransferProgressError):
+            download_files_with_xet(
+                file_specs=[{"dest_path": "/tmp/a.bin", "file_size": 10, "file_hash": "h"}],
+                token="test-token",
+                event_queue=queue.Queue(),
+            )
+
+        self._mock_runner(
+            MockRunner, {"status": "cancelled", "message": "Transfer cancelled by user"}
+        )
+        with pytest.raises(TransferCancelledError):
+            download_files_with_xet(
+                file_specs=[{"dest_path": "/tmp/a.bin", "file_size": 10, "file_hash": "h"}],
+                token="test-token",
+                event_queue=queue.Queue(),
+            )
+
+    @patch("hf_track.upload.xet_file.is_xet_available", return_value=True)
+    @patch("hf_track.upload.xet_file.XetSubprocessRunner")
+    def test_upload_uses_the_same_discriminator(self, MockRunner, _, tmp_path):
+        """The upload path had the identical chain."""
+        from hf_track.upload.xet_file import upload_file_with_xet
+        from hf_track.types import TransferCancelledError
+
+        # The upload path stats the file before spawning, so it needs a
+        # real one on disk.
+        upload_path = tmp_path / "a.bin"
+        upload_path.write_bytes(b"x" * 16)
+
+        self._mock_runner(
+            MockRunner,
+            {
+                "status": "error",
+                "error_type": "TransferCancelledError",
+                "message": "interrupted by peer",
+            },
+        )
+
+        with pytest.raises(TransferProgressError):
+            upload_file_with_xet(
+                file_path=str(upload_path),
+                repo_id="user/repo",
+                token="test-token",
+                event_queue=queue.Queue(),
+            )
+
+        self._mock_runner(
+            MockRunner, {"status": "cancelled", "message": "Transfer cancelled by user"}
+        )
+        with pytest.raises(TransferCancelledError):
+            upload_file_with_xet(
+                file_path=str(upload_path),
+                repo_id="user/repo",
+                token="test-token",
+                event_queue=queue.Queue(),
+            )
+
+    def test_download_source_has_no_message_substring_matching(self):
+        """The string matching is gone from every dispatch site, not just one.
+
+        Asserted on the source because a behavioural test cannot prove the
+        *absence* of a heuristic: a payload not exercised by any test would
+        still pass.
+        """
+        import pathlib
+
+        import hf_track.download as download_pkg
+
+        sources = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in (
+                pathlib.Path(download_pkg.__file__).parent / name
+                for name in ("xet_file.py", "xet_batch.py", "xet_snapshot.py")
+            )
+        }
+        sources["upload/xet_file.py"] = (
+            pathlib.Path(download_pkg.__file__).parent.parent / "upload" / "xet_file.py"
+        ).read_text(encoding="utf-8")
+
+        for name, src in sources.items():
+            assert '"interrupted" in' not in src, f"{name} still substring-matches"
+            assert '"cancelled" in' not in src, f"{name} still substring-matches"
+            assert 'result.get("message", "").lower()' not in src, (
+                f"{name} still lowercases the message to classify it"
+            )
+
+
+class TestBatchPooling:
+    """NTH-008: a batch may run more than one worker subprocess.
+
+    The default stays at one subprocess for the whole batch, so the tests
+    here cover both halves: that concurrency is bounded by ``max_workers``
+    when asked for, and that the unasked-for case is unchanged. A pooling
+    change that silently raised the default would be a regression, not a
+    feature.
+    """
+
+    class _ProbeRunner:
+        """Stands in for XetSubprocessRunner, tracking concurrency."""
+
+        instances = []
+        lock = threading.Lock()
+        live = 0
+        peak = 0
+        gate: Optional[threading.Event] = None
+
+        def __init__(self):
+            self.started_with = None
+            type(self).instances.append(self)
+
+        def start(self, worker_func=None, params=None, event_queue=None):
+            self.started_with = params
+            cls = type(self)
+            with cls.lock:
+                cls.live += 1
+                cls.peak = max(cls.peak, cls.live)
+            # Two rounds of polling so the main loop exercises the
+            # wait() path rather than returning on the first call.
+            self._calls = 0
+
+        def wait(self, timeout=None):
+            self._calls += 1
+            if self._calls < 2:
+                if type(self).gate is not None:
+                    type(self).gate.wait(timeout=5)
+                return None
+            cls = type(self)
+            with cls.lock:
+                cls.live -= 1
+            return {"status": "success", "message": "ok"}
+
+        def terminate(self, grace=None):
+            return None
+
+    @classmethod
+    def _specs(cls, count):
+        return [
+            {
+                "dest_path": f"/tmp/file-{i}.bin",
+                "file_size": 100 + i,
+                "file_hash": f"hash-{i}",
+                "xet_file_data": None,
+            }
+            for i in range(count)
+        ]
+
+    @pytest.fixture
+    def probe(self):
+        self._ProbeRunner.instances = []
+        self._ProbeRunner.live = 0
+        self._ProbeRunner.peak = 0
+        self._ProbeRunner.gate = threading.Event()
+        self._ProbeRunner.gate.set()
+        yield self._ProbeRunner
+        self._ProbeRunner.gate = None
+
+    def test_max_workers_defaults_to_one(self):
+        """The default preserves today's single-process behaviour."""
+        from hf_track.download.xet_batch import get_default_max_workers
+
+        assert get_default_max_workers() == 1
+
+    def test_default_call_starts_exactly_one_runner(self, probe):
+        """One batch, one subprocess, unless the caller asks otherwise."""
+        from hf_track.download import download_files_with_xet
+
+        with patch("hf_track.download.xet_batch.is_xet_available", return_value=True), \
+             patch("hf_track.download.xet_batch.XetSubprocessRunner", probe):
+            results = download_files_with_xet(
+                file_specs=self._specs(4),
+                token="t",
+                event_queue=queue.Queue(),
+            )
+
+        assert len(probe.instances) == 1
+        assert len(results) == 4
+
+    def test_batch_download_respects_max_workers(self, probe):
+        """Peak concurrency never exceeds the requested worker count."""
+        from hf_track.download import download_files_with_xet
+
+        probe.gate.clear()
+        with patch("hf_track.download.xet_batch.is_xet_available", return_value=True), \
+             patch("hf_track.download.xet_batch.XetSubprocessRunner", probe):
+            worker = threading.Thread(
+                target=lambda: download_files_with_xet(
+                    file_specs=self._specs(6),
+                    token="t",
+                    event_queue=queue.Queue(),
+                    max_workers=3,
+                ),
+                daemon=True,
+            )
+            worker.start()
+            # Let all three workers reach their first wait() before the
+            # gate opens, so the peak really is three and not one.
+            deadline = time.time() + 5
+            while probe.live < 3 and time.time() < deadline:
+                time.sleep(0.01)
+            assert probe.live == 3, (
+                f"only {probe.live} workers started; the pool did not spawn them"
+            )
+            probe.gate.set()
+            worker.join(timeout=15)
+
+        assert not worker.is_alive()
+        assert probe.peak <= 3
+
+    def test_max_workers_cannot_exceed_the_file_count(self, probe):
+        """Two files and four workers is two workers, not four empty ones."""
+        from hf_track.download import download_files_with_xet
+
+        with patch("hf_track.download.xet_batch.is_xet_available", return_value=True), \
+             patch("hf_track.download.xet_batch.XetSubprocessRunner", probe):
+            download_files_with_xet(
+                file_specs=self._specs(2),
+                token="t",
+                event_queue=queue.Queue(),
+                max_workers=4,
+            )
+
+        assert len(probe.instances) == 2
+
+    def test_zero_workers_is_rejected(self):
+        """A pool of zero would silently download nothing."""
+        from hf_track.download.xet_batch import _split_specs
+
+        with pytest.raises(ValueError, match="max_workers"):
+            _split_specs(self._specs(3), 0)
+
+    def test_pooled_batch_results_match_unpooled(self, probe):
+        """Equivalence, not merely non-crashing: same files, same order."""
+        from hf_track.download import download_files_with_xet
+
+        def _run(max_workers):
+            probe.instances = []
+            with patch("hf_track.download.xet_batch.is_xet_available", return_value=True), \
+                 patch("hf_track.download.xet_batch.XetSubprocessRunner", probe):
+                return download_files_with_xet(
+                    file_specs=self._specs(4),
+                    token="t",
+                    event_queue=queue.Queue(),
+                    max_workers=max_workers,
+                )
+
+        serial = _run(1)
+        pooled = _run(2)
+
+        assert [r.destination_path for r in pooled] == [
+            r.destination_path for r in serial
+        ]
+        assert all(r.success for r in pooled)
+
+    def test_file_indices_stay_in_the_callers_numbering(self, probe):
+        """A pooled run must not renumber file_index from 0 per worker."""
+        from hf_track.download import download_files_with_xet
+
+        q: queue.Queue = queue.Queue()
+        with patch("hf_track.download.xet_batch.is_xet_available", return_value=True), \
+             patch("hf_track.download.xet_batch.XetSubprocessRunner", probe):
+            download_files_with_xet(
+                file_specs=self._specs(4),
+                token="t",
+                event_queue=q,
+                max_workers=2,
+            )
+
+        indices = sorted(
+            e.file_index for e in list(q.queue) if e.event_type == EventType.START
+        )
+        assert indices == [0, 1, 2, 3]

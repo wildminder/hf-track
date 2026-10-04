@@ -34,12 +34,29 @@ These tests guard against any future regression of the same shape.
 from __future__ import annotations
 
 import ast
+import os
 import pathlib
 import subprocess
 import sys
 import textwrap
 
 import pytest
+
+from .test_module_size import _find_source_root
+
+
+# A child interpreter launched as ``sys.executable -c ...`` does not
+# inherit the ``sys.path`` entry that pytest injects for the *parent*
+# process (the ``pythonpath`` ini option); it only reads the real
+# ``PYTHONPATH``. On a bare checkout ``hf_track`` is not pip-installed,
+# so the fresh-interpreter test below could not import the package at
+# all. See plan 2026-10-04, step S06.
+SOURCE_ROOT = _find_source_root().parent
+
+
+def _child_env() -> dict[str, str]:
+    """An environment in which a fresh interpreter can import ``hf_track``."""
+    return {**os.environ, "PYTHONPATH": str(SOURCE_ROOT)}
 
 
 # ── Constants ────────────────────────────────────────────────────
@@ -395,6 +412,7 @@ class TestSubprocessImportsClean:
             capture_output=True,
             text=True,
             timeout=30,
+            env=_child_env(),
         )
         assert result.returncode == 0, (
             f"Fresh-Python import failed (rc={result.returncode}):\n"
@@ -402,3 +420,29 @@ class TestSubprocessImportsClean:
             f"stderr: {result.stderr}"
         )
         assert "OK" in result.stdout
+
+    def test_step14_fresh_interpreter_gets_pythonpath(self):
+        """The env this file hands to children must carry the source root.
+
+        Without it the fresh interpreter imports nothing of the package and
+        ``test_subprocess_can_construct_hf_tracker`` fails for a reason that
+        has nothing to do with the Step-14 regressions it guards.
+        """
+        child_env = _child_env()
+        assert "src" in child_env["PYTHONPATH"], (
+            f"PYTHONPATH should point at <package>/src, got "
+            f"{child_env['PYTHONPATH']!r}"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "from hf_track import HfTracker; HfTracker()"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=child_env,
+        )
+        assert result.returncode == 0, (
+            f"Fresh interpreter could not construct HfTracker (rc="
+            f"{result.returncode}):\nstdout: {result.stdout}\n"
+            f"stderr: {result.stderr}"
+        )

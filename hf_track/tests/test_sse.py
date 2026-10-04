@@ -157,3 +157,197 @@ class TestWebAppEndpoints:
         # (the endpoint will hang if we try to stream, so just check routes)
         routes = [route.path for route in client.app.routes]
         assert "/hf-track/events/{transfer_id}" in routes
+
+
+class TestSSEStream:
+    """Live ``GET /hf-track/events/{transfer_id}`` behaviour (NTH-010).
+
+    ``test_events_route_exists`` proves the route resolves; nothing proved
+    what it emits. The generator is driven directly rather than through
+    ``TestClient``, because ``TestClient`` cannot model the two things
+    that matter here -- a client that disconnects mid-stream, and a stream
+    that is *supposed* to stay open waiting for events that have not
+    arrived yet.
+    """
+
+    @pytest.fixture
+    def app_module(self):
+        pytest.importorskip("fastapi")
+        pytest.importorskip("httpx")
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        web_app_dir = Path(__file__).parent.parent / "examples" / "web_app"
+        module_path = web_app_dir / "app.py"
+        if not module_path.is_file():
+            pytest.skip(f"{module_path} is absent")
+
+        sys.path.insert(0, str(web_app_dir))
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "hf_track_example_web_app", module_path
+            )
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["hf_track_example_web_app"] = module
+            spec.loader.exec_module(module)
+            yield module
+        finally:
+            sys.path.remove(str(web_app_dir))
+
+    @staticmethod
+    def _event(transfer_id, event_type, **kwargs):
+        from hf_track.types import ProgressEvent, ProgressPhase, TransferDirection
+
+        return ProgressEvent(
+            event_type=event_type,
+            transfer_id=transfer_id,
+            direction=TransferDirection.DOWNLOAD,
+            filename=kwargs.pop("filename", "model.bin"),
+            phase=ProgressPhase.DOWNLOADING,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _stub_request(disconnected=False):
+        class _Request:
+            def __init__(self):
+                self._disconnected = disconnected
+
+            async def is_disconnected(self):
+                return self._disconnected
+
+        return _Request()
+
+    @pytest.fixture
+    def clean_buffers(self, app_module):
+        """Isolate each test from the app's module-level buffers."""
+        app_module._transfer_events.clear()
+        app_module._active_transfers.clear()
+        yield
+        app_module._transfer_events.clear()
+        app_module._active_transfers.clear()
+
+    @staticmethod
+    async def _drain(app_module, transfer_id, request, limit=50):
+        """Drain the endpoint's generator, stopping at ``limit`` frames."""
+        import asyncio
+
+        response = await app_module.stream_events(transfer_id, request)
+        iterator = response.body_iterator
+        frames = []
+        while len(frames) < limit:
+            try:
+                frames.append(await asyncio.wait_for(iterator.__anext__(), timeout=5))
+            except (StopAsyncIteration, asyncio.TimeoutError):
+                break
+        await iterator.aclose()
+        return frames
+
+    async def test_sse_stream_emits_data_frames(self, app_module, clean_buffers):
+        """Every frame is a ``data:`` payload that parses to an event dict."""
+        import json
+
+        from hf_track.types import EventType
+
+        transfer_id = "sse-frames-1"
+        app_module._transfer_events[transfer_id] = [
+            self._event(transfer_id, EventType.PROGRESS,
+                        bytes_completed=50, total_bytes=100, percentage=50.0),
+            self._event(transfer_id, EventType.COMPLETE,
+                        bytes_completed=100, total_bytes=100, percentage=100.0),
+        ]
+        app_module._active_transfers[transfer_id] = {"status": "running"}
+
+        frames = await self._drain(app_module, transfer_id, self._stub_request())
+
+        assert frames, "the stream emitted no frames"
+        payloads = []
+        for frame in frames:
+            # The endpoint yields ``{"data": ...}``; the ``data: `` prefix
+            # is added by the SSE encoder downstream, so assert on the
+            # shape it is handed.
+            assert isinstance(frame, dict) and "data" in frame
+            payloads.append(json.loads(frame["data"]))
+
+        assert payloads[0]["event_type"] == "progress"
+        assert payloads[-1]["event_type"] == "complete"
+        assert payloads[0]["transfer_id"] == transfer_id
+
+    async def test_sse_stream_closes_on_terminal_event(self, app_module, clean_buffers):
+        """A COMPLETE buffered into the transfer ends the stream."""
+        from hf_track.types import EventType
+
+        transfer_id = "sse-close-1"
+        app_module._transfer_events[transfer_id] = [
+            self._event(transfer_id, EventType.COMPLETE,
+                        bytes_completed=10, total_bytes=10, percentage=100.0),
+        ]
+        app_module._active_transfers[transfer_id] = {"status": "running"}
+
+        frames = await self._drain(app_module, transfer_id, self._stub_request())
+
+        assert len(frames) == 1, (
+            "the stream must stop at the terminal event rather than "
+            f"re-sending it on every poll; got {len(frames)} frames"
+        )
+
+    async def test_sse_stream_stops_on_client_disconnect(self, app_module, clean_buffers):
+        """A disconnected client ends the generator without raising."""
+        from hf_track.types import EventType
+
+        transfer_id = "sse-disconnect-1"
+        # Events ARE buffered, so only the disconnect can stop this stream.
+        app_module._transfer_events[transfer_id] = [
+            self._event(transfer_id, EventType.PROGRESS,
+                        bytes_completed=1, total_bytes=10),
+        ]
+
+        frames = await self._drain(
+            app_module, transfer_id, self._stub_request(disconnected=True)
+        )
+
+        assert frames == [], (
+            "a disconnected client must receive nothing, not even the "
+            "events already buffered for it"
+        )
+
+    async def test_sse_stream_replays_buffered_events_for_new_subscriber(
+        self, app_module, clean_buffers
+    ):
+        """A second subscriber gets the whole history from cursor 0."""
+        from hf_track.types import EventType
+
+        transfer_id = "sse-replay-1"
+        app_module._active_transfers[transfer_id] = {"status": "running"}
+        history = [
+            self._event(transfer_id, EventType.START),
+            self._event(transfer_id, EventType.PROGRESS,
+                        bytes_completed=5, total_bytes=10),
+            self._event(transfer_id, EventType.COMPLETE,
+                        bytes_completed=10, total_bytes=10, percentage=100.0),
+        ]
+        # Buffered by an earlier subscriber that has already gone.
+        app_module._transfer_events[transfer_id] = list(history)
+
+        frames = await self._drain(app_module, transfer_id, self._stub_request())
+
+        assert len(frames) == len(history), (
+            "a late subscriber must be replayed the events it missed; the "
+            f"cursor design promises this. sent {len(frames)} of {len(history)}"
+        )
+
+    async def test_sse_stream_closes_when_transfer_finished_with_no_new_events(
+        self, app_module, clean_buffers
+    ):
+        """A finished transfer with nothing new terminates rather than polling."""
+        transfer_id = "sse-finished-1"
+        app_module._transfer_events[transfer_id] = []
+        app_module._active_transfers[transfer_id] = {"status": "completed"}
+
+        frames = await self._drain(app_module, transfer_id, self._stub_request())
+
+        assert frames == [], (
+            "there is nothing to send and the transfer is finished, so the "
+            "stream must close rather than poll forever"
+        )

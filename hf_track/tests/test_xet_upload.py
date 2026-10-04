@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from hf_track.types import EventType, TransferDirection, TransferError, TransferProgressError
+from hf_track.types import EventType, TransferDirection, TransferErrorInfo, TransferProgressError
 from hf_track.upload import upload_file_with_xet, upload_bytes_with_xet
 
 
@@ -80,7 +80,7 @@ class TestUploadFileWithXet:
     @patch("hf_track.upload.xet_file.is_xet_available", return_value=True)
     @patch("hf_track.upload.xet_file.XetSubprocessRunner")
     def test_emits_error_event_on_failure(self, MockRunner, mock_avail, event_queue, tmp_path):
-        """Should raise TransferError when worker returns error."""
+        """Should raise TransferErrorInfo when worker returns error."""
         from hf_track.upload import upload_file_with_xet
 
         test_file = tmp_path / "test.bin"

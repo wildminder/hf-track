@@ -1,8 +1,8 @@
 """Baseline test count snapshot.
 
-Locks the pre-refactor test count to 386 (excluding this test itself) so
-that future regressions of the modular refactor (where tests may be split
-but not silently removed) are immediately visible.
+Locks the test count at 619 (excluding this test itself) so that
+regressions of the modular refactor — where tests may be split but not
+silently removed — are immediately visible.
 """
 from __future__ import annotations
 
@@ -13,10 +13,12 @@ from pathlib import Path
 
 import pytest
 
-# Pre-modular-refactor baseline (frozen on 2026-06-05). Counted BEFORE this
-# snapshot test was added. Update this constant deliberately when adding or
-# removing tests in bulk.
-BASELINE_TEST_COUNT = 386
+# Baseline frozen on 2026-10-04 (plan 2026-10-04, step S01), after the
+# collection abort in test_smooth_ticker.py was removed: that file's 18
+# cases had never been counted, so re-measuring the now-collectable suite
+# raised this from 386 to 619. Update this constant deliberately when
+# adding or removing tests in bulk.
+BASELINE_TEST_COUNT = 619
 
 
 def _collect_test_count() -> int:
@@ -41,7 +43,7 @@ def _collect_test_count() -> int:
 
 
 def test_baseline_test_count() -> None:
-    """The pre-refactor test count (excluding this test) was 386.
+    """The baseline test count (excluding this test) was 619.
 
     This test contributes 1 to the collected count, so we subtract 1 before
     comparing against the baseline.

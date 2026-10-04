@@ -1,32 +1,32 @@
-"""Tests for ``hf_track.types.results`` -- TransferResult and TransferError."""
+"""Tests for ``hf_track.types.results`` -- TransferResult and TransferErrorInfo."""
 
 from __future__ import annotations
 
 from hf_track.types import (
     TransferDirection,
-    TransferError,
+    TransferErrorInfo,
     TransferResult,
 )
 
 
 class TestTransferError:
-    """Tests for TransferError dataclass."""
+    """Tests for TransferErrorInfo dataclass."""
 
     def test_basic_creation(self):
-        err = TransferError(message="Network timeout", error_type="TimeoutError", retryable=True)
+        err = TransferErrorInfo(message="Network timeout", error_type="TimeoutError", retryable=True)
         assert err.message == "Network timeout"
         assert err.error_type == "TimeoutError"
         assert err.retryable is True
         assert str(err) == "Network timeout"
 
     def test_to_from_dict(self):
-        err = TransferError(message="Connection refused", error_type="ConnectionError", retryable=False)
+        err = TransferErrorInfo(message="Connection refused", error_type="ConnectionError", retryable=False)
         d = err.to_dict()
         assert d["message"] == "Connection refused"
         assert d["error_type"] == "ConnectionError"
         assert d["retryable"] is False
 
-        restored = TransferError.from_dict(d)
+        restored = TransferErrorInfo.from_dict(d)
         assert restored.message == "Connection refused"
         assert restored.error_type == "ConnectionError"
         assert restored.retryable is False

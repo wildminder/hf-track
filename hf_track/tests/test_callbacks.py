@@ -1870,3 +1870,223 @@ class TestDownloadProgressTqdmDiagnosticLogging:
         assert "is_xet_cached=True" in branches[0].getMessage()
         assert len(synths) == 1
         assert "final_bytes=1000" in synths[0].getMessage()
+
+class TestZeroByteEstimation:
+    """NTH-001: a zero byte counter must not read as "no progress".
+
+    ``hf_xet`` reports ``total_bytes_completed == 0`` until the first
+    chunk lands on disk, which on a cold cache can be several seconds. A
+    consumer that renders ``bytes_completed`` directly shows a frozen bar
+    that is visibly wrong -- the transfer *is* running -- and then jumps.
+
+    The estimation has to be narrow, and these are the tests that keep it
+    narrow: estimate only when there is a speed to estimate from, and never
+    past the total.
+    """
+
+    @staticmethod
+    def _total_update(**overrides):
+        defaults = {
+            "total_bytes": 10_000,
+            "total_bytes_completed": 0,
+            "total_bytes_completion_rate": 1_000.0,
+            "total_transfer_bytes": 10_000,
+            "total_transfer_bytes_completed": 0,
+            "total_transfer_bytes_completion_rate": 1_000.0,
+        }
+        defaults.update(overrides)
+        update = MagicMock()
+        for key, value in defaults.items():
+            setattr(update, key, value)
+        return update
+
+    @staticmethod
+    def _callback(queue_, *, total_bytes=10_000, elapsed=1.0):
+        cb = XetProgressCallback(
+            filename="test.bin",
+            total_bytes=total_bytes,
+            event_queue=queue_,
+            transfer_id="test-zero-byte",
+        )
+        # Backdate the clock instead of sleeping: the estimate is
+        # speed x elapsed, so the test is about the arithmetic, not timing.
+        cb._start_time = time.time() - elapsed
+        return cb
+
+    @staticmethod
+    def _drain(queue_):
+        events = []
+        while not queue_.empty():
+            events.append(queue_.get_nowait())
+        return events
+
+    def test_zero_byte_counter_with_speed_estimates_progress(self):
+        """Two updates at a non-zero speed both report progress > 0."""
+        q = queue.Queue()
+        cb = self._callback(q, elapsed=1.0)
+        cb._emit = MagicMock()
+
+        cb(self._total_update(), [])
+
+        assert cb._emit.call_count == 1
+        assert cb._emit.call_args.args[0] > 0, (
+            "a zero byte counter with a non-zero speed must still report "
+            "progress"
+        )
+
+    def test_zero_speed_does_not_invent_progress(self):
+        """No speed means nothing to estimate from: report 0, not a guess."""
+        q = queue.Queue()
+        cb = self._callback(q, elapsed=5.0)
+        cb._emit = MagicMock()
+
+        cb(
+            self._total_update(
+                total_bytes_completion_rate=0.0,
+                total_transfer_bytes_completion_rate=0.0,
+            ),
+            [],
+        )
+
+        assert cb._emit.call_args.args[0] == 0, (
+            "with no measured speed the estimate must stay at 0 rather "
+            "than invent bytes"
+        )
+
+    def test_estimate_never_exceeds_total(self):
+        """A long slow stream is capped below 100%."""
+        q = queue.Queue()
+        cb = self._callback(q, total_bytes=1_000, elapsed=1_000.0)
+        cb._emit = MagicMock()
+
+        cb(self._total_update(total_bytes=1_000), [])
+
+        estimated = cb._emit.call_args.args[0]
+        assert estimated <= 1_000
+        assert estimated < 1_000, (
+            "the estimate is capped at 99% so a running transfer never "
+            "displays as finished"
+        )
+
+    def test_real_bytes_win_over_the_estimate(self):
+        """Once the counter is non-zero the estimate must not apply."""
+        q = queue.Queue()
+        cb = self._callback(q, elapsed=10.0)
+        cb._emit = MagicMock()
+
+        cb(self._total_update(total_bytes_completed=4_000), [])
+
+        assert cb._emit.call_args.args[0] == 4_000
+
+    def test_estimate_grows_with_elapsed_time(self):
+        """Two updates later in the transfer estimate further along."""
+        q = queue.Queue()
+        early = self._callback(q, elapsed=1.0)
+        late = self._callback(q, elapsed=4.0)
+        early._emit = MagicMock()
+        late._emit = MagicMock()
+
+        update = self._total_update()
+        early(update, [])
+        late(update, [])
+
+        assert late._emit.call_args.args[0] > early._emit.call_args.args[0]
+
+
+class TestModeIndicator:
+    """NTH-007(a): which transport carried the transfer, on the event.
+
+    The direct Xet path and the ``huggingface_hub`` HTTP fallback emit
+    structurally identical ``ProgressEvent`` rows. A consumer therefore
+    cannot tell why a repo with thousands of files reported no per-file
+    bytes, or why the same download behaved differently on two machines.
+    ``extra["transport"]`` makes that answerable from the event itself.
+
+    The flag is *additive*: an event that did not come from a known
+    transport carries no key, rather than a fabricated claim.
+    """
+
+    @staticmethod
+    def _emit_from_xet_callback():
+        q = queue.Queue()
+        cb = XetProgressCallback(
+            filename="test.bin",
+            total_bytes=1_000,
+            event_queue=q,
+            transfer_id="test-transport",
+        )
+        update = MagicMock()
+        update.total_bytes = 1_000
+        update.total_bytes_completed = 250
+        update.total_bytes_completion_rate = 100.0
+        update.total_transfer_bytes = 1_000
+        update.total_transfer_bytes_completed = 250
+        update.total_transfer_bytes_completion_rate = 100.0
+        cb(update, [])
+        assert not q.empty()
+        return q.get_nowait()
+
+    def test_progress_event_extra_carries_transport_mode(self):
+        """A Xet-backed transfer says so."""
+        from hf_track.types import TRANSPORT_XET
+
+        event = self._emit_from_xet_callback()
+        assert event.extra.get("transport") == TRANSPORT_XET
+
+    def test_http_path_reports_http(self):
+        """The fallback reports the other half of the same vocabulary."""
+        from hf_track.types import TRANSPORT_HTTP, TRANSPORT_XET
+
+        assert TRANSPORT_HTTP == "http"
+        assert TRANSPORT_HTTP != TRANSPORT_XET
+
+    def test_extra_defaults_to_none_for_http_only_trackers(self):
+        """A hand-built event must not claim a transport nobody chose.
+
+        This is the half that matters: if the annotator defaulted to
+        "http", every caller that simply forgot to stamp an event would
+        start displaying a confident, wrong mode.
+        """
+        event = ProgressEvent(
+            event_type=EventType.PROGRESS,
+            transfer_id="t",
+            direction=TransferDirection.DOWNLOAD,
+            filename="f.bin",
+            phase=ProgressPhase.DOWNLOADING,
+        )
+        assert event.extra.get("transport") is None
+
+    def test_annotate_transport_returns_the_same_event(self):
+        """It composes into an expression rather than returning a copy."""
+        from hf_track.types import annotate_transport
+
+        event = ProgressEvent(
+            event_type=EventType.PROGRESS,
+            transfer_id="t",
+            direction=TransferDirection.DOWNLOAD,
+            filename="f.bin",
+            phase=ProgressPhase.DOWNLOADING,
+        )
+        assert annotate_transport(event, "xet") is event
+        assert event.extra["transport"] == "xet"
+
+    def test_extra_survives_serialisation(self):
+        """The flag reaches an SSE consumer, not just an in-process one."""
+        event = self._emit_from_xet_callback()
+        restored = ProgressEvent.from_dict(event.to_dict())
+        assert restored.extra.get("transport") == "xet"
+
+    def test_annotate_transport_does_not_clobber_other_extras(self):
+        """`extra` is shared by every add-on, not owned by this one."""
+        from hf_track.types import annotate_transport
+
+        event = ProgressEvent(
+            event_type=EventType.PROGRESS,
+            transfer_id="t",
+            direction=TransferDirection.DOWNLOAD,
+            filename="f.bin",
+            phase=ProgressPhase.DOWNLOADING,
+            extra={"tenant": "acme"},
+        )
+        annotate_transport(event, "http")
+        assert event.extra == {"tenant": "acme", "transport": "http"}
