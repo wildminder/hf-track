@@ -15,12 +15,56 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from ..token import XetTokenManager
-from ..types import ProgressEvent, generate_transfer_id
+from ..types import EventType, ProgressEvent, generate_transfer_id
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard, never executed
+    from ..subprocess import XetSubprocessRunner
 
 logger = logging.getLogger(__name__)
+
+#: Event kinds after which a transfer id can never be cancelled again, so
+#: any cancellation flag recorded for it is stale and must be dropped.
+TERMINAL_EVENT_TYPES = frozenset(
+    {EventType.COMPLETE, EventType.ERROR, EventType.CANCELLED}
+)
+
+
+class _TrackingEventQueue(queue.Queue):
+    """The tracker's event queue, which forgets cancelled ids as they end.
+
+    ``cancel()`` records a transfer id in ``_cancelled_transfers`` and the
+    public download/upload methods discard it in a ``finally``. That covers
+    every id the caller *hands to a method* — but an id that is cancelled
+    and then reaches a terminal event through some other path (a callback
+    emitted outside a tracked method, a transfer driven purely by a
+    consumer of this queue) is never discarded, and the set grows for the
+    lifetime of the tracker.
+
+    Rather than repeat the discard at every emission site, it lives here:
+    one place, reached by every event no matter who produced it.
+    """
+
+    def __init__(self, tracker: "_TrackerCore", maxsize: int = 0) -> None:
+        super().__init__(maxsize=maxsize)
+        self._tracker = tracker
+
+    def _forget_if_terminal(self, event: object) -> None:
+        if getattr(event, "event_type", None) not in TERMINAL_EVENT_TYPES:
+            return
+        transfer_id = getattr(event, "transfer_id", None)
+        if transfer_id:
+            self._tracker.cleanup_transfer(transfer_id)
+
+    def put(self, item, block: bool = True, timeout=None) -> None:
+        self._forget_if_terminal(item)
+        super().put(item, block, timeout)
+
+    def put_nowait(self, item) -> None:
+        self._forget_if_terminal(item)
+        super().put_nowait(item)
 
 
 class _TrackerCore:
@@ -34,7 +78,9 @@ class _TrackerCore:
         _token: Optional HuggingFace token used for auth.
         _endpoint: Optional custom endpoint URL.
         _report_interval: Seconds between event reports.
-        event_queue: Thread-safe queue of :class:`ProgressEvent`.
+        event_queue: Thread-safe queue of :class:`ProgressEvent`. It is a
+            :class:`_TrackingEventQueue`, which drops a cancelled transfer
+            id when that transfer reaches a terminal event.
         _token_manager: Xet token manager (auto-refresh).
         _cancelled_transfers: Set of transfer IDs the user requested to cancel.
         _lock: Guards ``_cancelled_transfers`` for thread-safety.
@@ -49,7 +95,6 @@ class _TrackerCore:
         self._token = token
         self._endpoint = endpoint
         self._report_interval = report_interval
-        self.event_queue: queue.Queue[ProgressEvent] = queue.Queue(maxsize=10000)
         self._token_manager = XetTokenManager(token, endpoint)
         self._cancelled_transfers: set[str] = set()
         # Plan 2026-06-05 step 3: registry of active
@@ -59,6 +104,11 @@ class _TrackerCore:
         # 1 s poll loop.
         self._active_runners: dict[str, "XetSubprocessRunner"] = {}
         self._lock = threading.Lock()
+        # Built last: the queue's terminal-event hook calls back into
+        # ``cleanup_transfer``, which needs the lock and the set above.
+        self.event_queue: queue.Queue[ProgressEvent] = _TrackingEventQueue(
+            self, maxsize=10000
+        )
 
     def cancel(self, transfer_id: str) -> None:
         """Cancel an active transfer by its transfer_id.

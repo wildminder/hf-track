@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from .results import TransferError
+from .results import TransferErrorInfo
 
 
 class ProgressPhase(str, enum.Enum):
@@ -33,6 +33,32 @@ class TransferDirection(str, enum.Enum):
 
     UPLOAD = "upload"
     DOWNLOAD = "download"
+
+
+#: Values ``ProgressEvent.extra["transport"]`` can take (NTH-007).
+TRANSPORT_XET = "xet"
+TRANSPORT_HTTP = "http"
+
+
+def annotate_transport(event: ProgressEvent, transport: str) -> ProgressEvent:
+    """Record which transport actually carried a transfer, on the event.
+
+    A consumer cannot otherwise tell *why* a transfer was slow or why a
+    file-counted repository reported no per-file bytes: the direct Xet
+    path and the ``huggingface_hub`` HTTP fallback emit structurally
+    identical events. Putting the transport in ``extra`` makes the bar,
+    the web app and any SSE consumer able to say which one they are
+    watching.
+
+    The flag is additive and deliberately optional. A caller that did not
+    go through a known transport leaves ``extra`` without the key rather
+    than having one invented for it -- "we don't know" and "we know it was
+    HTTP" are different claims, and only one of them is safe to display.
+
+    Returns the same event, so it composes into an expression.
+    """
+    event.extra["transport"] = transport
+    return event
 
 
 class EventType(str, enum.Enum):
@@ -90,7 +116,7 @@ class ProgressEvent:
     transfer_bytes_total: int = 0
     transfer_speed: float = 0.0
     dedup_saved_bytes: int = 0
-    error: Optional[TransferError] = None
+    error: Optional[TransferErrorInfo] = None
     timestamp: float = field(default_factory=time.time)
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -145,7 +171,7 @@ class ProgressEvent:
         transfer_id: str,
         direction: TransferDirection,
         filename: str,
-        error: TransferError,
+        error: TransferErrorInfo,
         phase: ProgressPhase = ProgressPhase.ERROR,
         **kwargs,
     ) -> ProgressEvent:
@@ -179,7 +205,7 @@ class ProgressEvent:
             phase=ProgressPhase.ERROR,
             bytes_completed=bytes_completed,
             total_bytes=total_bytes,
-            error=TransferError(message="Transfer cancelled by user", error_type="TransferCancelledError"),
+            error=TransferErrorInfo(message="Transfer cancelled by user", error_type="TransferCancelledError"),
             **kwargs,
         )
 
@@ -224,9 +250,9 @@ class ProgressEvent:
             err_data = data["error"]
             if isinstance(err_data, str):
                 # Backward compatibility for old JSON payloads
-                error_obj = TransferError(message=err_data)
+                error_obj = TransferErrorInfo(message=err_data)
             else:
-                error_obj = TransferError.from_dict(err_data)
+                error_obj = TransferErrorInfo.from_dict(err_data)
 
         return cls(
             event_type=EventType(data["event_type"]),

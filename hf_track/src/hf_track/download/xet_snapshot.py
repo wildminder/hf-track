@@ -21,7 +21,7 @@ from ..types import (
     ProgressPhase,
     TransferCancelledError,
     TransferDirection,
-    TransferError,
+    TransferErrorInfo,
     TransferProgressError,
     generate_transfer_id,
 )
@@ -134,14 +134,12 @@ def download_snapshot_with_xet(
                 )
                 raise TransferCancelledError("Snapshot download cancelled by user")
 
-        if result.get("status") == "success":
+        status = result.get("status")
+        if status == "success":
             return result.get("destination_path", local_dir or repo_id)
-        elif (
-            result.get("status") == "cancelled"
-            or result.get("error_type") == "TransferCancelledError"
-            or "cancelled" in result.get("message", "").lower()
-            or "interrupted" in result.get("message", "").lower()
-        ):
+        elif status == "cancelled":
+            # ``status`` is the only discriminator — see the note in
+            # ``download/xet_file.py``.
             raise TransferCancelledError(result.get("message", "Snapshot download cancelled by user"))
         else:
             error_msg = result.get("message", "Snapshot download failed")
@@ -170,7 +168,7 @@ def download_snapshot_with_xet(
                 direction=TransferDirection.DOWNLOAD,
                 filename=repo_id,
                 phase=ProgressPhase.ERROR,
-                error=TransferError(message=str(e), error_type=type(e).__name__),
+                error=TransferErrorInfo(message=str(e), error_type=type(e).__name__),
             )
         )
         raise

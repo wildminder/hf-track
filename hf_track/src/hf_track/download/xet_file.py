@@ -22,7 +22,7 @@ from ..types import (
     ProgressPhase,
     TransferCancelledError,
     TransferDirection,
-    TransferError,
+    TransferErrorInfo,
     TransferProgressError,
     generate_transfer_id,
 )
@@ -77,7 +77,7 @@ def download_file_with_xet(
     Raises:
         ImportError: If hf_xet is not installed.
         TransferCancelledError: If the transfer is cancelled.
-        TransferError: If the download fails.
+        TransferProgressError: If the download fails.
 
     .. deprecated:: 2026-07-09
         This function uses the legacy ``hf_xet.download_files()`` API
@@ -159,8 +159,13 @@ def download_file_with_xet(
                 )
                 raise TransferCancelledError("Download cancelled by user")
 
-        # Process the result
-        if result.get("status") == "success":
+        # Process the result. ``status`` is the only discriminator: the
+        # worker is the single authority on how the transfer ended, so a
+        # message that merely contains the word "cancelled" (or an
+        # ``error_type`` copied from a different run) must not turn a
+        # failed transfer into a cancelled one.
+        status = result.get("status")
+        if status == "success":
             return XetDownloadResult(
                 success=True,
                 filename=result.get("filename", filename),
@@ -168,12 +173,7 @@ def download_file_with_xet(
                 file_size=result.get("file_size", file_size),
                 transfer_id=transfer_id,
             )
-        elif (
-            result.get("status") == "cancelled"
-            or result.get("error_type") == "TransferCancelledError"
-            or "cancelled" in result.get("message", "").lower()
-            or "interrupted" in result.get("message", "").lower()
-        ):
+        elif status == "cancelled":
             raise TransferCancelledError(result.get("message", "Download cancelled by user"))
         else:
             # Error result from worker
@@ -203,7 +203,7 @@ def download_file_with_xet(
                 direction=TransferDirection.DOWNLOAD,
                 filename=filename,
                 phase=ProgressPhase.ERROR,
-                error=TransferError(message=str(e), error_type=type(e).__name__),
+                error=TransferErrorInfo(message=str(e), error_type=type(e).__name__),
             )
         )
         raise

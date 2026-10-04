@@ -44,8 +44,15 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
-logger = logging.getLogger(__name__)
+from ._retry import (  # noqa: F401  (re-exported for the tests)
+    DEFAULT_RETRY_BASE_DELAY_S,
+    DEFAULT_RETRY_MAX_DELAY_S,
+    RETRYABLE_ERRORS,
+    _sleep_unless_cancelled,
+    retry_with_backoff,
+)
 
+logger = logging.getLogger(__name__)
 
 def download_file_xet_only(
     *,
@@ -64,6 +71,9 @@ def download_file_xet_only(
     report_interval: float = 0.1,
     is_cancelled: Optional[Callable[[], bool]] = None,
     probe_timeout_s: float = 600.0,
+    max_retries: int = 3,
+    retry_base_delay_s: float = DEFAULT_RETRY_BASE_DELAY_S,
+    retry_max_delay_s: float = DEFAULT_RETRY_MAX_DELAY_S,
 ) -> str:
     """Dedicated xet single-file download using the hf_xet Session API.
 
@@ -98,7 +108,7 @@ def download_file_xet_only(
         ProgressEvent,
         ProgressPhase,
         TransferDirection,
-        TransferError,
+        TransferErrorInfo,
         TransferProgressError,
         TransferCancelledError,
     )
@@ -175,13 +185,30 @@ def download_file_xet_only(
         try:
             from huggingface_hub.utils._xet import get_xet_session
 
-            session = get_xet_session()
-            with session.new_file_download_group(
-                token_refresh_url=xet_file_data.refresh_route,
-                token_refresh_headers=headers,
-                custom_headers=xet_headers,
-                progress_callback=progress_callback,
-            ) as group:
+            def _open_group() -> Any:
+                """One attempt at acquiring the session and the group.
+
+                Both live in the retried unit: a session is cheap to
+                rebuild, but a half-opened group is not, so the whole
+                ``with`` block is re-entered rather than just the session
+                lookup.
+                """
+                session = get_xet_session()
+                return session, session.new_file_download_group(
+                    token_refresh_url=xet_file_data.refresh_route,
+                    token_refresh_headers=headers,
+                    custom_headers=xet_headers,
+                    progress_callback=progress_callback,
+                )
+
+            session, group_handle = retry_with_backoff(
+                _open_group,
+                max_retries=max_retries,
+                base_delay_s=retry_base_delay_s,
+                max_delay_s=retry_max_delay_s,
+                sleep=lambda d: _sleep_unless_cancelled(d, is_cancelled),
+            )
+            with group_handle as group:
                 group.start_download_file(
                     _XetFileInfo(file_hash, file_size if file_size else None),
                     dest_abs,
@@ -345,14 +372,14 @@ def _emit_error(event_queue: Any, transfer_id: str, filename: str, err: Exceptio
             ProgressEvent,
             ProgressPhase,
             TransferDirection,
-            TransferError,
+            TransferErrorInfo,
         )
 
         event = ProgressEvent.error_event(
             transfer_id=transfer_id,
             direction=TransferDirection.DOWNLOAD,
             filename=filename,
-            error=TransferError(
+            error=TransferErrorInfo(
                 message=str(err),
                 error_type="XetUnavailable",
             ),
@@ -382,6 +409,9 @@ def download_file_xet_subprocess(
     on_spawn: Optional[Callable[[object], None]] = None,
     on_finish: Optional[Callable[[], None]] = None,
     probe_timeout_s: float = 600.0,
+    max_retries: int = 3,
+    retry_base_delay_s: float = DEFAULT_RETRY_BASE_DELAY_S,
+    retry_max_delay_s: float = DEFAULT_RETRY_MAX_DELAY_S,
 ) -> str:
     """Dedicated xet single-file download run in a TERMINABLE subprocess.
 

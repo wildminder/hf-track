@@ -29,7 +29,7 @@ from ..types import (
     ProgressPhase,
     TransferCancelledError,
     TransferDirection,
-    TransferError,
+    TransferErrorInfo,
     generate_transfer_id,
 )
 
@@ -126,7 +126,7 @@ def upload_file(
                 direction=TransferDirection.UPLOAD,
                 filename=filename,
                 phase=ProgressPhase.ERROR,
-                error=TransferError(message=str(e), error_type=type(e).__name__),
+                error=TransferErrorInfo(message=str(e), error_type=type(e).__name__),
             )
         )
         raise
@@ -270,7 +270,7 @@ def upload_folder(
                 direction=TransferDirection.UPLOAD,
                 filename=f"folder:{os.path.basename(folder_path)}",
                 phase=ProgressPhase.ERROR,
-                error=TransferError(message=str(e), error_type=type(e).__name__),
+                error=TransferErrorInfo(message=str(e), error_type=type(e).__name__),
             )
         )
         raise

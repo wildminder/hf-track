@@ -16,21 +16,44 @@ The class is kept whole in this single module (not split into
   the other
 
 The token lifecycle:
-- **Uploads**: Use ``XetTokenType.WRITE`` to get a repo-level token
-  via ``fetch_xet_connection_info_from_repo_info()``.
-- **Downloads**: Use file-level ``XetFileData`` to get a per-file token
-  via ``refresh_xet_connection_info()``.
+- **Uploads**: Use ``XetTokenType.WRITE`` to build a repo-level
+  token-refresh URL.
+- **Downloads**: Use file-level ``XetFileData`` to get a per-file
+  ``refresh_route``.
+- **Fetching**: Both paths GET that URL through ``huggingface_hub``'s
+  shared HTTP session, which is exactly what the ``*_xet_connection_info``
+  helpers did before ``huggingface_hub`` 1.23.0 removed them.
 - **Token refresh**: Both paths support a ``token_refresher`` callable
   that the Rust runtime calls when the token expires.
-- **Caching**: ``huggingface_hub`` caches tokens internally with a
-  1,000-entry limit and 60-second safety margin before expiry.
 """
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 from .credentials import XetCredentials
+
+
+def _fetch_xet_connection_info(refresh_route: str, headers: dict) -> Any:
+    """GET a Xet token-refresh route and return the decoded payload.
+
+    Replaces ``refresh_xet_connection_info`` /
+    ``fetch_xet_connection_info_from_repo_info``, both removed in
+    ``huggingface_hub`` 1.23.0. The response is the same JSON the removed
+    helpers parsed: ``{"accessToken": ..., "exp": ..., "casUrl": ...}``.
+
+    Args:
+        refresh_route: Absolute URL the Hub serves a CAS token from.
+        headers: Authorization headers for that request.
+
+    Returns:
+        The decoded JSON payload (a dict).
+    """
+    from huggingface_hub.utils._http import get_session
+
+    response = get_session().get(refresh_route, headers=headers or None)
+    response.raise_for_status()
+    return response.json()
 
 
 class XetTokenManager:
@@ -70,6 +93,39 @@ class XetTokenManager:
             self._api = HfApi(token=self._token, endpoint=self._endpoint)
             self._headers = self._api._build_hf_headers()
 
+    # ── Credential acquisition (single path for every direction) ──
+
+    def _repo_refresh_route(self, repo_id: str, repo_type: str, revision: Optional[str]) -> str:
+        """Build the repo-level token-refresh URL for an upload."""
+        from huggingface_hub.utils._xet import (
+            XetTokenType,
+            xet_connection_info_refresh_url,
+        )
+
+        return xet_connection_info_refresh_url(
+            token_type=XetTokenType.WRITE,
+            repo_id=repo_id,
+            repo_type=repo_type,
+            revision=revision,
+            endpoint=self._endpoint,
+        )
+
+    def _fetch(self, refresh_route: str) -> XetCredentials:
+        """Exchange a refresh route for a populated ``XetCredentials``.
+
+        The single place every public fetch method goes through, so a
+        change to the token wire format happens once.
+        """
+        payload = _fetch_xet_connection_info(refresh_route, self._headers or {})
+
+        return XetCredentials(
+            endpoint=payload.get("casUrl") or "",
+            token_info=(
+                payload.get("accessToken") or "",
+                payload.get("exp") or 0,
+            ),
+        )
+
     def fetch_upload_credentials(
         self,
         repo_id: str,
@@ -91,30 +147,13 @@ class XetTokenManager:
         """
         self._ensure_api()
 
-        from huggingface_hub.utils._xet import (
-            XetTokenType,
-            fetch_xet_connection_info_from_repo_info,
+        creds = self._fetch(
+            self._repo_refresh_route(repo_id, repo_type, revision)
         )
-
-        connection_info = fetch_xet_connection_info_from_repo_info(
-            token_type=XetTokenType.WRITE,
-            repo_id=repo_id,
-            repo_type=repo_type,
-            revision=revision,
-            headers=self._headers,
-            endpoint=self._endpoint,
+        creds.token_refresher = self.fetch_upload_token_refresher(
+            repo_id, repo_type, revision
         )
-
-        return XetCredentials(
-            endpoint=connection_info.endpoint,
-            token_info=(
-                connection_info.access_token,
-                connection_info.expiration_unix_epoch,
-            ),
-            token_refresher=self.fetch_upload_token_refresher(
-                repo_id, repo_type, revision
-            ),
-        )
+        return creds
 
     def fetch_upload_token_refresher(
         self,
@@ -136,22 +175,11 @@ class XetTokenManager:
         Returns:
             A callable that returns (access_token, expiration_unix_epoch).
         """
-        from huggingface_hub.utils._xet import (
-            XetTokenType,
-            fetch_xet_connection_info_from_repo_info,
-        )
+        self._ensure_api()
+        refresh_route = self._repo_refresh_route(repo_id, repo_type, revision)
 
         def token_refresher():
-            self._ensure_api()
-            info = fetch_xet_connection_info_from_repo_info(
-                token_type=XetTokenType.WRITE,
-                repo_id=repo_id,
-                repo_type=repo_type,
-                revision=revision,
-                headers=self._headers,
-                endpoint=self._endpoint,
-            )
-            return info.access_token, info.expiration_unix_epoch
+            return self._fetch(refresh_route).token_info
 
         return token_refresher
 
@@ -171,21 +199,9 @@ class XetTokenManager:
         """
         self._ensure_api()
 
-        from huggingface_hub.utils._xet import refresh_xet_connection_info
-
-        connection_info = refresh_xet_connection_info(
-            file_data=xet_file_data,
-            headers=self._headers,
-        )
-
-        return XetCredentials(
-            endpoint=connection_info.endpoint,
-            token_info=(
-                connection_info.access_token,
-                connection_info.expiration_unix_epoch,
-            ),
-            token_refresher=self.fetch_download_token_refresher(xet_file_data),
-        )
+        creds = self._fetch(xet_file_data.refresh_route)
+        creds.token_refresher = self.fetch_download_token_refresher(xet_file_data)
+        return creds
 
     def fetch_download_token_refresher(
         self, xet_file_data
@@ -198,14 +214,10 @@ class XetTokenManager:
         Returns:
             A callable that returns (access_token, expiration_unix_epoch).
         """
-        from huggingface_hub.utils._xet import refresh_xet_connection_info
+        self._ensure_api()
+        refresh_route = xet_file_data.refresh_route
 
         def token_refresher():
-            self._ensure_api()
-            info = refresh_xet_connection_info(
-                file_data=xet_file_data,
-                headers=self._headers,
-            )
-            return info.access_token, info.expiration_unix_epoch
+            return self._fetch(refresh_route).token_info
 
         return token_refresher

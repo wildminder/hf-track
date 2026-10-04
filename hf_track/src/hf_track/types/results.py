@@ -2,7 +2,7 @@
 
 This module groups all *result envelope* types -- the structured objects
 returned from a transfer operation. ``TransferResult`` is the universal
-result; ``TransferError`` is the structured error payload embedded in
+result; ``TransferErrorInfo`` is the structured error payload embedded in
 ``ProgressEvent`` and returned from failed transfers.
 
 Note: ``XetDownloadResult`` and ``XetUploadResult`` live alongside their
@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional
 
 
 @dataclass
-class TransferError:
+class TransferErrorInfo:
     """Structured error information for failed transfers."""
 
     message: str
@@ -41,7 +41,7 @@ class TransferError:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> TransferError:
+    def from_dict(cls, data: Dict[str, Any]) -> TransferErrorInfo:
         return cls(
             message=data.get("message", "Unknown error"),
             error_type=data.get("error_type", "Exception"),

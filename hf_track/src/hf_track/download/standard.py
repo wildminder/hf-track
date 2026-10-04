@@ -17,8 +17,10 @@ from ..types import (
     ProgressEvent,
     ProgressPhase,
     TransferCancelledError,
+    TRANSPORT_HTTP,
     TransferDirection,
-    TransferError,
+    TransferErrorInfo,
+    annotate_transport,
     generate_transfer_id,
 )
 
@@ -68,14 +70,14 @@ def download_file(
     )
 
     event_queue.put(
-        ProgressEvent(
+        annotate_transport(ProgressEvent(
             event_type=EventType.START,
             transfer_id=transfer_id,
             direction=TransferDirection.DOWNLOAD,
             filename=filename,
             phase=ProgressPhase.DOWNLOADING,
             total_bytes=0,
-        )
+        ), TRANSPORT_HTTP)
     )
 
     try:
@@ -116,14 +118,14 @@ def download_file(
         raise
     except Exception as e:
         event_queue.put(
-            ProgressEvent(
+            annotate_transport(ProgressEvent(
                 event_type=EventType.ERROR,
                 transfer_id=transfer_id,
                 direction=TransferDirection.DOWNLOAD,
                 filename=filename,
                 phase=ProgressPhase.ERROR,
-                error=TransferError(message=str(e), error_type=type(e).__name__),
-            )
+                error=TransferErrorInfo(message=str(e), error_type=type(e).__name__),
+            ), TRANSPORT_HTTP)
         )
         raise
     finally:
@@ -181,7 +183,7 @@ def download_snapshot(
         # huggingface_hub's _AggregatedTqdm never calls .close() on the byte tracking bar.
         stats = state_manager.get_state(transfer_id)
         event_queue.put(
-            ProgressEvent(
+            annotate_transport(ProgressEvent(
                 event_type=EventType.COMPLETE,
                 transfer_id=transfer_id,
                 direction=TransferDirection.DOWNLOAD,
@@ -192,7 +194,7 @@ def download_snapshot(
                 percentage=100.0,
                 file_index=stats.get("files_completed", 0),
                 total_files=stats.get("total_files", 0),
-            )
+            ), TRANSPORT_HTTP)
         )
         return result
 
@@ -222,14 +224,14 @@ def download_snapshot(
         raise
     except Exception as e:
         event_queue.put(
-            ProgressEvent(
+            annotate_transport(ProgressEvent(
                 event_type=EventType.ERROR,
                 transfer_id=transfer_id,
                 direction=TransferDirection.DOWNLOAD,
                 filename=f"{repo_id}",
                 phase=ProgressPhase.ERROR,
-                error=TransferError(message=str(e), error_type=type(e).__name__),
-            )
+                error=TransferErrorInfo(message=str(e), error_type=type(e).__name__),
+            ), TRANSPORT_HTTP)
         )
         raise
     finally:

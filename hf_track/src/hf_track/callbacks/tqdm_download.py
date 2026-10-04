@@ -17,9 +17,11 @@ The class is in its own module to:
 
 1. Make its public surface (``DownloadProgressTqdm``) the only thing
    the rest of the package needs to import.
-2. Keep the diagnostic instrumentation (gated on
-   ``HF_TRACK_DEBUG_XET``) co-located with the code it instruments, so
-   the env-var can be removed cleanly in a future cleanup.
+2. Keep the diagnostic instrumentation co-located with the code it
+   instruments. Every record goes through the module-level :func:`_diag`
+   helper, which is gated on a single env var
+   (``DIAG_ENV_VAR``) — so removing the instrumentation later is one
+   deletion instead of an edit inside every instrumented method.
 3. Separate it from the unrelated Xet callback family and the upload
    patcher.
 """
@@ -27,7 +29,9 @@ The class is in its own module to:
 from __future__ import annotations
 
 import logging
+import os
 import queue
+import threading
 import time
 from typing import Callable, Optional
 
@@ -44,6 +48,40 @@ from .state import state_manager
 from .xet_callback import _dummy_file
 
 logger = logging.getLogger(__name__)
+
+#: Name of the environment variable that turns on the temporary
+#: instrumentation emitted by :func:`_diag`.
+DIAG_ENV_VAR = "HF_TRACK_DEBUG_XET"
+
+
+def _diag(event: str, **fields: object) -> None:
+    """Emit one temporary instrumentation record, gated on the env var.
+
+    Every diagnostic in this module routes through this helper so that
+    enabling, disabling, or deleting the instrumentation is a single edit
+    (:func:`_diag_enabled` plus this body) rather than an edit inside
+    every instrumented method.
+
+    The env var is read on each call rather than captured at import, so
+    the gate also works for interpreters that set it after this module is
+    loaded (the test suite, and the in-process worker entry points).
+
+    Diagnostics must never break a download: the formatting is wrapped so
+    a failure to log is swallowed, and nothing is raised.
+    """
+    if not _diag_enabled():
+        return
+    try:
+        rendered = " ".join(f"{k}={v}" for k, v in fields.items())
+        logger.debug("[DIAG-%s] pid=%d tid=%s %s", event, os.getpid(),
+                     threading.get_ident(), rendered)
+    except Exception as exc:  # pragma: no cover - diagnostics are best-effort
+        logger.debug("[DIAG-%s] failed to log: %s", event, exc)
+
+
+def _diag_enabled() -> bool:
+    """Return True when the instrumentation env var is set to a non-empty value."""
+    return bool(os.environ.get(DIAG_ENV_VAR))
 
 
 class DownloadProgressTqdm(base_tqdm):
@@ -94,26 +132,16 @@ class DownloadProgressTqdm(base_tqdm):
             )
 
         # ── DIAG: temporary instrumentation (Phase 0.1) ──────────────
-        import os as _os
-        if _os.environ.get("HF_TRACK_DEBUG_XET"):
-            try:
-                import threading as _thr
-                logger.debug(
-                    "[DIAG-INIT] pid=%d tid=%s id=%s total=%s unit=%s desc=%s "
-                    "is_bytes_bar=%s event_queue_is_none=%s has_cancel_hook=%s",
-                    _os.getpid(),
-                    _thr.get_ident(),
-                    id(self),
-                    getattr(self, "total", None),
-                    getattr(self, "unit", None),
-                    getattr(self, "desc", None),
-                    self.is_bytes_bar,
-                    self._event_queue is None,
-                    self._is_cancelled is not None,
-                )
-            except Exception as _e:
-                logger.debug("[DIAG-INIT] failed to log: %s", _e)
-        # ── END DIAG ─────────────────────────────────────────────────
+        _diag(
+            "INIT",
+            id=id(self),
+            total=getattr(self, "total", None),
+            unit=getattr(self, "unit", None),
+            desc=getattr(self, "desc", None),
+            is_bytes_bar=self.is_bytes_bar,
+            event_queue_is_none=self._event_queue is None,
+            has_cancel_hook=self._is_cancelled is not None,
+        )
 
     def _should_throttle(
         self,
@@ -147,25 +175,16 @@ class DownloadProgressTqdm(base_tqdm):
         return bytes_delta < min_delta
 
     def update(self, n=1):
-        # ── DIAG: temporary instrumentation (Phase 0.2) ──────────────
-        import os as _os
-        _diag = _os.environ.get("HF_TRACK_DEBUG_XET")
-        if _diag:
-            try:
-                import threading as _thr
-                _total_pre = getattr(self, "total", 0) or 0
-                _n_pre = getattr(self, "n", 0)
-                logger.debug(
-                    "[DIAG-UPDATE-ENTRY] pid=%d tid=%s id=%s n=%s prev_n=%s "
-                    "n_pre=%s total=%s is_bytes_bar=%s is_cancelled_hook=%s",
-                    _os.getpid(), _thr.get_ident(), id(self),
-                    n, self._prev_n, _n_pre, _total_pre,
-                    getattr(self, "is_bytes_bar", False),
-                    bool(self._is_cancelled and self._is_cancelled()),
-                )
-            except Exception:
-                pass
-        # ── END DIAG (entry) ─────────────────────────────────────────
+        # ── DIAG: update entry ───────────────────────────────────────
+        _diag(
+            "UPDATE-ENTRY",
+            id=id(self),
+            n=n,
+            prev_n=self._prev_n,
+            total=getattr(self, "total", 0) or 0,
+            is_bytes_bar=getattr(self, "is_bytes_bar", False),
+            is_cancelled_hook=bool(self._is_cancelled and self._is_cancelled()),
+        )
 
         if self._is_cancelled is not None and self._is_cancelled():
             raise TransferCancelledError("Transfer cancelled by user")
@@ -184,15 +203,12 @@ class DownloadProgressTqdm(base_tqdm):
         result = super().update(n)
 
         # ── DIAG: post-super().update() ─────────────────────────────
-        if _diag:
-            try:
-                logger.debug(
-                    "[DIAG-UPDATE-POST-SUPER] pid=%d n=%s self.n=%s total=%s",
-                    _os.getpid(), n, getattr(self, "n", 0), getattr(self, "total", 0),
-                )
-            except Exception:
-                pass
-        # ── END DIAG ─────────────────────────────────────────────────
+        _diag(
+            "UPDATE-POST-SUPER",
+            n=n,
+            self_n=getattr(self, "n", 0),
+            total=getattr(self, "total", 0),
+        )
 
         if n == 0:
             return result
@@ -208,16 +224,15 @@ class DownloadProgressTqdm(base_tqdm):
             # Correct: self.n was (prev_n + n), should be just n.
             if total_val > 0 and n > remaining and current_n > total_val:
                 # ── DIAG: absolute correction fired ───────────────────
-                if _diag:
-                    try:
-                        logger.debug(
-                            "[DIAG-ABS-CORRECTION] pid=%s n=%s prev_n=%s "
-                            "old_self_n=%s new_self_n=%s total=%s remaining=%s",
-                            _os.getpid(), n, prev_n, current_n, n, total_val, remaining,
-                        )
-                    except Exception:
-                        pass
-                # ── END DIAG ─────────────────────────────────────────
+                _diag(
+                    "ABS-CORRECTION",
+                    n=n,
+                    prev_n=prev_n,
+                    old_self_n=current_n,
+                    new_self_n=n,
+                    total=total_val,
+                    remaining=remaining,
+                )
                 # Reset to the absolute position
                 setattr(self, "n", n)
                 current_n = n
@@ -278,17 +293,12 @@ class DownloadProgressTqdm(base_tqdm):
         # Throttle: skip emitting if too soon and too little change
         if self._should_throttle(agg_bytes_completed, agg_total_bytes, now):
             # ── DIAG: throttled ──────────────────────────────────────
-            if _diag:
-                try:
-                    logger.debug(
-                        "[DIAG-THROTTLED] pid=%s agg_bytes=%s agg_total=%s "
-                        "first_emitted=%s",
-                        _os.getpid(), agg_bytes_completed, agg_total_bytes,
-                        self._first_event_emitted,
-                    )
-                except Exception:
-                    pass
-            # ── END DIAG ─────────────────────────────────────────────
+            _diag(
+                "THROTTLED",
+                agg_bytes=agg_bytes_completed,
+                agg_total=agg_total_bytes,
+                first_emitted=self._first_event_emitted,
+            )
             return result
 
         speed = getattr(self, "format_dict", {}).get("rate") or 0
@@ -314,16 +324,14 @@ class DownloadProgressTqdm(base_tqdm):
         self._last_emit_bytes = agg_bytes_completed
         self._first_event_emitted = True
 
-        # ── DIAG: emit-success ─────────────────────────────────────
-        if _diag:
-            try:
-                logger.debug(
-                    "[DIAG-EMIT] pid=%s event_type=PROGRESS bytes=%s total=%s pct=%.2f",
-                    _os.getpid(), agg_bytes_completed, agg_total_bytes, percentage,
-                )
-            except Exception:
-                pass
-        # ── END DIAG ───────────────────────────────────────────────
+# ── DIAG: emit-success ─────────────────────────────────────
+        _diag(
+            "EMIT",
+            event_type=EventType.PROGRESS.name,
+            bytes=agg_bytes_completed,
+            total=agg_total_bytes,
+            pct=f"{percentage:.2f}",
+        )
         return result
 
     def _emit_event(self, event: ProgressEvent) -> None:
@@ -335,87 +343,55 @@ class DownloadProgressTqdm(base_tqdm):
         If ``self._event_queue`` is ``None``, the event is silently dropped
         (useful when a subclass overrides this method to route elsewhere).
         """
-        # ── DIAG: temporary instrumentation (Phase 0.3) ──────────────
-        import os as _os
-        _diag = _os.environ.get("HF_TRACK_DEBUG_XET")
-        if _diag:
-            try:
-                import threading as _thr
-                _d_size = -1
-                try:
-                    _d = event.to_dict()
-                    _d_size = len(_d)
-                except Exception as _td:
-                    _d_size = -1
-                    logger.debug(
-                        "[DIAG-EMIT-EVENT-DICT-FAIL] pid=%s tid=%s err=%s",
-                        _os.getpid(), _thr.get_ident(), _td,
-                    )
-                logger.debug(
-                    "[DIAG-EMIT-EVENT] pid=%s tid=%s event_type=%s "
-                    "bytes=%s total=%s dict_size=%s queue_is_none=%s",
-                    _os.getpid(), _thr.get_ident(),
-                    event.event_type.value, event.bytes_completed,
-                    event.total_bytes, _d_size,
-                    self._event_queue is None,
-                )
-            except Exception as _e:
-                logger.debug("[DIAG-EMIT-EVENT] log failed: %s", _e)
-        # ── END DIAG ─────────────────────────────────────────────────
+        # ── DIAG: emission into the queue ──────────────────────────
+        dict_size = -1
+        try:
+            dict_size = len(event.to_dict())
+        except Exception as exc:
+            _diag("EMIT-EVENT-DICT-FAIL", error=f"{type(exc).__name__}: {exc}")
+        _diag(
+            "EMIT-EVENT",
+            event_type=event.event_type.value,
+            bytes=event.bytes_completed,
+            total=event.total_bytes,
+            dict_size=dict_size,
+            queue_is_none=self._event_queue is None,
+        )
 
         if self._event_queue is None:
             return
 
-        # ── DIAG: capture put_nowait outcome ────────────────────────
-        if _diag:
-            try:
-                self._event_queue.put_nowait(event)
-                logger.debug(
-                    "[DIAG-EMIT-PUT-OK] pid=%s event_type=%s",
-                    _os.getpid(), event.event_type.value,
-                )
-            except queue.Full:
-                logger.debug(
-                    "[DIAG-EMIT-PUT-FULL] pid=%s event_type=%s",
-                    _os.getpid(), event.event_type.value,
-                )
-                logger.warning(
-                    "Download progress event queue full — dropping %s event",
-                    event.event_type.value,
-                )
-            except BaseException as _put_err:  # DIAG: catch ALL
-                logger.debug(
-                    "[DIAG-EMIT-PUT-ERR] pid=%s err_type=%s err=%s",
-                    _os.getpid(), type(_put_err).__name__, _put_err,
-                )
-                # Re-raise so we can see if the in-process path propagates
-                raise
-            return
-        # ── END DIAG (with put) ──────────────────────────────────────
-
-        # Non-DIAG path: original behavior
         try:
             self._event_queue.put_nowait(event)
+            _diag("EMIT-PUT-OK", event_type=event.event_type.value)
         except queue.Full:
-            logger.warning("Download progress event queue full — dropping %s event", event.event_type.value)
+            _diag("EMIT-PUT-FULL", event_type=event.event_type.value)
+            logger.warning(
+                "Download progress event queue full — dropping %s event",
+                event.event_type.value,
+            )
+        except BaseException as put_err:
+            # Not a full queue — something else is wrong with the queue
+            # object itself. Log it, then let it propagate: swallowing it
+            # here would turn a broken queue into a silently stalled bar.
+            _diag(
+                "EMIT-PUT-ERR",
+                err_type=type(put_err).__name__,
+                err=put_err,
+            )
+            raise
 
     def close(self):
-        # ── DIAG: temporary instrumentation (Phase 0.4) ──────────────
-        import os as _os
-        _diag = _os.environ.get("HF_TRACK_DEBUG_XET")
-        if _diag:
-            try:
-                logger.debug(
-                    "[DIAG-CLOSE-ENTRY] pid=%s id=%s n=%s total=%s "
-                    "is_bytes_bar=%s event_queue_is_none=%s closed=%s",
-                    _os.getpid(), id(self),
-                    getattr(self, "n", 0), getattr(self, "total", 0),
-                    getattr(self, "is_bytes_bar", False),
-                    self._event_queue is None, self._closed,
-                )
-            except Exception:
-                pass
-        # ── END DIAG ─────────────────────────────────────────────────
+        # ── DIAG: close entry ──────────────────────────────────────
+        _diag(
+            "CLOSE-ENTRY",
+            id=id(self),
+            n=getattr(self, "n", 0),
+            total=getattr(self, "total", 0),
+            is_bytes_bar=getattr(self, "is_bytes_bar", False),
+            event_queue_is_none=self._event_queue is None,
+            closed=self._closed,
+        )
 
         if self._closed:
             super().close()
@@ -434,16 +410,13 @@ class DownloadProgressTqdm(base_tqdm):
             is_xet_cached = n_val == 0 and total_val > 0
 
             # ── DIAG: branch decision ────────────────────────────────
-            if _diag:
-                try:
-                    logger.debug(
-                        "[DIAG-CLOSE-BRANCH] pid=%s is_complete=%s "
-                        "is_xet_cached=%s n_val=%s total_val=%s",
-                        _os.getpid(), is_complete, is_xet_cached, n_val, total_val,
-                    )
-                except Exception:
-                    pass
-            # ── END DIAG ─────────────────────────────────────────────
+            _diag(
+                "CLOSE-BRANCH",
+                is_complete=is_complete,
+                is_xet_cached=is_xet_cached,
+                n_val=n_val,
+                total_val=total_val,
+            )
 
             if is_complete or is_xet_cached:
                 final_bytes = total_val if is_xet_cached else n_val
@@ -453,18 +426,14 @@ class DownloadProgressTqdm(base_tqdm):
                     total_files if total_files > 0 else state.get("files_completed", 0)
                 )
 
-                # ── DIAG: synthesize COMPLETE ──────────────────────────
-                if _diag:
-                    try:
-                        logger.debug(
-                            "[DIAG-CLOSE-SYNTH-COMPLETE] pid=%s final_bytes=%s "
-                            "total_bytes=%s files_completed=%s total_files=%s",
-                            _os.getpid(), final_bytes, total_val,
-                            files_completed, total_files,
-                        )
-                    except Exception:
-                        pass
-                # ── END DIAG ─────────────────────────────────────────
+                # ── DIAG: synthesized COMPLETE ──────────────────────────
+                _diag(
+                    "CLOSE-SYNTH-COMPLETE",
+                    final_bytes=final_bytes,
+                    total_bytes=total_val,
+                    files_completed=files_completed,
+                    total_files=total_files,
+                )
 
                 event = ProgressEvent(
                     event_type=EventType.COMPLETE,

@@ -27,11 +27,13 @@ import time
 from typing import Callable, Optional
 
 from ..types import (
+    TRANSPORT_XET,
     EventType,
     ProgressEvent,
     ProgressPhase,
     TransferCancelledError,
     TransferDirection,
+    annotate_transport,
 )
 
 logger = logging.getLogger(__name__)
@@ -214,6 +216,7 @@ class XetProgressCallback:
             transfer_speed=transfer_speed if include_transfer_stats else 0,
             dedup_saved_bytes=dedup_saved,
         )
+        annotate_transport(event, TRANSPORT_XET)
         try:
             self.event_queue.put_nowait(event)
         except queue.Full:

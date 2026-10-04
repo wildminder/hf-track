@@ -93,7 +93,22 @@ def render_progress_line(event: ProgressEvent, bar_width: int = 30) -> str:
     if event.dedup_saved_bytes > 0:
         dedup_str = f"dedup:{format_bytes(event.dedup_saved_bytes)} saved"
 
+    # NTH-007(b): which transport carried this transfer. The direct Xet
+    # path and the huggingface_hub HTTP fallback emit identical event
+    # shapes, so without this a reader cannot tell a dedup-fast Xet
+    # download from a slow HTTP one -- or explain why one repo shows
+    # per-file counts and another does not.
+    #
+    # Rendered only when the event says, and left blank otherwise: an
+    # absent flag means "unknown", which must not be displayed as "http".
+    transport = (event.extra or {}).get("transport")
+    mode_str = ""
+    if transport:
+        mode_str = f"[{str(transport).upper()}]"
+
     parts = [f"{label} {bar} {pct} {byte_str}"]
+    if mode_str:
+        parts.insert(0, mode_str)
     if speed_str:
         parts.append(speed_str)
     if net_str:
@@ -214,7 +229,7 @@ class ConsoleProgressDisplay:
             
             error_msg = "Unknown error"
             if event.error:
-                # Handle new structured TransferError object
+                # Handle new structured TransferErrorInfo object
                 error_msg = event.error.message if hasattr(event.error, 'message') else str(event.error)
                 
             line = f"  [ERR] {error_msg}"

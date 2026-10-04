@@ -28,10 +28,25 @@ import threading
 import warnings
 from typing import Any, Callable, Dict, Optional
 
-from ..types import EventType, ProgressEvent, TransferError
+from ..types import EventType, ProgressEvent, TransferErrorInfo
 from .messages import MSG_EVENT, SubprocessMessage
 
 logger = logging.getLogger(__name__)
+
+
+def _signal_cancel(cancel_event: Optional[mp.Event]) -> None:
+    """Best-effort ``cancel_event.set()`` on a possibly dead handle.
+
+    The handle belongs to a child that may already have exited, which can
+    leave a broken mp primitive behind; a failure here must not abort
+    termination.
+    """
+    if cancel_event is None:
+        return
+    try:
+        cancel_event.set()
+    except Exception:
+        pass
 
 
 class XetSubprocessRunner:
@@ -70,6 +85,11 @@ class XetSubprocessRunner:
         self._terminate_timeout = terminate_timeout
         self._kill_timeout = kill_timeout
         self._lock = threading.Lock()
+        # Bumped by every ``start()``. ``terminate()`` clears the process
+        # references only if the generation it snapshotted is still current,
+        # so a ``start()`` issued while ``terminate()`` was joining the old
+        # child is not clobbered by that older call (CRIT-012).
+        self._generation = 0
 
     def start(
         self,
@@ -92,6 +112,7 @@ class XetSubprocessRunner:
             if self._process is not None and self._process.is_alive():
                 raise RuntimeError("A subprocess is already running. Call terminate() first.")
 
+            self._generation += 1
             self._event_queue = event_queue
             self._stop_event.clear()
             self._result = None
@@ -192,14 +213,7 @@ class XetSubprocessRunner:
                 # Translate SubprocessMessage → ProgressEvent
                 try:
                     event = ProgressEvent.from_dict(msg.payload)
-                    if self._event_queue is not None:
-                        try:
-                            self._event_queue.put_nowait(event)
-                        except queue.Full:
-                            logger.warning(
-                                "Event queue full — dropping %s event for %s",
-                                event.event_type.value, event.filename,
-                            )
+                    self._enqueue_event(event)
                 except Exception as e:
                     logger.warning("Failed to translate event message: %s", e)
 
@@ -220,6 +234,79 @@ class XetSubprocessRunner:
                 # Emit CANCELLED event
                 self._emit_cancelled_from_payload(msg.payload)
                 break
+
+    def _enqueue_event(self, event: ProgressEvent) -> None:
+        """Put ``event`` on the consumer queue, never blocking the relay.
+
+        A full queue used to mean "log and discard", which silently threw
+        away progress updates and -- worse -- a terminal event a final
+        progress bar depends on. Instead:
+
+        * a PROGRESS event evicts the superseded PROGRESS event already
+          queued for the same transfer, so a slow consumer sees the latest
+          byte count rather than a stale one;
+        * a terminal event (COMPLETE/ERROR/CANCELLED) evicts whatever is
+          queued, because dropping one leaves the UI stuck forever.
+
+        Only when neither eviction applies -- a full queue of unrelated
+        events -- is the new event dropped, as before.
+        """
+        target = self._event_queue
+        if target is None:
+            return
+
+        try:
+            target.put_nowait(event)
+            return
+        except queue.Full:
+            pass
+
+        evicted = self._evict_for(event)
+        if not evicted:
+            logger.warning(
+                "Event queue full — dropping %s event for %s",
+                event.event_type.value, event.filename,
+            )
+            return
+        try:
+            target.put_nowait(event)
+        except queue.Full:
+            logger.warning(
+                "Event queue refilled — dropping %s event for %s",
+                event.event_type.value, event.filename,
+            )
+
+    def _evict_for(self, event: ProgressEvent) -> bool:
+        """Free one queue slot for ``event`` if the queued event may be lost.
+
+        Returns True when a slot was freed (or was not needed), False when
+        the queue head must be preserved and the caller should drop.
+        """
+        target = self._event_queue
+        if target is None:
+            return False
+        try:
+            queued = target.get_nowait()
+        except queue.Empty:
+            return True
+
+        if event.event_type is not EventType.PROGRESS:
+            # Terminal event: the consumer is waiting on this one, so the
+            # queued event is the one that goes.
+            return True
+        if (
+            queued.event_type is EventType.PROGRESS
+            and queued.transfer_id == event.transfer_id
+        ):
+            # ``queued`` is a superseded progress report for the same transfer.
+            return True
+        # Unrelated event: put the slot back and report "no slot".
+        try:
+            target.put_nowait(queued)
+        except queue.Full:  # pragma: no cover - the slot we took is ours
+            logger.warning("Lost a %s event for %s while coalescing",
+                           queued.event_type.value, queued.filename)
+        return False
 
     def _synthesize_result_if_missing(self) -> None:
         """If the worker process exited without sending a terminal message
@@ -280,8 +367,7 @@ class XetSubprocessRunner:
                 if msg.is_event:
                     try:
                         event = ProgressEvent.from_dict(msg.payload)
-                        if self._event_queue is not None:
-                            self._event_queue.put_nowait(event)
+                        self._enqueue_event(event)
                     except Exception:
                         pass
                 elif msg.is_terminal:
@@ -325,7 +411,7 @@ class XetSubprocessRunner:
                 file_index=payload.get("files_completed", 0),
                 total_files=payload.get("total_files", 0),
             )
-            self._event_queue.put(event)
+            self._enqueue_event(event)
         except Exception as e:
             logger.warning("Failed to emit COMPLETE event: %s", e)
 
@@ -341,13 +427,13 @@ class XetSubprocessRunner:
                 direction=TransferDirection(payload.get("direction", "download")),
                 filename=payload.get("filename", ""),
                 phase=ProgressPhase.ERROR,
-                error=TransferError(
+                error=TransferErrorInfo(
                     message=payload.get("message", "Unknown error"),
                     error_type=payload.get("error_type", "Exception"),
                     retryable=payload.get("retryable", False),
                 ),
             )
-            self._event_queue.put(event)
+            self._enqueue_event(event)
         except Exception as e:
             logger.warning("Failed to emit ERROR event: %s", e)
 
@@ -363,7 +449,7 @@ class XetSubprocessRunner:
                 bytes_completed=payload.get("bytes_completed", 0),
                 total_bytes=payload.get("total_bytes", 0),
             )
-            self._event_queue.put(event)
+            self._enqueue_event(event)
         except Exception as e:
             logger.warning("Failed to emit CANCELLED event: %s", e)
 
@@ -412,73 +498,82 @@ class XetSubprocessRunner:
                 behavior for existing callers).
 
         Always safe to call — no-op if no process is running.
+
+        The lock is held only while snapshotting the child references and
+        setting the stop event; the joins run outside it. Holding it across
+        the joins blocked ``pid``, ``exitcode``, ``is_alive()`` and
+        ``request_cancel()`` for the whole termination window, including the
+        ``terminate_timeout``/``kill_timeout`` waits.
         """
         with self._lock:
-            # Stop the relay thread (always, regardless of which phase)
             self._stop_event.set()
+            process = self._process
+            cancel_event = self._cancel_event
+            relay_thread = self._relay_thread
+            generation = self._generation
 
-            if self._process is not None:
-                # === Phase 1: cooperative exit (only if grace > 0) ===
-                if grace and grace > 0:
-                    # Signal cancellation first
-                    if self._cancel_event is not None:
-                        try:
-                            self._cancel_event.set()
-                        except Exception:
-                            pass
-                    if self._process.is_alive():
-                        self._process.join(timeout=grace)
-                    if not self._process.is_alive():
-                        # Child exited cooperatively — clean up and return.
-                        if self._relay_thread is not None and self._relay_thread.is_alive():
-                            self._relay_thread.join(timeout=2.0)
-                        self._process = None
-                        self._mp_queue = None
-                        self._cancel_event = None
-                        self._relay_thread = None
-                        return
-                    # Child is still alive after grace period — fall through
-                    # to the hard phase (SIGTERM).
+        if process is not None:
+            # === Phase 1: cooperative exit (only if grace > 0) ===
+            cooperative_exit = False
+            if grace and grace > 0:
+                # Signal cancellation first
+                _signal_cancel(cancel_event)
+                if process.is_alive():
+                    process.join(timeout=grace)
+                cooperative_exit = not process.is_alive()
 
+            if not cooperative_exit:
                 # === Phase 2: hard terminate (SIGTERM → SIGKILL) ===
                 # If grace was provided, the cancel_event was already
                 # set in phase 1; if grace was None, set it now so the
                 # child can still observe the cancel between chunks
                 # before SIGTERM lands.
-                if self._cancel_event is not None and not (grace and grace > 0):
-                    try:
-                        self._cancel_event.set()
-                    except Exception:
-                        pass
+                if not (grace and grace > 0):
+                    _signal_cancel(cancel_event)
 
-                if self._process.is_alive():
-                    logger.debug("Terminating subprocess pid=%d", self._process.pid)
-                    self._process.terminate()
-                    self._process.join(timeout=self._terminate_timeout)
+                if process.is_alive():
+                    logger.debug("Terminating subprocess pid=%d", process.pid)
+                    process.terminate()
+                    process.join(timeout=self._terminate_timeout)
 
-                    if self._process.is_alive():
+                    if process.is_alive():
                         logger.warning(
                             "Subprocess pid=%d did not terminate in %.1fs — killing",
-                            self._process.pid,
+                            process.pid,
                             self._terminate_timeout,
                         )
-                        self._process.kill()
-                        self._process.join(timeout=self._kill_timeout)
+                        process.kill()
+                        process.join(timeout=self._kill_timeout)
 
-                    if self._process.is_alive():
+                    if process.is_alive():
                         logger.error(
                             "Subprocess pid=%d could not be killed!",
-                            self._process.pid,
+                            process.pid,
                         )
 
-                # Wait for relay thread to finish
-                if self._relay_thread is not None and self._relay_thread.is_alive():
-                    self._relay_thread.join(timeout=2.0)
+        # Wait for relay thread to finish
+        if relay_thread is not None and relay_thread.is_alive():
+            relay_thread.join(timeout=2.0)
 
-                # Clean up process reference
-                self._process = None
+        self._release(generation)
 
-            # Clean up mp objects
+    def _release(self, generation: int) -> None:
+        """Drop the child references captured at ``generation``.
+
+        The second, short acquisition is what makes a concurrent
+        ``start()`` safe: it bumps ``_generation``, so this call sees the
+        mismatch and leaves the freshly started process alone instead of
+        clearing references that now belong to it.
+        """
+        with self._lock:
+            if generation != self._generation:
+                logger.debug(
+                    "Skipping stale cleanup: generation %d superseded by %d",
+                    generation,
+                    self._generation,
+                )
+                return
+            self._process = None
             self._mp_queue = None
             self._cancel_event = None
             self._relay_thread = None

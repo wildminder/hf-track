@@ -29,12 +29,13 @@ from ..types import (
     ProgressPhase,
     TransferCancelledError,
     TransferDirection,
-    TransferError,
+    TransferErrorInfo,
     TransferProgressError,
     generate_transfer_id,
 )
 from ..token import is_xet_available
 from .._xet_worker import HybridRunner, download_hybrid, _serialize_xet_file_data
+from ._matching import _matches_any
 
 def download_snapshot_streaming(
     repo_id: str,
@@ -237,11 +238,16 @@ def download_snapshot_streaming(
             from huggingface_hub.constants import HF_HUB_CACHE
             repo_cache = os.path.join(HF_HUB_CACHE, f"{repo_type}s--{repo_id.replace('/', '--')}")
             os.makedirs(repo_cache, exist_ok=True)
-            dest = os.path.join(repo_cache, os.path.basename(path))
+            dest = os.path.join(repo_cache, path)
         file_specs.append(
             {
                 "hash": meta.xet_file_data.file_hash,
                 "file_size": meta_size,
+                # Repo-relative path. Without this the worker falls back to
+                # ``os.path.basename(dest_path)``, which drops the directory
+                # component — ``onnx/audio_encoder.onnx`` became
+                # ``audio_encoder.onnx`` and the HTTP fallback 404'd.
+                "filename": path,
                 "dest_path": dest,
                 "xet_file_data": _serialize_xet_file_data(meta.xet_file_data),
             }

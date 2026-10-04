@@ -27,7 +27,7 @@ from ..types import (
     ProgressPhase,
     TransferCancelledError,
     TransferDirection,
-    TransferError,
+    TransferErrorInfo,
     TransferProgressError,
     generate_transfer_id,
 )
@@ -82,7 +82,7 @@ def _run_upload_in_subprocess(
 
     Raises:
         TransferCancelledError: If the transfer is cancelled.
-        TransferError: If the upload fails.
+        TransferProgressError: If the upload fails.
     """
     transfer_id = transfer_id or generate_transfer_id()
 
@@ -121,7 +121,8 @@ def _run_upload_in_subprocess(
                 )
                 raise TransferCancelledError("Upload cancelled by user")
 
-        if result.get("status") == "success":
+        status = result.get("status")
+        if status == "success":
             return XetUploadResult(
                 success=True,
                 filename=result.get("filename", filename),
@@ -130,12 +131,9 @@ def _run_upload_in_subprocess(
                 transfer_id=transfer_id,
                 url=result.get("url"),
             )
-        elif (
-            result.get("status") == "cancelled"
-            or result.get("error_type") == "TransferCancelledError"
-            or "cancelled" in result.get("message", "").lower()
-            or "interrupted" in result.get("message", "").lower()
-        ):
+        elif status == "cancelled":
+            # ``status`` is the only discriminator — see the note in
+            # ``download/xet_file.py``.
             raise TransferCancelledError(result.get("message", "Upload cancelled by user"))
         else:
             error_msg = result.get("message", "Upload failed")
@@ -164,7 +162,7 @@ def _run_upload_in_subprocess(
                 direction=TransferDirection.UPLOAD,
                 filename=filename,
                 phase=ProgressPhase.ERROR,
-                error=TransferError(message=str(e), error_type=type(e).__name__),
+                error=TransferErrorInfo(message=str(e), error_type=type(e).__name__),
             )
         )
         raise

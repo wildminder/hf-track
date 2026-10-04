@@ -45,6 +45,9 @@ SSE integration::
 
 from __future__ import annotations
 
+import importlib.metadata
+import warnings
+
 # Core types
 from .types import (
     EventType,
@@ -52,6 +55,7 @@ from .types import (
     ProgressPhase,
     TransferCancelledError,
     TransferDirection,
+    TransferErrorInfo,
     TransferProgressError,
     TransferResult,
     TokenError,
@@ -76,7 +80,17 @@ from .subprocess import SubprocessMessage, XetSubprocessRunner
 # High-level tracker
 from .tracker import HfTracker
 
-__version__ = "0.1.0"
+# The single source of truth for the version is ``[project] version`` in
+# ``pyproject.toml``, which is what the installed distribution metadata is
+# built from. A second literal here used to drift from it silently (it read
+# "0.1.0" against a declared "0.2.4"), so this reads the metadata instead.
+# The fallback covers a bare checkout where the package is importable via
+# ``pythonpath = ["src"]`` but was never installed, so there is no
+# distribution to ask.
+try:
+    __version__ = importlib.metadata.version("hf-track")
+except importlib.metadata.PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     # Core types
@@ -85,6 +99,7 @@ __all__ = [
     "ProgressPhase",
     "TransferCancelledError",
     "TransferDirection",
+    "TransferErrorInfo",
     "TransferProgressError",
     "TransferResult",
     "generate_transfer_id",
@@ -105,3 +120,27 @@ __all__ = [
     # High-level tracker
     "HfTracker",
 ]
+
+#: Names renamed in this release, mapped to their replacement. Kept for one
+#: deprecation cycle, then deleted along with ``__getattr__`` below.
+_RENAMED = {
+    # A dataclass that sat next to two exceptions of similar name, which
+    # invited ``except TransferError`` — a clause that caught nothing.
+    "TransferError": TransferErrorInfo,
+}
+
+
+def __getattr__(name: str):
+    """Serve a pre-rename name with a ``DeprecationWarning``, for one cycle."""
+    replacement = _RENAMED.get(name)
+    if replacement is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    warnings.warn(
+        f"hf_track.{name} was renamed to {replacement.__name__}: it is a "
+        f"dataclass carrying an error payload, not an exception. Import "
+        f"{replacement.__name__} to read it, and catch "
+        f"TransferCancelledError / TransferProgressError for failures.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return replacement
