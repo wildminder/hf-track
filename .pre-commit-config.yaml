@@ -1,0 +1,48 @@
+# Lint hooks — NTH-013 / IMP-022. Run pre-commit from the repository root.
+#
+# Install once per clone:
+#   pip install -e "hf_track[dev]" && pre-commit install
+#
+# Three hooks, in decreasing severity:
+#
+#   ruff-lint-gate      blocking, product code only, current findings live in
+#                       download/xet_streaming.py and tracker/_core.py and are
+#                       fixed by the CRIT-009 and IMP-025 steps.
+#   ruff-lint-advisory   never blocks; reports the 119 style/hygiene findings
+#                       so they can be drained incrementally.
+#   ruff-format         manual stage only (`pre-commit run --hook-stage manual
+#                       ruff-format`); enabling it by default would reformat
+#                       the entire tree and bury this change in noise.
+#
+# CI runs the same gate without --fix — see .github/workflows/lint.yml.
+minimum_pre_commit_version: "3.0.0"
+default_language_version:
+  python: python3
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.22
+    hooks:
+      # 1. The gate. `select` comes from [tool.ruff.lint] in
+      # hf_track/pyproject.toml (F821, F811); the config is picked up
+      # automatically because every path below sits under hf_track/.
+      # Scope is the shipped package: the gate's job is to stop a bug
+      # shipping, and F821/F811 debt in tests belongs to whoever owns
+      # each test file.
+      - id: ruff
+        name: ruff-lint-gate
+        args: [--fix]
+        files: ^hf_track/src/
+
+      # 2. The whole repository, report-only. --exit-zero is what keeps this
+      # advisory; drop it (and the `always_run`) when the count reaches zero.
+      - id: ruff
+        name: ruff-lint-advisory
+        args: [--select, F401,E402,F841,E731, --exit-zero]
+        always_run: true
+        verbose: true
+
+      # 3. Opt-in formatter. Not part of the default run on purpose.
+      - id: ruff-format
+        name: ruff-format
+        stages: [manual]

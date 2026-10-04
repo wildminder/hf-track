@@ -24,7 +24,10 @@ classifiers = [
     "Topic :: System :: Networking :: Monitoring",
 ]
 dependencies = [
-    "huggingface_hub>=0.23.0",
+    # Upper-bounded: huggingface_hub 1.x removed the Xet credential helpers
+    # this package used (CRIT-008). Until the 2.x API is validated, a solver
+    # must not silently pick it up.
+    "huggingface_hub>=0.23.0,<2.0",
     "tqdm>=4.64.0",
 ]
 
@@ -35,6 +38,7 @@ dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "pytest-cov>=4.0",
+    "ruff>=0.15",
 ]
 
 [project.urls]
@@ -48,8 +52,44 @@ packages = ["src/hf_track"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
-addopts = "--tb=short"
+# --cov-fail-under is deliberately NOT set here (NTH-009). The suite is
+# currently red, so a coverage threshold would fail every run for a reason
+# unrelated to coverage; add the gate once the baseline stops drifting.
+addopts = "--tb=short --cov=hf_track --cov-report=term-missing"
 markers = [
     "integration: marks tests requiring real HF credentials (deselect with '-m \"not integration\"')",
     "network: marks tests requiring real network access to huggingface.co (deselect with '-m \"not network\"')",
 ]
+
+[tool.ruff]
+# Mirrors `requires-python` above.
+target-version = "py39"
+# First-party roots, so `hf_track.*` imports stop looking third-party.
+src = ["src"]
+extend-exclude = ["_backup", ".codegraph", ".ruff_cache", ".pytest_cache"]
+
+[tool.ruff.lint]
+# The *gate* rule set. Everything ruff reports under these rules fails the
+# build; nothing else does. Measured on 2026-10-04, `ruff check .` reports
+# 130 findings (85 F401, 17 E402, 16 F841, 8 F811, 3 F821, 1 E731). Only
+# the two rules below hide runtime breakage — F821 is a name that does not
+# exist at the point of use (two live product bugs today) and F811 is a
+# redefinition that silently shadows the original, including a dead test.
+# The other 119 are style/hygiene and are run advisory-only (see
+# `.pre-commit-config.yaml`, hook `ruff-lint-advisory`); promoting one
+# means moving it here, which is a deliberate act rather than a side
+# effect of enabling the linter.
+select = ["F821", "F811"]
+
+[tool.ruff.lint.per-file-ignores]
+# Re-export shims import names purely to publish them, and this package
+# does not maintain __all__ for that purpose — the one finding this
+# suppresses today is hf_track/src/hf_track/__init__.py:57. F401 is not
+# gated, so this changes nothing about the gate; it exists so that
+# promoting F401 later does not immediately fail on the shims.
+#
+# Deliberately *not* exempting F811 anywhere: a duplicated test name
+# silently disables a test (hf_track/tests/test_sse.py:96 and :148 are
+# the same test, so the first never runs), and that is exactly what the
+# gate is for.
+"**/__init__.py" = ["F401"]

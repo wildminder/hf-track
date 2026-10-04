@@ -1,0 +1,60 @@
+name: lint
+
+# NTH-013 / IMP-022: the lint gate.
+#
+# Only linting runs here. There is deliberately no test job yet: the suite
+# does not currently collect cleanly, and a permanently red pipeline is
+# worse than no pipeline. The test job is added once the collection abort is
+# gone.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ruff:
+    name: ruff (F821, F811 gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: python -m pip install --upgrade "ruff>=0.15"
+
+      # The gate: same rule set as [tool.ruff.lint] in hf_track/pyproject.toml,
+      # same scope as the `ruff-lint-gate` pre-commit hook. No --fix here on
+      # purpose — CI reports, it does not rewrite a pull request.
+      #
+      # Scope is the shipped package only. Tests and examples are covered by
+      # the advisory step below: the gate's job is to stop a bug shipping, and
+      # the F821/F811 debt in tests belongs to whoever owns each file.
+      - name: Gate (blocking)
+        run: python -m ruff check hf_track/src --output-format=github
+
+      # Report-only. Informational until the count reaches zero; a non-zero
+      # exit is tolerated deliberately.
+      - name: Hygiene (advisory)
+        run: python -m ruff check . --select F401,E402,F841,E731 --exit-zero
+        continue-on-error: true
+
+      # IMP-023: the documentation link check runs here, in the same job as
+      # the lint gate, because both are "the tree disagrees with itself"
+      # checks. A dead link in docs/README.md and an undefined name in the
+      # package are the same class of defect — a claim that stopped being
+      # true — and splitting them across jobs would let both go unnoticed
+      # whenever one of them is skipped.
+      #
+      # --check is a pure comparison: exit 1 when docs/README.md no longer
+      # matches what the generator would emit, exit 2 when a relative link
+      # resolves to nothing. It writes nothing.
+      - name: Docs index is current (blocking)
+        run: python hf_track/tools/generate_docs_index.py --check
