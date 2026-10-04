@@ -54,6 +54,15 @@ SOURCE_ROOT = _find_source_root().parent  # <package>/src
 # stays quick, real enough that the Hub is genuinely exercised.
 SMALL_PUBLIC_FILE = ("bert-base-uncased", "config.json")
 
+# A file that really IS stored in Xet storage. config.json is a small
+# plain file and is not, so the Xet path rejects it outright with
+# "File ... is not stored in Xet storage" (tracker/_xet_impls.py:71).
+# This one is Xet-backed and still only ~33 KB.
+XET_PUBLIC_FILE = (
+    "hf-internal-testing/tiny-random-VoxtralRealtimeForConditionalGeneration",
+    "onnx/audio_encoder.onnx",
+)
+
 _INSTALL_HINT = (
     "hf_track is not installed in this interpreter. Run "
     "`pip install -e hf_track` from the repository root to exercise this "
@@ -183,9 +192,17 @@ class TestHubIntegration:
             pytest.skip("hf_xet is not installed, so the Xet path cannot run")
 
         tracker = self._tracker()
-        repo_id, filename = SMALL_PUBLIC_FILE
+        repo_id, filename = XET_PUBLIC_FILE
 
-        tracker.download_file(repo_id, filename, local_dir=str(local_dir), use_xet=True)
+        try:
+            tracker.download_file(
+                repo_id, filename, local_dir=str(local_dir), use_xet=True
+            )
+        except ValueError as exc:
+            if "not stored in Xet storage" in str(exc):
+                pytest.skip(f"{filename} is no longer Xet-stored: {exc}")
+            raise
+
         events = tracker.get_events()
 
         totals = [e.total_bytes for e in events if e.total_bytes]
@@ -216,7 +233,16 @@ class TestHubIntegration:
             )
 
     def test_cancellation_from_another_thread_is_observed(self, local_dir: Path):
-        """A cancel issued off the calling thread reaches a live download."""
+        """A cancel issued off the calling thread reaches a live download.
+
+        The outcome is genuinely racy: the target is ~570 bytes, so the
+        transfer usually finishes before the cancel lands. Both outcomes are
+        legal, but the failure this guards against is a cancel that leaves a
+        *third* outcome behind -- a hang, or an unrelated exception escaping
+        the transfer. So the assertion is on the shape of the result, not on
+        catching ``Exception`` (which accepts everything and so proves
+        nothing).
+        """
         from hf_track import TransferCancelledError
 
         tracker = self._tracker()
@@ -224,8 +250,8 @@ class TestHubIntegration:
         transfer_id = "integration-cancel-2"
 
         def _cancel_soon() -> None:
-            # The download may already be past its first chunk, so poll
-            # until the tracker registers an active runner, then cancel.
+            # Give the transfer a moment to register, then cancel from this
+            # thread while the main thread is inside download_file().
             for _ in range(200):
                 if transfer_id in tracker._active_runners:
                     break
@@ -235,13 +261,25 @@ class TestHubIntegration:
         canceller = threading.Thread(target=_cancel_soon, daemon=True)
         canceller.start()
         try:
-            with pytest.raises((TransferCancelledError, Exception)):
-                tracker.download_file(
+            try:
+                path = tracker.download_file(
                     repo_id,
                     filename,
                     local_dir=str(local_dir),
                     transfer_id=transfer_id,
                     use_xet=False,
+                )
+            except TransferCancelledError:
+                # Cancel won the race -- the documented cancellation path.
+                return
+            except Exception as exc:  # noqa: BLE001 - re-raised immediately
+                raise AssertionError(
+                    f"cancel produced an unrelated {type(exc).__name__}: {exc}"
+                ) from exc
+            else:
+                # Download won the race. It must still have landed on disk.
+                assert path and Path(path).exists(), (
+                    "download_file returned a path that does not exist"
                 )
         finally:
             canceller.join(timeout=5)

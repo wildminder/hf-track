@@ -92,6 +92,9 @@ class SubprocessMessage:
         message: str = "Transfer cancelled by user",
         bytes_completed: int = 0,
         total_bytes: int = 0,
+        transfer_id: str = "",
+        direction: str = "download",
+        filename: str = "",
     ) -> SubprocessMessage:
         """Create a cancellation message.
 
@@ -99,6 +102,12 @@ class SubprocessMessage:
             message: Cancellation reason.
             bytes_completed: Bytes transferred before cancellation.
             total_bytes: Total bytes expected.
+            transfer_id: Transfer this cancellation belongs to. The runner
+                reads it back out of the payload to build the CANCELLED
+                ``ProgressEvent``; without it the event carries an empty id
+                and the tracker cannot match it to its transfer.
+            direction: ``"download"`` or ``"upload"``.
+            filename: File being transferred.
         """
         return cls(
             msg_type=MSG_CANCELLED,
@@ -107,6 +116,9 @@ class SubprocessMessage:
                 "message": message,
                 "bytes_completed": bytes_completed,
                 "total_bytes": total_bytes,
+                "transfer_id": transfer_id,
+                "direction": direction,
+                "filename": filename,
             },
         )
 

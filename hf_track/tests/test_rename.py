@@ -2,16 +2,27 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import inspect
 
 import pytest
+
+
+def _declared_version() -> str:
+    """The single source of truth for the version: installed metadata.
+
+    These tests used to hardcode "0.1.0" and went red on every version
+    bump. ``hf_track.__version__`` is derived from ``importlib.metadata``,
+    so asserting it against a literal only ever tested staleness.
+    """
+    return importlib.metadata.version("hf-track")
 
 
 def test_hf_track_importable():
     """hf_track package should be importable."""
     import hf_track
     assert hasattr(hf_track, "__version__")
-    assert hf_track.__version__ == "0.1.0"
+    assert hf_track.__version__ == _declared_version()
 
 
 def test_hf_track_public_api():
@@ -43,9 +54,9 @@ def test_sse_module_reexports_event_source_response():
 
 
 def test_package_version():
-    """Package version should be preserved."""
+    """Package version should match the installed distribution."""
     import hf_track
-    assert hf_track.__version__ == "0.1.0"
+    assert hf_track.__version__ == _declared_version()
 
 
 def test_all_exports_present():

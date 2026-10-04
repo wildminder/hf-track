@@ -22,9 +22,9 @@ from unittest import mock
 
 import pytest
 
-import hf_track.download.xet_file_only as xet_file_only
+import hf_track.download.xet_file_subprocess as xet_file_subprocess
 import hf_track.subprocess as hf_track_subprocess_mod
-from hf_track.download import xet_file_only as xfo
+from hf_track.download import xet_file_subprocess as xfo
 from hf_track.tracker import HfTracker
 from hf_track.types import TransferCancelledError
 
@@ -93,7 +93,7 @@ def test_watchdog_terminates_runner_on_cancel():
         is_cancelled=fake_is_cancelled,
     )
     with mock.patch.object(hf_track_subprocess_mod, "XetSubprocessRunner", return_value=runner):
-        t = threading.Thread(target=lambda: xet_file_only.download_file_xet_subprocess(**kwargs))
+        t = threading.Thread(target=lambda: xet_file_subprocess.download_file_xet_subprocess(**kwargs))
         t.start()
         # Let the watchdog start looping.
         time.sleep(0.2)
@@ -143,7 +143,7 @@ def test_tracker_cancel_registers_runner_then_terminates():
         is_cancelled=fake_is_cancelled,
     )
     with mock.patch.object(hf_track_subprocess_mod, "XetSubprocessRunner", return_value=runner):
-        t = threading.Thread(target=lambda: xet_file_only.download_file_xet_subprocess(**kwargs))
+        t = threading.Thread(target=lambda: xet_file_subprocess.download_file_xet_subprocess(**kwargs))
         t.start()
         time.sleep(0.2)
         # This is what the example script / Ctrl+C handler does.

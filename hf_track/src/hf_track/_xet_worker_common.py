@@ -100,17 +100,30 @@ def _safe_put(mp_queue: mp.Queue, message: SubprocessMessage) -> None:
         pass
 
 
-def _handle_worker_exception(mp_queue: mp.Queue, e: BaseException) -> None:
+def _handle_worker_exception(
+    mp_queue: mp.Queue,
+    e: BaseException,
+    *,
+    transfer_id: str = "",
+    direction: str = "download",
+    filename: str = "",
+) -> None:
     """Safely format and send an exception as a terminal message."""
     try:
         from .types import TransferCancelledError
         if isinstance(e, KeyboardInterrupt):
             _safe_put(mp_queue, SubprocessMessage.cancelled(
                 message="Transfer interrupted by user (Ctrl+C)",
+                transfer_id=transfer_id,
+                direction=direction,
+                filename=filename,
             ))
         elif isinstance(e, TransferCancelledError):
             _safe_put(mp_queue, SubprocessMessage.cancelled(
                 message="Transfer cancelled by user",
+                transfer_id=transfer_id,
+                direction=direction,
+                filename=filename,
             ))
         else:
             _safe_put(mp_queue, SubprocessMessage.error(
@@ -119,7 +132,6 @@ def _handle_worker_exception(mp_queue: mp.Queue, e: BaseException) -> None:
             ))
     except BaseException:
         pass
-
 
 
 # ── Progress Throttler (shared by all xet workers) ───────────────

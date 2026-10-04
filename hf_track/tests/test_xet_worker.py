@@ -164,7 +164,7 @@ class TestMakeProgressCallback:
     def test_callback_emits_event_message(self):
         """Callback puts a SubprocessMessage(event) into mp_queue."""
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         callback = _make_progress_callback(
@@ -200,7 +200,7 @@ class TestMakeProgressCallback:
     def test_callback_raises_on_cancel_event(self):
         """Callback raises TransferCancelledError when cancel_event is set."""
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
         cancel_event.set()
 
@@ -226,7 +226,7 @@ class TestMakeProgressCallback:
     def test_callback_not_cancelled_by_default(self):
         """Callback proceeds normally when cancel_event is not set."""
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         callback = _make_progress_callback(
@@ -283,7 +283,7 @@ class TestDownloadWorker:
         group.__enter__.return_value = group
 
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         _download_worker(self._make_params(), mp_queue, cancel_event)
@@ -302,7 +302,7 @@ class TestDownloadWorker:
         mock_get_session.return_value.new_file_download_group.side_effect = ConnectionError("Auth failed")
 
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         _download_worker(self._make_params(), mp_queue, cancel_event)
@@ -314,7 +314,7 @@ class TestDownloadWorker:
     def test_download_worker_import_error(self):
         """Worker emits error message when hf_xet is not importable."""
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         with patch.dict("sys.modules", {"hf_xet": None}):
@@ -348,7 +348,7 @@ class TestUploadFileWorker:
     def test_upload_file_worker_import_error(self):
         """Worker emits error message when hf_xet is not importable."""
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         with patch.dict("sys.modules", {"hf_xet": None}):
@@ -380,7 +380,7 @@ class TestUploadBytesWorker:
     def test_upload_bytes_worker_import_error(self):
         """Worker emits error message when hf_xet is not importable."""
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         with patch.dict("sys.modules", {"hf_xet": None}):
@@ -393,7 +393,7 @@ class TestUploadBytesWorker:
     def test_upload_bytes_worker_no_content_no_path(self):
         """Worker emits error when neither file_content nor file_path is provided."""
         test_ctx = mp.get_context("spawn")
-        test_mp_queue = test_ctx.Queue()
+        test_mp_queue = queue.Queue()  # thread queue: worker runs in-process
         test_cancel_event = test_ctx.Event()
 
         test_params = self._make_params()
@@ -452,7 +452,7 @@ class TestSnapshotWorker:
         mock_snapshot_dl.return_value = "/tmp/test_repo"
 
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         _snapshot_worker(self._make_params(), mp_queue, cancel_event)
@@ -475,7 +475,7 @@ class TestSnapshotWorker:
         mock_snapshot_dl.return_value = "/tmp/test_repo"
 
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         params = self._make_params(
@@ -511,7 +511,7 @@ class TestSnapshotWorker:
         mock_snapshot_dl.return_value = "/tmp/test_repo"
 
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         _snapshot_worker(self._make_params(), mp_queue, cancel_event)
@@ -535,7 +535,7 @@ class TestSnapshotWorker:
         mock_snapshot_dl.side_effect = RuntimeError("network error")
 
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         _snapshot_worker(self._make_params(), mp_queue, cancel_event)
@@ -551,7 +551,7 @@ class TestSnapshotWorker:
         mock_snapshot_dl.side_effect = ImportError("no module")
 
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         _snapshot_worker(self._make_params(), mp_queue, cancel_event)
@@ -566,7 +566,7 @@ class TestSnapshotWorker:
         mock_snapshot_dl.side_effect = KeyboardInterrupt()
 
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         _snapshot_worker(self._make_params(), mp_queue, cancel_event)
@@ -581,7 +581,7 @@ class TestSnapshotWorker:
         mock_snapshot_dl.return_value = "/tmp/cache/test_repo"
 
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         params = self._make_params(local_dir=None)
@@ -602,7 +602,7 @@ class TestSnapshotWorker:
         mock_snapshot_dl.return_value = "/tmp/test_repo"
 
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         _snapshot_worker(self._make_params(), mp_queue, cancel_event)
@@ -632,7 +632,7 @@ class TestSnapshotWorker:
         mock_snapshot_dl.return_value = "/tmp/test_repo"
 
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
 
         _snapshot_worker(self._make_params(), mp_queue, cancel_event)
@@ -652,7 +652,7 @@ class TestSnapshotWorker:
         mock_snapshot_dl.return_value = "/tmp/test_repo"
 
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
         cancel_event.set() # Pre-set the cancel event
 
@@ -721,7 +721,7 @@ class TestSnapshotWorkerUseXet:
         huggingface_hub imports occur."""
         mock_snapshot_dl.return_value = "/tmp/test_repo"
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
         params = self._make_params(use_xet=False)
 
@@ -745,7 +745,7 @@ class TestSnapshotWorkerUseXet:
         huggingface_hub imports occur."""
         mock_snapshot_dl.return_value = "/tmp/test_repo"
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
         params = self._make_params(use_xet=True)
 
@@ -769,7 +769,7 @@ class TestSnapshotWorkerUseXet:
         """Default use_xet (not in params) is True."""
         mock_snapshot_dl.return_value = "/tmp/test_repo"
         ctx = mp.get_context("spawn")
-        mp_queue = ctx.Queue()
+        mp_queue = queue.Queue()  # thread queue: worker runs in-process
         cancel_event = ctx.Event()
         params = self._make_params()
         del params["use_xet"]  # Remove to test default

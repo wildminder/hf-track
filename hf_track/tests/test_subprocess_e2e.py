@@ -117,23 +117,19 @@ def _crash_worker(params: dict, mp_queue: mp.Queue, cancel_event: mp.Event) -> N
 
 
 def _multi_file_worker(params: dict, mp_queue: mp.Queue, cancel_event: mp.Event) -> None:
-    """Worker that simulates downloading multiple files sequentially."""
+    """Worker that simulates downloading multiple files sequentially.
+
+    Cancels BETWEEN files, after the current file's progress is emitted.
+    Checking before the first file made the tests below depend on whether
+    the child had finished spawning before the test fired ``cancel_event``
+    -- on Windows spawn costs more than the sleep they allowed, so zero
+    progress events existed and the assertion on them failed.
+    """
     files = params.get("files", ["a.bin", "b.bin", "c.bin"])
     transfer_id = params.get("transfer_id", "e2e-multi")
     file_size = params.get("file_size", 500)
 
     for fname in files:
-        if cancel_event.is_set():
-            mp_queue.put(SubprocessMessage.cancelled(
-                message="Multi-file worker cancelled",
-                transfer_id=transfer_id,
-                direction="download",
-                filename=fname,
-                bytes_completed=0,
-                total_bytes=file_size,
-            ))
-            return
-
         # Emit progress for each file
         for pct in [25, 50, 75, 100]:
             mp_queue.put(SubprocessMessage.event({
@@ -149,6 +145,17 @@ def _multi_file_worker(params: dict, mp_queue: mp.Queue, cancel_event: mp.Event)
             }))
         time.sleep(0.05)
 
+        if cancel_event.is_set():
+            mp_queue.put(SubprocessMessage.cancelled(
+                message="Multi-file worker cancelled",
+                transfer_id=transfer_id,
+                direction="download",
+                filename=fname,
+                bytes_completed=0,
+                total_bytes=file_size,
+            ))
+            return
+
     mp_queue.put(SubprocessMessage.result(
         filename=",".join(files),
         file_size=file_size * len(files),
@@ -158,6 +165,36 @@ def _multi_file_worker(params: dict, mp_queue: mp.Queue, cancel_event: mp.Event)
 
 
 # ── Helpers ───────────────────────────────────────────────────────
+
+
+def _wait_for_progress(
+    event_queue: queue.Queue, timeout: float = 10.0
+) -> list[ProgressEvent]:
+    """Collect events until the first PROGRESS arrives; return them all.
+
+    Used instead of ``time.sleep`` before cancelling: a fixed sleep races
+    process spawn, which on Windows is slower than the sleep these tests
+    used, so the worker could be killed before emitting anything.
+
+    The events seen while waiting are RETURNED rather than discarded --
+    terminate() sets the relay's stop event, so anything still in flight is
+    dropped, and a helper that swallowed the first progress event would
+    leave the caller's assertion with nothing to count.
+    """
+    seen: list[ProgressEvent] = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            event = event_queue.get(timeout=min(0.2, remaining))
+        except queue.Empty:
+            continue
+        seen.append(event)
+        if event.event_type is EventType.PROGRESS:
+            break
+    return seen
 
 
 def _collect_events(event_queue: queue.Queue, timeout: float = 2.0) -> list[ProgressEvent]:
@@ -397,13 +434,16 @@ class TestSubprocessE2ECancel:
             event_queue=event_queue,
         )
 
-        time.sleep(0.2)
+# Wait for the worker to actually be running rather than sleeping a
+        # fixed amount: process spawn on Windows costs more than a short
+        # sleep, so a fixed wait could terminate before the first event.
+        seen = _wait_for_progress(event_queue, timeout=10.0)
         runner.terminate()
 
-        events = _collect_events(event_queue, timeout=2.0)
+        events = seen + _collect_events(event_queue, timeout=2.0)
 
         # Should have at least some progress events
-        progress = [e for e in events if e.event_type == EventType.PROGRESS]
+        progress = [e for e in events if e.event_type is EventType.PROGRESS]
         assert len(progress) >= 1, "Expected at least 1 progress event before cancel"
 
     def test_cancel_during_multi_file(self):

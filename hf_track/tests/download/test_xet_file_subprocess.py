@@ -23,7 +23,7 @@ from unittest import mock
 import pytest
 
 import hf_track.subprocess as subprocess_mod
-from hf_track.download import xet_file_only
+from hf_track.download import xet_file_subprocess
 from hf_track.types import TransferCancelledError, TransferProgressError
 
 
@@ -81,7 +81,7 @@ def _call(runner, **overrides):
     )
     kwargs.update(overrides)
     with mock.patch.object(subprocess_mod, "XetSubprocessRunner", return_value=runner):
-        return xet_file_only.download_file_xet_subprocess(**kwargs)
+        return xet_file_subprocess.download_file_xet_subprocess(**kwargs)
 
 
 def test_returns_destination_on_success():

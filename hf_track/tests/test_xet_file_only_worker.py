@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import queue
 import time
 from unittest import mock
 
@@ -125,7 +126,12 @@ class _XetPatch:
 
 def _run_worker(params, cancel_event=None, progress_calls=None):
     """Run the worker in-process, collecting all SubprocessMessages."""
-    mp_queue: mp.Queue = mp.Queue()
+    # A plain thread queue, not mp.Queue: the worker runs in THIS process, and
+    # mp.Queue hands writes to a feeder thread, so empty() can report True
+    # while messages are still in flight. That made these tests fail or pass
+    # depending on suite ordering. With queue.Queue the put is synchronous and
+    # the drain below is exact.
+    mp_queue: queue.Queue = queue.Queue()
     if cancel_event is None:
         cancel_event = mp.Event()
     with _XetPatch(progress_calls=progress_calls or [100, 200, 300]):
@@ -189,7 +195,7 @@ def test_worker_sends_result_with_dest_path():
 
 def test_worker_passes_correct_group_args():
     with _XetPatch(progress_calls=[100, 200, 300]) as patch:
-        mp_queue: mp.Queue = mp.Queue()
+        mp_queue: queue.Queue = queue.Queue()
         _xet_file_only_worker(_base_params(), mp_queue, mp.Event())
     kwargs = patch.captured["new_group_kwargs"]
     assert kwargs is not None
@@ -226,7 +232,7 @@ def test_worker_sends_error_when_xet_file_data_missing():
 
 def test_worker_sends_error_on_start_failure():
     with _XetPatch(start_side_effect=RuntimeError("boom")) as patch:
-        mp_queue: mp.Queue = mp.Queue()
+        mp_queue: queue.Queue = queue.Queue()
         _xet_file_only_worker(_base_params(), mp_queue, mp.Event())
         messages = []
         while not mp_queue.empty():
