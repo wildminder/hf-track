@@ -24,15 +24,15 @@ repos:
     rev: v0.15.22
     hooks:
       # 1. The gate. `select` comes from [tool.ruff.lint] in
-      # hf_track/pyproject.toml (F821, F811); the config is picked up
-      # automatically because every path below sits under hf_track/.
+      # pyproject.toml (F821, F811); the config is picked up
+      # automatically because every path below sits under the package src/.
       # Scope is the shipped package: the gate's job is to stop a bug
       # shipping, and F821/F811 debt in tests belongs to whoever owns
       # each test file.
       - id: ruff
         name: ruff-lint-gate
         args: [--fix]
-        files: ^hf_track/src/
+        files: ^src/
 
       # 2. The whole repository, report-only. --exit-zero is what keeps this
       # advisory; drop it (and the `always_run`) when the count reaches zero.

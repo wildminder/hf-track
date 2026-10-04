@@ -5,8 +5,8 @@ a document was added, renamed or deleted — and a drifted index is worse
 than no index, because its links look authoritative. This script makes the
 index a *derived* artefact:
 
-    python hf_track/tools/generate_docs_index.py           # rewrite docs/README.md
-    python hf_track/tools/generate_docs_index.py --check   # exit 1 if it is stale
+    python tools/generate_docs_index.py           # rewrite docs/README.md
+    python tools/generate_docs_index.py --check   # exit 1 if it is stale
 
 ``--check`` is the part that matters. It is a pure comparison, so it can
 run in CI without modifying anything: the test
@@ -37,9 +37,10 @@ import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-# ``<package>/tools/generate_docs_index.py`` -> ``<package>`` -> repo root.
-PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-REPO_ROOT = PACKAGE_ROOT.parent
+# ``<repo>/tools/generate_docs_index.py`` -> ``<repo>``. The project root
+# and the repository root are the same directory now that pyproject.toml
+# sits at the top level; there is no package directory to step through.
+REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCS_ROOT = REPO_ROOT / "docs"
 INDEX_PATH = DOCS_ROOT / "README.md"
 
@@ -91,7 +92,7 @@ def _existing_header() -> str:
         return (
             f"{HEADER_START}\n"
             "<!-- Anything between these two markers is preserved verbatim by\n"
-            "     `hf_track/tools/generate_docs_index.py`. Put analysis here; the\n"
+            "     `tools/generate_docs_index.py`. Put analysis here; the\n"
             "     structure below is regenerated. -->\n"
             f"{HEADER_END}\n"
         )
@@ -165,7 +166,7 @@ def _dead_links(markdown: str) -> List[str]:
         path_part = target.split("#", 1)[0]
         if not path_part:
             continue
-        # ``hf_track/src/hf_track/tracker.py:356`` is a source citation,
+        # ``src/hf_track/tracker.py:356`` is a source citation,
         # not a document link — the ``:line`` suffix is part of the
         # convention this repo writes citations in, and resolving it as a
         # filename would report every citation in the index as dead.
@@ -174,7 +175,7 @@ def _dead_links(markdown: str) -> List[str]:
         if (DOCS_ROOT / decoded).exists():
             continue
         # A target that resolves against the *repository* root is a
-        # source citation (``hf_track/src/hf_track/tracker.py``), not a
+        # source citation (``src/hf_track/tracker.py``), not a
         # broken document link. The index cites source constantly and
         # those references go stale for entirely different reasons.
         if (REPO_ROOT / decoded).exists():
@@ -228,7 +229,7 @@ def render() -> str:
     out.append("")
     out.append("```console")
     out.append(
-        "python hf_track/tools/generate_docs_index.py --check   # index matches the tree?"
+        "python tools/generate_docs_index.py --check   # index matches the tree?"
     )
     out.append("```")
     out.append("")
@@ -264,7 +265,7 @@ def main(argv: List[str] | None = None) -> int:
         if current != generated:
             print(
                 "docs/README.md is out of date. Run:\n"
-                "  python hf_track/tools/generate_docs_index.py",
+                "  python tools/generate_docs_index.py",
                 file=sys.stderr,
             )
             return 1

@@ -27,7 +27,7 @@ jobs:
       - name: Install ruff
         run: python -m pip install --upgrade "ruff>=0.15"
 
-      # The gate: same rule set as [tool.ruff.lint] in hf_track/pyproject.toml,
+      # The gate: same rule set as [tool.ruff.lint] in pyproject.toml,
       # same scope as the `ruff-lint-gate` pre-commit hook. No --fix here on
       # purpose — CI reports, it does not rewrite a pull request.
       #
@@ -35,7 +35,7 @@ jobs:
       # the advisory step below: the gate's job is to stop a bug shipping, and
       # the F821/F811 debt in tests belongs to whoever owns each file.
       - name: Gate (blocking)
-        run: python -m ruff check hf_track/src --output-format=github
+        run: python -m ruff check src --output-format=github
 
       # Report-only. Informational until the count reaches zero; a non-zero
       # exit is tolerated deliberately.
@@ -54,7 +54,7 @@ jobs:
       # matches what the generator would emit, exit 2 when a relative link
       # resolves to nothing. It writes nothing.
       - name: Docs index is current (blocking)
-        run: python hf_track/tools/generate_docs_index.py --check
+        run: python tools/generate_docs_index.py --check
 
   test:
     name: test (unit)
@@ -82,7 +82,7 @@ jobs:
       # genuinely useful but must not gate a commit -- a TLS blip or a Hub
       # outage would otherwise red the whole project.
       - name: Unit tests
-        run: python -m pytest hf_track/tests -m "not integration" -q --cov=hf_track --cov-report=term-missing
+        run: python -m pytest tests -m "not integration" -q --cov=hf_track --cov-report=term-missing
 
       - name: Wheel builds and installs clean
         run: |
@@ -106,4 +106,4 @@ jobs:
         run: python -m pip install -e "hf_track[dev,xet]"
 
       - name: Integration tests
-        run: python -m pytest hf_track/tests -m integration -q --no-cov
+        run: python -m pytest tests -m integration -q --no-cov

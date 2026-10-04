@@ -18,7 +18,7 @@ Why one test that lists ALL violators
 -------------------------------------
 It's tempting to split this into a parametrize-per-file, but then
 adding a new file would silently be allowed to grow forever. A single
-test that scans ``hf_track/src/hf_track/`` and reports every file
+test that scans ``src/hf_track/`` and reports every file
 that is over its budget gives a complete picture in one failure
 message — and adding a new file automatically subjects it to the
 default budget.
@@ -74,11 +74,13 @@ def _find_source_root() -> pathlib.Path:
 
 SOURCE_ROOT = _find_source_root()
 
-# The repository root: <root>/hf_track/src/hf_track -> <root>
-REPO_ROOT = SOURCE_ROOT.parents[2]
+# <root>/src/hf_track -> <root>/src -> <root>. The project root and the
+# repository root are the same directory now that pyproject.toml sits at
+# the top level, so there is no package directory to step through.
+REPO_ROOT = SOURCE_ROOT.parents[1]
 
 # The project's packaging + tooling manifest.
-PYPROJECT = SOURCE_ROOT.parents[1] / "pyproject.toml"
+PYPROJECT = REPO_ROOT / "pyproject.toml"
 
 # Default budget for any file without an explicit override.
 DEFAULT_BUDGET = 500
@@ -402,11 +404,11 @@ class TestRuffConfiguration:
     # in files no step owns; the sse one is a duplicated test name, i.e. a
     # test that never runs.
     KNOWN_GATE_FINDINGS: Set[Tuple[str, str]] = {
-        ("hf_track/examples/web_app/tests/test_web_app.py", "F811"),
-        ("hf_track/src/hf_track/download/xet_streaming.py", "F821"),
-        ("hf_track/src/hf_track/tracker/_core.py", "F821"),
-        ("hf_track/tests/test_sse.py", "F811"),
-        ("hf_track/tests/test_xet_upload.py", "F811"),
+        ("examples/web_app/tests/test_web_app.py", "F811"),
+        ("src/hf_track/download/xet_streaming.py", "F821"),
+        ("src/hf_track/tracker/_core.py", "F821"),
+        ("tests/test_sse.py", "F811"),
+        ("tests/test_xet_upload.py", "F811"),
     }
 
     # Concise-format finding line: path:line:col: CODE message
@@ -552,15 +554,15 @@ class TestRuffConfiguration:
         self._assert_no_new_findings(findings, self.KNOWN_GATE_FINDINGS)
 
     def test_shipped_package_has_only_the_known_gate_findings(self):
-        """The blocking scope (``hf_track/src``) carries only known defects.
+        """The blocking scope (``src``) carries only known defects.
 
         This is the scope CI runs, so it is the one that has to reach zero:
         once CRIT-009 and IMP-025 land, the gate blocks on nothing and
         starts blocking on regressions.
         """
-        findings = self._ruff_findings("hf_track/src")
+        findings = self._ruff_findings("src")
         shipped = {
-            key for key in self.KNOWN_GATE_FINDINGS if key[0].startswith("hf_track/src/")
+            key for key in self.KNOWN_GATE_FINDINGS if key[0].startswith("src/")
         }
         self._assert_no_new_findings(findings, shipped)
 
@@ -700,7 +702,7 @@ class TestDocsIndex:
     nobody remembers to run.
     """
 
-    # SOURCE_ROOT is <repo>/hf_track/src/hf_track; the generator sits next
+    # SOURCE_ROOT is <repo>/src/hf_track; the generator sits
     # to src/, under the package root.
     GENERATOR = SOURCE_ROOT.parents[1] / "tools" / "generate_docs_index.py"
     DOCS_ROOT = REPO_ROOT / "docs"
@@ -724,7 +726,7 @@ class TestDocsIndex:
         )
         assert proc.returncode == 0, (
             "docs/README.md is out of date. Run:\n"
-            "  python hf_track/tools/generate_docs_index.py\n"
+            "  python tools/generate_docs_index.py\n"
             f"({(proc.stderr or '').strip()})"
         )
 

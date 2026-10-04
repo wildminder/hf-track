@@ -34,7 +34,7 @@ tmp/
 
 # Downloaded model files (output from examples)
 downloads/
-hf_track/examples/downloads/
+examples/downloads/
 
 # desloppify local state
 .desloppify/

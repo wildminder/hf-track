@@ -84,12 +84,12 @@ select = ["F821", "F811"]
 [tool.ruff.lint.per-file-ignores]
 # Re-export shims import names purely to publish them, and this package
 # does not maintain __all__ for that purpose — the one finding this
-# suppresses today is hf_track/src/hf_track/__init__.py:57. F401 is not
+# suppresses today is src/hf_track/__init__.py:57. F401 is not
 # gated, so this changes nothing about the gate; it exists so that
 # promoting F401 later does not immediately fail on the shims.
 #
 # Deliberately *not* exempting F811 anywhere: a duplicated test name
-# silently disables a test (hf_track/tests/test_sse.py:96 and :148 are
+# silently disables a test (tests/test_sse.py:96 and :148 are
 # the same test, so the first never runs), and that is exactly what the
 # gate is for.
 "**/__init__.py" = ["F401"]
