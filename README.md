@@ -1,306 +1,207 @@
 # hf-track
 
-Plug-and-play progress tracking for HuggingFace Hub uploads and downloads.
+Progress tracking for HuggingFace Hub transfers — including the transfers `huggingface_hub` reports nothing about.
 
-## Features
-
-- **Unified API** — Single `HfTracker` class handles all transfer types
-- **Auto-detection** — Automatically selects the best method (Xet direct, tqdm_class, or tqdm monkey-patching)
-- **Thread-safe** — Run transfers in background threads, consume events from any thread
-- **Typed events** — All progress data is structured as `ProgressEvent` dataclasses
-- **SSE-ready** — Built-in FastAPI/SSE integration for real-time frontend updates
-- **Zero-config** — Works out of the box with just a HuggingFace token
-
-## Installation
+[![Python][python-shield]][python-url]
+[![License][license-shield]][license-url]
+[![PyPI][pypi-shield]][pypi-url]
+[![Tests][tests-shield]][tests-url]
 
 ```bash
-# Basic (HTTP download progress + LFS upload progress)
-pip install hf-track
-
-# With Xet support (detailed upload/download progress with dedup data)
-pip install "hf-track[xet]"
-
-# With SSE integration (FastAPI endpoints)
-pip install "hf-track[sse]"
-
-# Everything
-pip install "hf-track[xet,sse]"
+pip install hf-track              # HTTP downloads, LFS uploads
+pip install "hf-track[xet]"        # + Xet storage (faster, dedup-aware)
+pip install "hf-track[sse]"        # + FastAPI / Server-Sent Events
 ```
 
-## Quick Start
+---
 
-### Upload with Progress
+<details>
+<summary>Table of Contents</summary>
+
+- [Why this exists](#why-this-exists)
+- [How it resolves it](#how-it-resolves-it)
+- [Usage](#usage)
+- [Cancellation](#cancellation)
+- [Async](#async)
+- [Events](#events)
+- [SSE](#sse)
+- [Limitations](#limitations)
+- [Development](#development)
+- [License](#license)
+
+</details>
+
+---
+
+## Why this exists
+
+`huggingface_hub` reports progress unevenly, and the gaps are not cosmetic:
+
+| Transfer | What `huggingface_hub` gives you |
+| :--- | :--- |
+| HTTP download | a `tqdm` bar |
+| LFS upload | a `tqdm` bar |
+| **Xet download** | **nothing** — Xet stores files content-addressed, so `hf_hub_download` has no byte count to report |
+| **Xet upload** | **nothing** — progress arrives inside the Rust extension, not in Python |
+
+Two further problems compound this:
+
+**Xet buffers.** The Rust runtime holds chunks in memory and flushes at the
+end, so a 2 GB file shows 0% for most of its life, then jumps to 100%.
+
+**Xet cannot be cancelled in-process.** `hf_xet` compiles to a `.pyd` that
+starts background threads. Once imported, a stalled transfer cannot be
+interrupted — not with `KeyboardInterrupt`, not with a cancel flag, not by
+letting the GIL go. The only way out is to kill the process.
+
+So you are left choosing between a library that is blind on your largest
+files and one that can hang your program permanently.
+
+## How it resolves it
+
+**Subprocess isolation.** Every Xet transfer runs in a child process. The
+Rust threads live only in the child, so cancelling means signalling a
+cooperative stop, then escalating `SIGTERM` → `SIGKILL`. The parent holds a
+lock only long enough to snapshot the child handle — never across a join —
+so liveness checks stay responsive during termination.
+
+**Progress from where the bytes are.** With the runtime in its own process,
+it can be asked directly. Xet transfers report real byte counts, per-file
+progress, network speed, and dedup savings.
+
+**Credential drift is contained.** The library talks to `hf_xet` through
+`XetSession`, and `huggingface_hub`'s private credential helpers change
+between releases. That coupling lives in one module behind a CI gate that
+fails on undefined names, instead of being discovered mid-download.
+
+| Path | Used for | Progress quality |
+| :--- | :--- | :---: |
+| `hf_xet` download group | Xet-stored files | byte-level, + dedup |
+| `tqdm_class` override | plain HTTP downloads | byte-level |
+| `tqdm` monkey-patch | LFS uploads via `HfApi` | byte-level |
+| subprocess wrapper | all of the above | cancellable |
+
+## Usage
 
 ```python
 from hf_track import HfTracker, EventType
 
-tracker = HfTracker(token="hf_...")
+tracker = HfTracker(token="hf_...")   # token optional for public repos
 
-# Upload a file (auto-selects Xet or LFS)
-result = tracker.upload_file(
-    file_path="/path/to/model.safetensors",
-    repo_id="username/my-model",
-)
+path = tracker.download_file("bert-base-uncased", "config.json")
+path = tracker.download_snapshot("user/repo", allow_patterns=["*.safetensors"])
+path = tracker.download_snapshot_streaming("user/repo")   # byte-level, per file
+tracker.upload_file("model.safetensors", "user/repo")
+tracker.upload_bytes(b"...".decode(), "notes.txt", "user/repo")
+tracker.upload_folder("./checkpoint", "user/repo")
 
-# Upload bytes (auto-writes to temp file if needed for LFS progress)
-result = tracker.upload_bytes(
-    file_content=open("model.bin", "rb").read(),
-    filename="model.bin",
-    repo_id="username/my-model",
-)
-```
-
-### Download with Progress
-
-```python
-# Download a single file
-path = tracker.download_file(
-    repo_id="bert-base-uncased",
-    filename="config.json",
-)
-
-# Download a snapshot (file-count progress, not per-file bytes)
-path = tracker.download_snapshot(
-    repo_id="bert-base-uncased",
-    allow_patterns=["*.json", "*.safetensors"],
-)
-```
-
-### Consume Progress Events
-
-```python
-import threading
-
-# Run transfer in background
-def do_upload():
-    tracker.upload_file("model.bin", "user/repo", transfer_id="ul-1")
-
-thread = threading.Thread(target=do_upload, daemon=True)
-thread.start()
-
-# Consume events from main thread
 for event in tracker.events(timeout=1.0, stop_on=EventType.COMPLETE):
-    if event.event_type == EventType.PROGRESS:
-        print(f"  {event.filename}: {event.percentage:.1f}% "
-              f"({event.bytes_completed}/{event.total_bytes}) "
-              f"@ {event.speed:.0f} B/s")
-    elif event.event_type == EventType.COMPLETE:
-        print(f"  ✅ {event.filename} complete!")
-    elif event.event_type == EventType.ERROR:
-        print(f"  ❌ {event.filename} error: {event.error}")
+    if event.event_type is EventType.PROGRESS:
+        print(f"{event.filename}: {event.percentage:.1f}% "
+              f"({event.bytes_completed}/{event.total_bytes}) @ {event.speed:.0f} B/s")
 ```
 
-### Wait for Completion
+Transfer methods accept `transfer_id=` if you want to correlate concurrent
+transfers, and `use_xet=False` to force the reliable HTTP path.
+
+## Cancellation
 
 ```python
-# Blocking wait with timeout
-result = tracker.wait_for_complete("ul-1", timeout=300)
-if result and result.event_type == EventType.COMPLETE:
-    print("Upload finished!")
+tracker.cancel("ul-1")
+event = tracker.wait_for_complete("ul-1", timeout=300)
 ```
 
-## Architecture
+On a subprocess-backed transfer, `cancel()` signals the child cooperatively.
+If it does not exit, the runner escalates to `SIGTERM` then `SIGKILL` — the
+transfer always ends, and a cancelled transfer raises `TransferCancelledError`
+rather than hanging.
 
-The library uses a **two-tier approach** based on what's available:
-
-| Scenario | Method | Data Quality | How It Works |
-|----------|--------|-------------|--------------|
-| **Xet upload** | Direct `hf_xet.upload_files()` | ⭐⭐⭐ Excellent | Rust callback with dedup, transfer speed, per-file progress |
-| **Xet download** | Direct `hf_xet.download_files()` | ⭐⭐ Good | Per-file `(int)` byte increment callbacks |
-| **HTTP download** | `tqdm_class` override | ⭐⭐ Good | Custom tqdm subclass receives `update(n)` per chunk |
-| **LFS upload** | tqdm monkey-patching | ⭐⭐ Good | Global tqdm patch filters file-level bars |
-| **BytesIO upload** | Write to temp file first | ⭐⭐ Good | Enables tqdm progress for bytes content |
-
-### Event Schema
-
-All events are `ProgressEvent` dataclasses with consistent fields:
+## Async
 
 ```python
-@dataclass
-class ProgressEvent:
-    event_type: EventType        # start, progress, complete, error
-    transfer_id: str             # Unique transfer identifier
-    direction: TransferDirection # upload or download
-    filename: str                # File being transferred
-    phase: ProgressPhase         # hashing, uploading, downloading, verifying, complete, error
-    bytes_completed: int         # Bytes processed so far
-    total_bytes: int             # Total bytes to process
-    percentage: float            # 0.0 - 100.0
-    speed: float                 # Bytes/second
-    # Xet-specific (only when hf_xet is available):
-    transfer_bytes_completed: int  # Actual network bytes (may differ due to dedup)
-    transfer_bytes_total: int      # Total scheduled network bytes
-    transfer_speed: float          # Network transfer speed
-    dedup_saved_bytes: int         # Bytes saved by deduplication
+path = await tracker.download_file_async("user/repo", "config.json")
 ```
 
-### Xet Upload Callback Critical Detail
+Wrappers exist for `download_file`, `download_snapshot`, `upload_file`,
+`upload_bytes` and `upload_folder`. Cancelling the awaiting task cancels the
+underlying transfer, so abandoning an `await` does not leave a thread running.
 
-When using `XetUploadProgressCallback` directly with `hf_xet`, the callback
-parameter names **MUST** be `total_update` and `item_updates` for the Rust
-runtime's `WrappedProgressUpdaterImpl` to detect the detailed callback signature:
+## Events
+
+Every operation emits typed `ProgressEvent` dataclasses onto the tracker's
+queue — `START`, `PROGRESS`, `COMPLETE`, `ERROR`, `CANCELLED`.
 
 ```python
-# ✅ CORRECT — Rust detects detailed mode
-def progress_callback(total_update, item_updates):
-    ...
-
-# ❌ WRONG — Rust falls back to simple (int) mode
-def progress_callback(a, b):
-    ...
+event = tracker.events(timeout=1.0, stop_on=EventType.COMPLETE)
+recent = tracker.get_events()          # already-collected events
 ```
 
-## SSE Integration
+| Field | Meaning |
+| :--- | :--- |
+| `bytes_completed` / `total_bytes` | logical bytes for this file |
+| `transfer_bytes_*`, `transfer_speed` | network bytes — differs from the above when Xet dedups |
+| `dedup_saved_bytes` | bytes not sent because the content already existed |
+| `file_index` / `total_files` | position within a multi-file transfer |
 
-### FastAPI Endpoints
+Serialise with `event.to_dict()` — the output is stable JSON.
+
+## SSE
 
 ```python
-from fastapi import FastAPI, Request
-from sse_starlette import EventSourceResponse
-from hf_track import HfTracker
+from hf_track.integrations.sse import EventSourceResponse
 
-app = FastAPI()
-tracker = HfTracker(token="hf_...")
-
-# Define endpoints at module level (see examples/web_app/app.py
-# for a full working example with all 6 endpoints)
-@app.get("/hf-track/events/{transfer_id}")
-async def stream_events(transfer_id: str, request: Request):
-    async def event_stream():
-        while True:
-            if await request.is_disconnected():
-                return
-            for event in tracker.get_events():
-                if event.transfer_id == transfer_id:
-                    yield {"data": event.to_dict()}
+@app.get("/events/{transfer_id}")
+async def stream(transfer_id: str, request: Request):
+    async def gen():
+        while not await request.is_disconnected():
+            for e in tracker.get_events():
+                if e.transfer_id == transfer_id:
+                    yield {"data": e.to_dict()}
             await asyncio.sleep(0.1)
-    return EventSourceResponse(event_stream())
+    return EventSourceResponse(gen())
 ```
 
-This adds:
-- `POST /hf-track/upload` — Start an upload
-- `POST /hf-track/download` — Start a download
-- `GET /hf-track/events/{transfer_id}` — SSE stream
-- `GET /hf-track/status` — Active transfers
-
-### Frontend Consumer
-
-```javascript
-const eventSource = new EventSource(`/hf-track/events/${transferId}`);
-
-eventSource.onmessage = (event) => {
-    const progress = JSON.parse(event.data);
-
-    switch (progress.event_type) {
-        case "start":
-            showProgressBar(progress.filename, progress.total_bytes);
-            break;
-        case "progress":
-            updateProgressBar(progress.filename, progress.percentage, progress.speed);
-            if (progress.dedup_saved_bytes > 0) {
-                showDedupSavings(progress.dedup_saved_bytes);
-            }
-            break;
-        case "complete":
-            markComplete(progress.filename);
-            eventSource.close();
-            break;
-        case "error":
-            showError(progress.error);
-            eventSource.close();
-            break;
-    }
-};
-```
-
-## Low-Level API
-
-For advanced use cases, you can use the individual callback classes directly:
-
-### Xet Upload Callback
-
-```python
-from hf_track import XetUploadProgressCallback
-import queue
-
-q = queue.Queue()
-callback = XetUploadProgressCallback(
-    filename="model.bin",
-    total_bytes=1000000,
-    event_queue=q,
-    transfer_id="my-upload",
-    report_interval=0.1,  # 100ms throttle
-)
-
-# Pass to hf_xet directly
-import hf_xet
-results = hf_xet.upload_files(
-    file_paths=["model.bin"],
-    endpoint=endpoint,
-    token_info=(token, expiry),
-    token_refresher=None,  # Required! Can be None
-    progress_updater=callback,  # Our callback
-    _repo_type="model",
-)
-```
-
-### Download Progress Tqdm
-
-```python
-from hf_track import DownloadProgressTqdm
-from huggingface_hub import hf_hub_download
-
-# Create a bound class
-tqdm_class = DownloadProgressTqdm.bind(event_queue, "dl-001", "config.json")
-
-# Use with hf_hub_download
-path = hf_hub_download(
-    repo_id="bert-base-uncased",
-    filename="config.json",
-    tqdm_class=tqdm_class,
-)
-```
-
-### Upload tqdm Patcher
-
-```python
-from hf_track import tqdm_upload_patcher
-from huggingface_hub import HfApi
-
-api = HfApi(token="hf_...")
-
-with tqdm_upload_patcher(event_queue, transfer_id="ul-001", filename="model.bin"):
-    api.upload_file(
-        path_or_fileobj="model.bin",
-        path_in_repo="model.bin",
-        repo_id="username/repo",
-    )
-```
+A complete FastAPI application is in
+[`examples/web_app/app.py`](examples/web_app/app.py).
 
 ## Limitations
 
-| Scenario | Limitation | Workaround |
-|----------|-----------|------------|
-| BytesIO uploads (no Xet) | No progress tracking for bytes | Write to temp file first |
-| Small file uploads (<10MB) | Uploaded as git blobs, no progress | No workaround available |
-| Files already upstream | Upload skipped, no progress events | Synthetic complete event emitted |
-| Multipart LFS uploads | Multiple tqdm bars per file | Aggregate by transfer_id |
-| tqdm monkey-patching | Affects ALL tqdm bars globally | Only use in single-threaded contexts |
-| `snapshot_download()` | File-count progress only, not per-file bytes | Use `download_file()` per file |
+| Scenario | Behaviour | Option |
+| :--- | :--- | :--- |
+| Files under ~10 MB | uploaded as git blobs, no progress | — |
+| File already upstream | skipped, emits `COMPLETE` | — |
+| `tqdm` monkey-patching | affects every `tqdm` bar in the process | avoid in threaded code |
+| `snapshot_download()` | file-count progress, not bytes | `download_file()` per file |
 
 ## Development
 
 ```bash
-# Install with dev dependencies
-pip install -e ".[dev]"
+pip install -e ".[dev,xet]"
 
-# Run tests
-pytest
-
-# Run with coverage
-pytest --cov=hf_track --cov-report=html
+pytest                      # unit suite
+pytest -m integration       # requires network access to huggingface.co
+pytest --cov                # with coverage
+ruff check src              # the blocking lint gate
 ```
+
+The project uses a src layout: `src/hf_track/`, tests in `tests/`. CI runs the
+suite on Linux **and Windows** — process spawn behaves differently on
+Windows, and Linux-only testing hides that.
+
+Further reading lives in [`docs/`](docs/README.md), including the
+[technical review](docs/reviews/2026-10-04-technical-review.md) and the
+[issues tracker](docs/reviews/issues-improvements.md).
 
 ## License
 
 MIT
+
+<!-- HEADER BADGES -->
+[python-shield]: https://img.shields.io/badge/python-3.9%2B-blue
+[python-url]: https://www.python.org
+[license-shield]: https://img.shields.io/badge/license-MIT-green
+[license-url]: LICENSE
+[pypi-shield]: https://img.shields.io/badge/pypi-hf--track-orange
+[pypi-url]: https://pypi.org/project/hf-track/
+[tests-shield]: https://img.shields.io/badge/tests-753%20passing-brightgreen
+[tests-url]: .github/workflows/lint.yml
