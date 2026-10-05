@@ -2,28 +2,26 @@
 
 <p align="center">▁▂▃▄▅▆▇█▇▆▅▄▃▂▁</p>
 
-# hf-track
+<div align="center">
+
+# █ HF-Track █
+
+<img  alt="image" src="https://github.com/user-attachments/assets/b38684c4-d22f-4683-80ec-9c554475d713" />
+</div>
+
 
 <p align="center">
+
   <b>Byte-level progress for Hugging Face transfers, including the Xet paths
   <code>huggingface_hub</code> reports nothing about.</b>
 </p>
 
 <div align="center">
 
-[![what you get: byte-level, dedup, cancellable][value-shield]][the-gap]
-
-</div>
-
-<p align="center">
-
 [![Python][python-shield]][python-url]
 [![License][license-shield]][license-url]
-[![PyPI][pypi-shield]][pypi-url]
-[![Tests][tests-shield]][tests-url]
-[![CI][ci-shield]][ci-url]
 
-</p>
+</div>
 
 ```bash
 pip install hf-track# HTTP downloads, LFS uploads
@@ -34,19 +32,18 @@ pip install "hf-track[sse]"   # + FastAPI / Server-Sent Events
 <details>
 <summary><b>◈ Table of Contents</b></summary>
 
-- [◈ The gap](#the-gap)
-- [◈ How it resolves](#how-it-resolves)
-- [◈ Choosing a method](#choosing-a-method)
-- [◈ Downloads](#downloads)
-- [◈ Uploads](#uploads)
-- [◈ Events](#events)
-- [◈ Cancellation](#cancellation)
-- [◈ Async](#async)
-- [◈ Server-sent events](#sse)
-- [◈ Retries](#retries)
-- [◈ Limitations](#limitations)
-- [◈ Development](#development)
-- [◈ License](#license)
+- [The gap](#the-gap)
+- [How it resolves](#how-it-resolves)
+- [Choosing a method](#choosing-a-method)
+- [Downloads](#downloads)
+- [Uploads](#uploads)
+- [Events](#events)
+- [Cancellation](#cancellation)
+- [Async](#async)
+- [Server-sent events](#sse)
+- [Retries](#retries)
+- [Limitations](#limitations)
+- [Development](#development)
 
 </details>
 
@@ -91,7 +88,6 @@ one that can hang your program permanently.
 The parent holds its lock only long enough to snapshot the child handle, never
 across a join, so liveness checks stay responsive while a child is terminating.
 
-<p align="center">▁▂▃▄▅▆▇█▇▆▅▄▃▂▁</p>
 
 | Path | Used for | Progress quality |
 | :--- | :--- | :---: |
@@ -104,6 +100,9 @@ across a join, so liveness checks stay responsive while a child is terminating.
 
 The `transfer_id` you pass correlates concurrent transfers and is what
 `cancel()` takes. Omit it and one is generated per call.
+
+<p align="center"><img  width="60%" src="https://github.com/user-attachments/assets/413653f2-8032-48bc-b2e8-5d234911f087" /></p>
+
 
 <p id="choosing-a-method" align="center">▰ ▰ ▰ ▰ ▰ ▰ ▰</p>
 
@@ -129,7 +128,7 @@ instead of falling back.
 
 <a id="quick-start"></a>
 
-### ▸ Quick start
+### Quick start
 
 ```python
 from hf_track import HfTracker, EventType
@@ -146,11 +145,9 @@ for event in tracker.events(timeout=1.0, stop_on=EventType.COMPLETE):
               f"({event.bytes_completed}/{event.total_bytes}) @ {event.speed:.0f} B/s")
 ```
 
-<p align="center">· · · · ·</p>
-
 <a id="download-options"></a>
 
-### ▸ Per-call options
+### Per-call options
 
 Every transfer accepts `transfer_id=` to correlate concurrent work, and
 `use_xet=False` to force the reliable HTTP path. `download_file()` also takes
@@ -217,9 +214,7 @@ transfer always ends, one way or another: a cancelled transfer raises
 path = await tracker.download_file_async("user/repo", "config.json")
 ```
 
-Wrappers exist for `download_file`, `download_snapshot`, `upload_file`,
-`upload_bytes`, and `upload_folder`. Cancelling the awaiting task cancels the
-underlying transfer, so abandoning an `await` does not leave a thread running.
+Wrappers exist for `download_file`, `download_snapshot`, `upload_file`, `upload_bytes`, and `upload_folder`. Cancelling the awaiting task cancels the underlying transfer, so abandoning an `await` does not leave a thread running.
 
 <p id="sse" align="center">▰ ▰ ▰ ▰ ▰ ▰ ▰</p>
 
@@ -239,10 +234,7 @@ async def stream(transfer_id: str, request: Request):
     return EventSourceResponse(gen())
 ```
 
-The module re-exports `sse_starlette.EventSourceResponse` and nothing else. The
-old `create_progress_router()` factory is gone, having broken Starlette 1.0's
-response serialization. A complete FastAPI application, with endpoints defined
-at module level, is in [`examples/web_app/app.py`](examples/web_app/app.py).
+The module re-exports `sse_starlette.EventSourceResponse` and nothing else. The old `create_progress_router()` factory is gone, having broken Starlette 1.0's response serialization. A complete FastAPI application, with endpoints defined at module level, is in [`examples/web_app/app.py`](examples/web_app/app.py).
 
 <p id="retries" align="center">▰ ▰ ▰ ▰ ▰ ▰ ▰</p>
 
@@ -277,14 +269,9 @@ pytest --cov                # with coverage
 ruff check src              # the blocking lint gate: F821, F811
 ```
 
-Src layout, with tests in `tests/`. CI runs the unit suite on Linux **and**
-Windows, because process spawn behaves differently there and a Linux-only
-matrix hid a class of ordering bug. The integration job is
-`continue-on-error`: it hits `huggingface.co` and must never gate a commit.
+Src layout, with tests in `tests/`. CI runs the unit suite on Linux **and** Windows, because process spawn behaves differently there and a Linux-only matrix hid a class of ordering bug. The integration job is `continue-on-error`: it hits `huggingface.co` and must never gate a commit.
 
-The ruff gate covers `F821` and `F811` only. Those are the two rules that hide
-runtime breakage: a name that does not exist at the point of use, and a
-redefinition that silently shadows the original.
+The ruff gate covers `F821` and `F811` only. Those are the two rules that hide runtime breakage: a name that does not exist at the point of use, and a redefinition that silently shadows the original.
 
 > [!NOTE]
 > The suite is **748 unit tests plus 5 integration tests**, of which one unit
@@ -292,19 +279,6 @@ redefinition that silently shadows the original.
 > reachable and fails without it. Expect `1 failed, 747 passed, 5 deselected`
 > offline.
 
-Further reading lives in [`docs/`](docs/README.md), including the
-[architecture notes](docs/architecture/architecture.md) and the
-[issues tracker](docs/reviews/issues-improvements.md).
-
-<p id="license" align="center">▰ ▰ ▰ ▰ ▰ ▰ ▰</p>
-
-## ◈ License
-
-MIT. See [LICENSE](LICENSE).
-
-<p align="center">▁▂▃▄▅▆▇█▇▆▅▄▃▂▁</p>
-
-<p align="center">◈ ✦ ◈</p>
 
 <!-- HEADER BADGES -->
 [value-shield]: https://img.shields.io/badge/what%20you%20get-byte--level%20%2B%20dedup%20%2B%20cancellable-8957e5?style=for-the-badge&logo=huggingface&logoColor=white
