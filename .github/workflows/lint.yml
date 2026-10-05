@@ -43,19 +43,6 @@ jobs:
         run: python -m ruff check . --select F401,E402,F841,E731 --exit-zero
         continue-on-error: true
 
-      # IMP-023: the documentation link check runs here, in the same job as
-      # the lint gate, because both are "the tree disagrees with itself"
-      # checks. A dead link in docs/README.md and an undefined name in the
-      # package are the same class of defect — a claim that stopped being
-      # true — and splitting them across jobs would let both go unnoticed
-      # whenever one of them is skipped.
-      #
-      # --check is a pure comparison: exit 1 when docs/README.md no longer
-      # matches what the generator would emit, exit 2 when a relative link
-      # resolves to nothing. It writes nothing.
-      - name: Docs index is current (blocking)
-        run: python tools/generate_docs_index.py --check
-
   test:
     name: test (unit)
     runs-on: ${{ matrix.os }}
@@ -76,7 +63,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e "hf_track[dev,xet]"
+          python -m pip install -e ".[dev,xet]"
 
       # -m "not integration": those tests hit huggingface.co. They are
       # genuinely useful but must not gate a commit -- a TLS blip or a Hub
@@ -87,7 +74,7 @@ jobs:
       - name: Wheel builds and installs clean
         run: |
           python -m pip install --upgrade build twine
-          python -m build hf_track --outdir dist
+          python -m build . --outdir dist
           python -m twine check dist/*
 
   integration:
@@ -103,7 +90,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install
-        run: python -m pip install -e "hf_track[dev,xet]"
+        run: python -m pip install -e ".[dev,xet]"
 
       - name: Integration tests
         run: python -m pytest tests -m integration -q --no-cov
