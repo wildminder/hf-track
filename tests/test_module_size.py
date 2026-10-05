@@ -660,11 +660,19 @@ class TestHubCompatibility:
             f"huggingface_hub:\n\n" + "\n\n".join(failures)
         )
 
-    def test_installed_hub_exposes_only_supported_xet_api(self):
-        """The Xet helpers the package uses exist, and the removed ones do not.
+    def test_installed_hub_exposes_the_xet_api_we_use(self):
+        """The Xet helpers the package calls exist in the installed hub.
 
         This is the assertion that fails on ``huggingface_hub`` 1.x before
         the CRIT-008 migration and passes after it.
+
+        It deliberately does *not* assert that the removed names are still
+        absent. ``huggingface_hub`` is resolved by a ``>=`` floor, and
+        upstream is free to re-add them -- it did, after 1.23.0. Whether a
+        name is missing from someone else's module is not this package's
+        contract; that our calls resolve is. A test that re-adds them turns
+        every future hub release into a red build over a change that broke
+        nothing here.
         """
         from huggingface_hub.utils import _xet
 
@@ -677,14 +685,6 @@ class TestHubCompatibility:
             assert hasattr(_xet, name), (
                 f"the installed huggingface_hub no longer exposes {name}; "
                 "the Xet path must be migrated again"
-            )
-
-        for removed in (
-            "refresh_xet_connection_info",
-            "fetch_xet_connection_info_from_repo_info",
-        ):
-            assert not hasattr(_xet, removed), (
-                f"{removed} exists again -- the migration may be reversible"
             )
 
 

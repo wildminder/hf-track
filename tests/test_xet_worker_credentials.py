@@ -122,14 +122,20 @@ class TestWorkerCredentialMigration:
         assert "new_upload_commit" in worker_src
         assert "token_refresh_url=" in worker_src
 
-    def test_removed_api_is_actually_removed_from_the_installed_hub(self):
-        """The premise: these names do not exist in the installed hub."""
+    def test_replacement_api_exists_in_the_installed_hub(self):
+        """The names the migration migrated *to* are present.
+
+        Nothing here asserts the old names are still gone. ``huggingface_hub``
+        is resolved by a ``>=`` floor and upstream re-added them after
+        1.23.0; whether a symbol is absent from a module we do not own is
+        not a contract of this package, and asserting it turns any future
+        hub release into a red build over a change that broke nothing here.
+        The compatibility guarantee the package actually makes is that its
+        own calls resolve -- which the tests above check against our source
+        and this one checks against the installed hub.
+        """
         from huggingface_hub.utils import _xet
 
-        for name in REMOVED_NAMES:
-            assert not hasattr(_xet, name), (
-                f"{name} exists again -- the migration may be reversible"
-            )
         assert hasattr(_xet, "get_xet_session")
 
 

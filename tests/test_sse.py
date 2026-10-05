@@ -14,6 +14,7 @@ class TestSSEModule:
 
     def test_sse_module_importable(self):
         """The sse module can be imported."""
+        pytest.importorskip("sse_starlette")
         from hf_track.integrations import sse
 
         assert sse is not None
@@ -27,12 +28,14 @@ class TestSSEModule:
 
     def test_create_progress_router_removed(self):
         """create_progress_router no longer exists in the sse module."""
+        pytest.importorskip("sse_starlette")
         from hf_track.integrations import sse
 
         assert not hasattr(sse, "create_progress_router")
 
     def test_create_raw_sse_stream_removed(self):
         """create_raw_sse_stream no longer exists in the sse module."""
+        pytest.importorskip("sse_starlette")
         from hf_track.integrations import sse
 
         assert not hasattr(sse, "create_raw_sse_stream")

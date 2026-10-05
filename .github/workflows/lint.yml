@@ -60,16 +60,22 @@ jobs:
         with:
           python-version: "3.12"
 
+      # sse is an optional extra, so its tests skip without it -- which would
+      # mean CI never exercises shipped code. Install it and let them run.
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,xet]"
+          python -m pip install -e ".[dev,xet,sse]"
 
-      # -m "not integration": those tests hit huggingface.co. They are
-      # genuinely useful but must not gate a commit -- a TLS blip or a Hub
-      # outage would otherwise red the whole project.
+      # -m "not integration and not network": those tests hit huggingface.co. They
+      # are genuinely useful but must not gate a commit -- a TLS blip, a Hub
+      # outage or a slow link would otherwise red the whole project, and they
+      # did exactly that here (two streaming tests failed under parallel load
+      # while passing alone). The `network` marker is what actually identifies
+      # them; the deselect used to name only `integration`, so CI ran them
+      # anyway. The integration job below covers the Hub-facing paths.
       - name: Unit tests
-        run: python -m pytest tests -m "not integration" -q --cov=hf_track --cov-report=term-missing
+        run: python -m pytest tests -m "not integration and not network" -q --cov=hf_track --cov-report=term-missing
 
       - name: Wheel builds and installs clean
         run: |
@@ -90,7 +96,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install
-        run: python -m pip install -e ".[dev,xet]"
+        run: python -m pip install -e ".[dev,xet,sse]"
 
       - name: Integration tests
         run: python -m pytest tests -m integration -q --no-cov

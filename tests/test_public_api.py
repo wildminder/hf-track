@@ -305,5 +305,6 @@ class TestDocstringQuickStart:
 
     def test_sse_integration_importable(self):
         """The SSE integration example must import cleanly."""
+        pytest.importorskip("sse_starlette")
         from hf_track.integrations.sse import EventSourceResponse
         assert EventSourceResponse is not None
