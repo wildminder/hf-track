@@ -47,3 +47,5 @@ htmlcov/
 # local tool indexes / caches
 .codegraph/
 .zcode/
+_backup/
+docs/
